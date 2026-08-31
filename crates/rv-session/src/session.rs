@@ -1,0 +1,450 @@
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use rv_core::{ConnectRequest, EncryptionMode};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio::time::timeout;
+use vnc::{PixelFormat, VncConnector, VncEvent, X11Event};
+
+use crate::SessionError;
+use crate::compositor::{Apply, Framebuffer};
+use crate::encodings::encodings_for;
+use crate::vencrypt;
+
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Shortest interval between incremental update requests once the previous
+/// one has been answered.
+const REFRESH_EVERY: Duration = Duration::from_millis(16);
+/// Longest interval without a request. Servers hold an incremental request
+/// until the screen changes, so this only matters as a keepalive; it also
+/// nudges vnc-rs's network task, which stops reading while its decoder is
+/// backlogged until the next outgoing message.
+const REFRESH_KEEPALIVE: Duration = Duration::from_millis(250);
+/// How long the loop idles waiting for input before polling decoded frames again.
+const POLL_EVERY: Duration = Duration::from_millis(4);
+/// Decoded frame events applied per scheduling slot. A server streaming
+/// updates must not keep the loop busy so long that a queued key-up waits;
+/// the remote side would auto-repeat the key in the meantime.
+const MAX_EVENTS_PER_SLOT: usize = 64;
+
+#[derive(Debug, Clone)]
+pub enum SessionEvent {
+    Status(String),
+    Connected {
+        width: u16,
+        height: u16,
+        name: String,
+    },
+    FrameReady {
+        generation: u64,
+    },
+    Clipboard(String),
+    Bell,
+    Error(String),
+    Disconnected,
+}
+
+#[derive(Debug, Clone)]
+pub enum SessionCommand {
+    Input(X11Event),
+    Close,
+}
+
+pub struct SessionHandle {
+    pub framebuffer: Arc<Mutex<Framebuffer>>,
+    cmd_tx: tokio::sync::mpsc::UnboundedSender<SessionCommand>,
+    event_rx: Mutex<mpsc::Receiver<SessionEvent>>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl SessionHandle {
+    pub fn spawn(request: ConnectRequest) -> Self {
+        let framebuffer = Arc::new(Mutex::new(Framebuffer::default()));
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (event_tx, event_rx) = mpsc::channel();
+        let fb = framebuffer.clone();
+        let thread = thread::Builder::new()
+            .name("rv-vnc".into())
+            .spawn(move || {
+                let rt = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .enable_all()
+                    .build()
+                    .expect("tokio runtime");
+                rt.block_on(run(request, fb, cmd_rx, event_tx));
+            })
+            .expect("spawn vnc thread");
+        Self {
+            framebuffer,
+            cmd_tx,
+            event_rx: Mutex::new(event_rx),
+            thread: Some(thread),
+        }
+    }
+
+    pub fn send(&self, cmd: SessionCommand) {
+        let _ = self.cmd_tx.send(cmd);
+    }
+
+    pub fn try_recv(&self) -> Option<SessionEvent> {
+        self.event_rx.lock().ok()?.try_recv().ok()
+    }
+
+    /// Events since the last call.
+    ///
+    /// Frame notifications are collapsed to the newest generation (see
+    /// [`coalesce_frames`]): pixels live in `framebuffer`, so one notification
+    /// per drain is all a renderer needs, no matter how many rectangles the
+    /// server sent.
+    pub fn drain(&self) -> Vec<SessionEvent> {
+        let mut out = Vec::new();
+        while let Some(e) = self.try_recv() {
+            out.push(e);
+        }
+        coalesce_frames(&mut out);
+        out
+    }
+
+    pub fn pointer(&self, x: u16, y: u16, buttons: u8) {
+        self.send(SessionCommand::Input(X11Event::PointerEvent(
+            (x, y, buttons).into(),
+        )));
+    }
+
+    pub fn key(&self, keysym: u32, down: bool) {
+        self.send(SessionCommand::Input(X11Event::KeyEvent(
+            (keysym, down).into(),
+        )));
+    }
+
+    pub fn copy_text(&self, text: String) {
+        self.send(SessionCommand::Input(X11Event::CopyText(text)));
+    }
+
+    pub fn close(&self) {
+        self.send(SessionCommand::Close);
+    }
+}
+
+/// Collapse every `FrameReady` in `events` into a single one carrying the
+/// newest generation, at the position of the last frame event. Every other
+/// event keeps its relative order.
+///
+/// Servers send one rectangle per event, and a busy desktop yields dozens per
+/// frame. Rebuilding the on-screen image once per rectangle stalls the UI
+/// thread badly enough that queued key-ups are delivered late and the remote
+/// auto-repeats the key.
+pub fn coalesce_frames(events: &mut Vec<SessionEvent>) {
+    let mut newest: Option<u64> = None;
+    let mut last = None;
+    for (i, e) in events.iter().enumerate() {
+        if let SessionEvent::FrameReady { generation } = e {
+            newest = Some(newest.map_or(*generation, |n| n.max(*generation)));
+            last = Some(i);
+        }
+    }
+    let (Some(generation), Some(last)) = (newest, last) else {
+        return;
+    };
+    let mut index = 0;
+    events.retain(|e| {
+        let keep = !matches!(e, SessionEvent::FrameReady { .. }) || index == last;
+        index += 1;
+        keep
+    });
+    if let Some(SessionEvent::FrameReady { generation: g }) = events
+        .iter_mut()
+        .find(|e| matches!(e, SessionEvent::FrameReady { .. }))
+    {
+        *g = generation;
+    }
+}
+
+impl Drop for SessionHandle {
+    fn drop(&mut self) {
+        self.close();
+        if let Some(h) = self.thread.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+async fn run(
+    request: ConnectRequest,
+    fb: Arc<Mutex<Framebuffer>>,
+    mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<SessionCommand>,
+    event_tx: mpsc::Sender<SessionEvent>,
+) {
+    let send = |e: SessionEvent| {
+        let _ = event_tx.send(e);
+    };
+
+    send(SessionEvent::Status(format!(
+        "Connecting to {}:{}…",
+        request.host, request.port
+    )));
+
+    match connect_and_loop(request, fb, &mut cmd_rx, &send).await {
+        Ok(()) => send(SessionEvent::Disconnected),
+        Err(e) => {
+            send(SessionEvent::Error(e.to_string()));
+            send(SessionEvent::Disconnected);
+        }
+    }
+}
+
+async fn connect_and_loop(
+    request: ConnectRequest,
+    fb: Arc<Mutex<Framebuffer>>,
+    cmd_rx: &mut tokio::sync::mpsc::UnboundedReceiver<SessionCommand>,
+    send: &impl Fn(SessionEvent),
+) -> Result<(), SessionError> {
+    let addr = format!("{}:{}", request.host, request.port);
+    let tcp = timeout(CONNECT_TIMEOUT, TcpStream::connect(&addr))
+        .await
+        .map_err(|_| SessionError::Timeout)?
+        .map_err(|e| SessionError::msg(format!("cannot connect to {addr}: {e}")))?;
+    let _ = tcp.set_nodelay(true);
+
+    let password = request.password.clone().unwrap_or_default();
+    let encodings = encodings_for(request.quality);
+    let shared = request.shared;
+
+    match request.encryption {
+        EncryptionMode::Always => {
+            send(SessionEvent::Status("Negotiating VeNCrypt…".into()));
+            let client = connect_vencrypt(tcp, &request.host, password, encodings, shared).await?;
+            session_loop(client, fb, cmd_rx, send).await
+        }
+        EncryptionMode::PreferOn => {
+            send(SessionEvent::Status("Negotiating VeNCrypt…".into()));
+            match connect_vencrypt(
+                tcp,
+                &request.host,
+                password.clone(),
+                encodings.clone(),
+                shared,
+            )
+            .await
+            {
+                Ok(client) => session_loop(client, fb, cmd_rx, send).await,
+                Err(first) => {
+                    send(SessionEvent::Status(format!(
+                        "VeNCrypt unavailable ({first}); trying standard RFB…"
+                    )));
+                    let tcp = timeout(CONNECT_TIMEOUT, TcpStream::connect(&addr))
+                        .await
+                        .map_err(|_| SessionError::Timeout)??;
+                    let _ = tcp.set_nodelay(true);
+                    let client = connect_plain(tcp, password, encodings, shared).await?;
+                    session_loop(client, fb, cmd_rx, send).await
+                }
+            }
+        }
+        EncryptionMode::Off | EncryptionMode::LetServerChoose => {
+            match connect_plain(tcp, password, encodings, shared).await {
+                Ok(client) => session_loop(client, fb, cmd_rx, send).await,
+                Err(e) => {
+                    let hint = if request.encryption == EncryptionMode::LetServerChoose {
+                        format!(
+                            "{e}. If the server requires encryption, set Encryption to Prefer on or Always."
+                        )
+                    } else {
+                        e.to_string()
+                    };
+                    Err(SessionError::msg(hint))
+                }
+            }
+        }
+    }
+}
+
+async fn connect_plain(
+    tcp: TcpStream,
+    password: String,
+    encodings: Vec<vnc::VncEncoding>,
+    shared: bool,
+) -> Result<vnc::VncClient, SessionError> {
+    let mut connector = VncConnector::new(tcp)
+        .set_auth_method(async move { Ok(password) })
+        .allow_shared(shared)
+        .set_pixel_format(PixelFormat::rgba());
+    for enc in encodings {
+        connector = connector.add_encoding(enc);
+    }
+    Ok(connector.build()?.try_start().await?.finish()?)
+}
+
+async fn connect_vencrypt(
+    tcp: TcpStream,
+    host: &str,
+    password: String,
+    encodings: Vec<vnc::VncEncoding>,
+    shared: bool,
+) -> Result<vnc::VncClient, SessionError> {
+    // Version exchange first so we can pick security type 19.
+    let mut stream = tcp;
+    let mut version = [0u8; 12];
+    stream.read_exact(&mut version).await?;
+    stream.write_all(b"RFB 003.008\n").await?;
+
+    let count = stream.read_u8().await?;
+    if count == 0 {
+        let reason_len = stream.read_u32().await.unwrap_or(0);
+        let mut reason = vec![0u8; reason_len.min(4096) as usize];
+        let _ = stream.read_exact(&mut reason).await;
+        return Err(SessionError::msg(
+            String::from_utf8_lossy(&reason).into_owned(),
+        ));
+    }
+    let mut types = vec![0u8; count as usize];
+    stream.read_exact(&mut types).await?;
+    if !types.contains(&vencrypt::VENCRYPT_SECURITY_TYPE) {
+        return Err(SessionError::msg(
+            "server does not offer VeNCrypt (security type 19)",
+        ));
+    }
+
+    let (tls, _auth) = vencrypt::handshake(stream, host, false).await?;
+    let mut connector = VncConnector::new(tls)
+        .set_auth_method(async move { Ok(password) })
+        .allow_shared(shared)
+        .set_pixel_format(PixelFormat::rgba());
+    for enc in encodings {
+        connector = connector.add_encoding(enc);
+    }
+    Ok(connector.build()?.try_start().await?.finish()?)
+}
+
+async fn session_loop(
+    mut client: vnc::VncClient,
+    fb: Arc<Mutex<Framebuffer>>,
+    cmd_rx: &mut tokio::sync::mpsc::UnboundedReceiver<SessionCommand>,
+    send: &impl Fn(SessionEvent),
+) -> Result<(), SessionError> {
+    use tokio::sync::mpsc::error::TryRecvError;
+
+    send(SessionEvent::Status(
+        "Connected, waiting for desktop…".into(),
+    ));
+    let mut announced = false;
+    let mut last_refresh = Instant::now();
+    // One incremental request in flight at a time, like other VNC viewers.
+    // Firing them unconditionally queues every key event behind a backlog of
+    // requests the server has not answered yet.
+    let mut refresh_answered = true;
+    loop {
+        // Input first: a key-up queued behind frame decoding turns into
+        // auto-repeat on the server, so pixels never take priority over commands.
+        loop {
+            match cmd_rx.try_recv() {
+                Ok(cmd) => {
+                    if !apply_command(&mut client, cmd).await? {
+                        return Ok(());
+                    }
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    let _ = client.close().await;
+                    return Ok(());
+                }
+            }
+        }
+
+        let mut applied = 0;
+        while applied < MAX_EVENTS_PER_SLOT {
+            match client.poll_event().await {
+                Ok(Some(ev)) => {
+                    handle_event(ev, &fb, send, &mut announced);
+                    applied += 1;
+                    refresh_answered = true;
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    let _ = client.close().await;
+                    return Err(e.into());
+                }
+            }
+        }
+        let since_refresh = last_refresh.elapsed();
+        if (refresh_answered && since_refresh >= REFRESH_EVERY)
+            || since_refresh >= REFRESH_KEEPALIVE
+        {
+            last_refresh = Instant::now();
+            refresh_answered = false;
+            let _ = client.input(X11Event::Refresh).await;
+        }
+        if applied == MAX_EVENTS_PER_SLOT {
+            // Backlog: go straight back to the input check instead of idling.
+            tokio::task::yield_now().await;
+            continue;
+        }
+
+        tokio::select! {
+            cmd = cmd_rx.recv() => {
+                match cmd {
+                    None => {
+                        let _ = client.close().await;
+                        return Ok(());
+                    }
+                    Some(cmd) => {
+                        if !apply_command(&mut client, cmd).await? {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+            _ = tokio::time::sleep(POLL_EVERY) => {}
+        }
+    }
+}
+
+/// Returns `Ok(false)` once the session should end.
+async fn apply_command(
+    client: &mut vnc::VncClient,
+    cmd: SessionCommand,
+) -> Result<bool, SessionError> {
+    match cmd {
+        SessionCommand::Close => {
+            let _ = client.close().await;
+            Ok(false)
+        }
+        SessionCommand::Input(ev) => {
+            client.input(ev).await?;
+            Ok(true)
+        }
+    }
+}
+
+fn handle_event(
+    ev: VncEvent,
+    fb: &Arc<Mutex<Framebuffer>>,
+    send: &impl Fn(SessionEvent),
+    announced: &mut bool,
+) {
+    let mut fb = fb.lock().expect("framebuffer lock");
+    match fb.apply(ev) {
+        Apply::Resized => {
+            if !*announced && fb.width > 0 {
+                *announced = true;
+                send(SessionEvent::Connected {
+                    width: fb.width,
+                    height: fb.height,
+                    name: fb.desktop_name.clone(),
+                });
+            }
+            send(SessionEvent::FrameReady {
+                generation: fb.generation,
+            });
+        }
+        Apply::Dirty => send(SessionEvent::FrameReady {
+            generation: fb.generation,
+        }),
+        Apply::Clipboard(text) => send(SessionEvent::Clipboard(text)),
+        Apply::Bell => send(SessionEvent::Bell),
+        Apply::Error(e) => send(SessionEvent::Error(e)),
+        Apply::Ignored => {}
+    }
+}

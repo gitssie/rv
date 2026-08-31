@@ -1,0 +1,24 @@
+[package]
+name = "rv-session"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Tokio RFB session, framebuffer compositor, and VeNCrypt for RV"
+
+[lints]
+workspace = true
+
+[dependencies]
+rv-core.workspace = true
+image.workspace = true
+rustls.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+tracing.workspace = true
+vnc.workspace = true
+webpki-roots.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-util", "time"] }

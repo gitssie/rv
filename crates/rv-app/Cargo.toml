@@ -1,0 +1,32 @@
+[package]
+name = "rv-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "RV desktop VNC viewer"
+
+[[bin]]
+name = "rv"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+rv-core.workspace = true
+rv-session.workspace = true
+anyhow.workspace = true
+image.workspace = true
+smallvec.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+gpui = { git = "https://github.com/zed-industries/zed" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit"] }
+gpui-component = { git = "https://github.com/longbridge/gpui-component" }
+gpui-component-assets = { git = "https://github.com/longbridge/gpui-component" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["NSArray", "NSString"] }
+raw-window-handle = "0.6"

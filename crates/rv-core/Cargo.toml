@@ -1,0 +1,18 @@
+[package]
+name = "rv-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Connection models, address book, and keysyms for RV"
+
+[lints]
+workspace = true
+
+[dependencies]
+directories.workspace = true
+keyring.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
