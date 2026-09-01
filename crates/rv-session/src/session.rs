@@ -3,7 +3,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use rv_core::{ConnectRequest, EncryptionMode};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 use vnc::{PixelFormat, VncConnector, VncEvent, X11Event};
@@ -32,14 +31,8 @@ const MAX_EVENTS_PER_SLOT: usize = 64;
 #[derive(Debug, Clone)]
 pub enum SessionEvent {
     Status(String),
-    Connected {
-        width: u16,
-        height: u16,
-        name: String,
-    },
-    FrameReady {
-        generation: u64,
-    },
+    Connected { width: u16, height: u16 },
+    FrameReady { generation: u64 },
     Clipboard(String),
     Bell,
     Error(String),
@@ -164,10 +157,11 @@ pub fn coalesce_frames(events: &mut Vec<SessionEvent>) {
 
 impl Drop for SessionHandle {
     fn drop(&mut self) {
+        // Ask the session to stop but never block the caller: this runs on the
+        // UI thread when a window closes, and the worker may be mid-handshake.
+        // The worker notices the closed command channel and exits on its own.
         self.close();
-        if let Some(h) = self.thread.take() {
-            let _ = h.join();
-        }
+        drop(self.thread.take());
     }
 }
 
@@ -201,118 +195,96 @@ async fn connect_and_loop(
     cmd_rx: &mut tokio::sync::mpsc::UnboundedReceiver<SessionCommand>,
     send: &impl Fn(SessionEvent),
 ) -> Result<(), SessionError> {
-    let addr = format!("{}:{}", request.host, request.port);
-    let tcp = timeout(CONNECT_TIMEOUT, TcpStream::connect(&addr))
+    // A close request (window closed, handle dropped) must interrupt the
+    // handshake too, not just the running session; otherwise a server that
+    // never answers keeps the worker alive for the whole connect timeout.
+    let client = tokio::select! {
+        result = connect(&request, send) => result?,
+        _ = wait_for_close(cmd_rx) => return Ok(()),
+    };
+    session_loop(client, fb, cmd_rx, send).await
+}
+
+/// Resolves once the UI asks to close (or drops the handle). Input queued
+/// before the session exists has nothing to go to and is discarded.
+async fn wait_for_close(cmd_rx: &mut tokio::sync::mpsc::UnboundedReceiver<SessionCommand>) {
+    loop {
+        match cmd_rx.recv().await {
+            Some(SessionCommand::Close) | None => return,
+            Some(SessionCommand::Input(_)) => {}
+        }
+    }
+}
+
+async fn dial(addr: &str) -> Result<TcpStream, SessionError> {
+    let tcp = timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
         .await
         .map_err(|_| SessionError::Timeout)?
         .map_err(|e| SessionError::msg(format!("cannot connect to {addr}: {e}")))?;
     let _ = tcp.set_nodelay(true);
+    Ok(tcp)
+}
+
+/// Which transport to use given what the server offers and what the user asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Transport {
+    Plain,
+    VeNCrypt,
+}
+
+fn choose_transport(mode: EncryptionMode, types: &[u8]) -> Result<Transport, SessionError> {
+    let plain_ok = types
+        .iter()
+        .any(|t| matches!(*t, vencrypt::SEC_NONE | vencrypt::SEC_VNC_AUTH));
+    let vencrypt_ok = types.contains(&vencrypt::VENCRYPT_SECURITY_TYPE);
+    let offered = || {
+        types
+            .iter()
+            .map(|t| vencrypt::security_type_name(*t))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    match mode {
+        EncryptionMode::Always if vencrypt_ok => Ok(Transport::VeNCrypt),
+        EncryptionMode::Always => Err(SessionError::msg(format!(
+            "server does not offer VeNCrypt (offers: {}); set Encryption to Let server choose to connect unencrypted",
+            offered()
+        ))),
+        EncryptionMode::PreferOn if vencrypt_ok => Ok(Transport::VeNCrypt),
+        EncryptionMode::LetServerChoose if vencrypt_ok && !plain_ok => Ok(Transport::VeNCrypt),
+        _ if plain_ok => Ok(Transport::Plain),
+        EncryptionMode::Off if vencrypt_ok => Err(SessionError::msg(format!(
+            "server requires encryption (offers: {}); set Encryption to Let server choose",
+            offered()
+        ))),
+        _ => Err(SessionError::msg(format!(
+            "no supported security type (server offers: {}; RV supports None, VncAuth, VeNCrypt)",
+            offered()
+        ))),
+    }
+}
+
+async fn connect(
+    request: &ConnectRequest,
+    send: &impl Fn(SessionEvent),
+) -> Result<vnc::VncClient, SessionError> {
+    let addr = format!("{}:{}", request.host, request.port);
+    let mut tcp = dial(&addr).await?;
+    let types = vencrypt::read_security_types(&mut tcp).await?;
+    let stream = match choose_transport(request.encryption, &types)? {
+        Transport::Plain => vencrypt::RfbStream::plain(tcp, &types),
+        Transport::VeNCrypt => {
+            send(SessionEvent::Status("Negotiating VeNCrypt…".into()));
+            vencrypt::handshake(tcp, &request.host).await?
+        }
+    };
 
     let password = request.password.clone().unwrap_or_default();
-    let encodings = encodings_for(request.quality);
-    let shared = request.shared;
-
-    match request.encryption {
-        EncryptionMode::Always => {
-            send(SessionEvent::Status("Negotiating VeNCrypt…".into()));
-            let client = connect_vencrypt(tcp, &request.host, password, encodings, shared).await?;
-            session_loop(client, fb, cmd_rx, send).await
-        }
-        EncryptionMode::PreferOn => {
-            send(SessionEvent::Status("Negotiating VeNCrypt…".into()));
-            match connect_vencrypt(
-                tcp,
-                &request.host,
-                password.clone(),
-                encodings.clone(),
-                shared,
-            )
-            .await
-            {
-                Ok(client) => session_loop(client, fb, cmd_rx, send).await,
-                Err(first) => {
-                    send(SessionEvent::Status(format!(
-                        "VeNCrypt unavailable ({first}); trying standard RFB…"
-                    )));
-                    let tcp = timeout(CONNECT_TIMEOUT, TcpStream::connect(&addr))
-                        .await
-                        .map_err(|_| SessionError::Timeout)??;
-                    let _ = tcp.set_nodelay(true);
-                    let client = connect_plain(tcp, password, encodings, shared).await?;
-                    session_loop(client, fb, cmd_rx, send).await
-                }
-            }
-        }
-        EncryptionMode::Off | EncryptionMode::LetServerChoose => {
-            match connect_plain(tcp, password, encodings, shared).await {
-                Ok(client) => session_loop(client, fb, cmd_rx, send).await,
-                Err(e) => {
-                    let hint = if request.encryption == EncryptionMode::LetServerChoose {
-                        format!(
-                            "{e}. If the server requires encryption, set Encryption to Prefer on or Always."
-                        )
-                    } else {
-                        e.to_string()
-                    };
-                    Err(SessionError::msg(hint))
-                }
-            }
-        }
-    }
-}
-
-async fn connect_plain(
-    tcp: TcpStream,
-    password: String,
-    encodings: Vec<vnc::VncEncoding>,
-    shared: bool,
-) -> Result<vnc::VncClient, SessionError> {
-    let mut connector = VncConnector::new(tcp)
+    let mut connector = VncConnector::new(stream)
         .set_auth_method(async move { Ok(password) })
-        .allow_shared(shared)
-        .set_pixel_format(PixelFormat::rgba());
-    for enc in encodings {
-        connector = connector.add_encoding(enc);
-    }
-    Ok(connector.build()?.try_start().await?.finish()?)
-}
-
-async fn connect_vencrypt(
-    tcp: TcpStream,
-    host: &str,
-    password: String,
-    encodings: Vec<vnc::VncEncoding>,
-    shared: bool,
-) -> Result<vnc::VncClient, SessionError> {
-    // Version exchange first so we can pick security type 19.
-    let mut stream = tcp;
-    let mut version = [0u8; 12];
-    stream.read_exact(&mut version).await?;
-    stream.write_all(b"RFB 003.008\n").await?;
-
-    let count = stream.read_u8().await?;
-    if count == 0 {
-        let reason_len = stream.read_u32().await.unwrap_or(0);
-        let mut reason = vec![0u8; reason_len.min(4096) as usize];
-        let _ = stream.read_exact(&mut reason).await;
-        return Err(SessionError::msg(
-            String::from_utf8_lossy(&reason).into_owned(),
-        ));
-    }
-    let mut types = vec![0u8; count as usize];
-    stream.read_exact(&mut types).await?;
-    if !types.contains(&vencrypt::VENCRYPT_SECURITY_TYPE) {
-        return Err(SessionError::msg(
-            "server does not offer VeNCrypt (security type 19)",
-        ));
-    }
-
-    let (tls, _auth) = vencrypt::handshake(stream, host, false).await?;
-    let mut connector = VncConnector::new(tls)
-        .set_auth_method(async move { Ok(password) })
-        .allow_shared(shared)
-        .set_pixel_format(PixelFormat::rgba());
-    for enc in encodings {
+        .allow_shared(request.shared)
+        .set_pixel_format(PixelFormat::bgra());
+    for enc in encodings_for(request.quality) {
         connector = connector.add_encoding(enc);
     }
     Ok(connector.build()?.try_start().await?.finish()?)
@@ -432,7 +404,6 @@ fn handle_event(
                 send(SessionEvent::Connected {
                     width: fb.width,
                     height: fb.height,
-                    name: fb.desktop_name.clone(),
                 });
             }
             send(SessionEvent::FrameReady {
@@ -446,5 +417,45 @@ fn handle_event(
         Apply::Bell => send(SessionEvent::Bell),
         Apply::Error(e) => send(SessionEvent::Error(e)),
         Apply::Ignored => {}
+    }
+}
+
+#[cfg(test)]
+mod transport_tests {
+    use super::*;
+
+    #[test]
+    fn let_server_choose_prefers_plain_but_accepts_vencrypt_only() {
+        assert_eq!(
+            choose_transport(EncryptionMode::LetServerChoose, &[1, 2, 19]).unwrap(),
+            Transport::Plain
+        );
+        assert_eq!(
+            choose_transport(EncryptionMode::LetServerChoose, &[19]).unwrap(),
+            Transport::VeNCrypt
+        );
+        assert!(choose_transport(EncryptionMode::LetServerChoose, &[16, 30]).is_err());
+    }
+
+    #[test]
+    fn prefer_on_and_always() {
+        assert_eq!(
+            choose_transport(EncryptionMode::PreferOn, &[2, 19]).unwrap(),
+            Transport::VeNCrypt
+        );
+        assert_eq!(
+            choose_transport(EncryptionMode::PreferOn, &[2]).unwrap(),
+            Transport::Plain
+        );
+        assert!(choose_transport(EncryptionMode::Always, &[2]).is_err());
+    }
+
+    #[test]
+    fn off_never_encrypts() {
+        assert_eq!(
+            choose_transport(EncryptionMode::Off, &[2, 19]).unwrap(),
+            Transport::Plain
+        );
+        assert!(choose_transport(EncryptionMode::Off, &[19]).is_err());
     }
 }
