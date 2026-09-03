@@ -1,0 +1,191 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  BINARY: rv
+
+jobs:
+  build-macos:
+    name: macOS (universal)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust targets
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-universal
+
+      - name: Build
+        run: |
+          cargo build --release -p rv-app --target aarch64-apple-darwin
+          cargo build --release -p rv-app --target x86_64-apple-darwin
+
+      - name: Package RV.app + dmg
+        run: |
+          set -euxo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          [ "${GITHUB_REF_TYPE}" = "tag" ] || VERSION="0.0.0-${GITHUB_SHA::7}"
+
+          APP=dist/RV.app
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          lipo -create \
+            "target/aarch64-apple-darwin/release/$BINARY" \
+            "target/x86_64-apple-darwin/release/$BINARY" \
+            -output "$APP/Contents/MacOS/$BINARY"
+          cat > "$APP/Contents/Info.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key><string>RV</string>
+            <key>CFBundleDisplayName</key><string>RV</string>
+            <key>CFBundleIdentifier</key><string>io.github.madeye.rv</string>
+            <key>CFBundleExecutable</key><string>$BINARY</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>$VERSION</string>
+            <key>CFBundleVersion</key><string>$VERSION</string>
+            <key>LSMinimumSystemVersion</key><string>12.0</string>
+            <key>NSHighResolutionCapable</key><true/>
+            <key>NSSupportsAutomaticGraphicsSwitching</key><true/>
+          </dict>
+          </plist>
+          EOF
+          # Ad-hoc signature (arm64 refuses to run unsigned binaries).
+          codesign --force --deep -s - "$APP"
+
+          DMG_DIR=$(mktemp -d)
+          cp -R "$APP" "$DMG_DIR/"
+          ln -s /Applications "$DMG_DIR/Applications"
+          hdiutil create -volname "RV" -srcfolder "$DMG_DIR" -ov -format UDZO \
+            "dist/rv-$VERSION-macos-universal.dmg"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-universal
+          path: dist/*.dmg
+          if-no-files-found: error
+
+  build-linux:
+    name: Linux (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang cmake pkg-config \
+            libfontconfig-dev libfreetype-dev \
+            libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libx11-dev libxcb1-dev libasound2-dev libvulkan-dev
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-${{ matrix.arch }}
+
+      - name: Build
+        run: cargo build --release -p rv-app
+
+      - name: Package tarball
+        run: |
+          set -euxo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          [ "${GITHUB_REF_TYPE}" = "tag" ] || VERSION="0.0.0-${GITHUB_SHA::7}"
+          STAGE="rv-$VERSION-linux-${{ matrix.arch }}"
+          mkdir -p "dist/$STAGE"
+          cp "target/release/$BINARY" LICENSE README.md "dist/$STAGE/"
+          tar -C dist -czf "dist/$STAGE.tar.gz" "$STAGE"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.arch }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  build-windows:
+    name: Windows (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: windows-latest
+          - arch: aarch64
+            runner: windows-11-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install NASM (vendored OpenSSL)
+        if: matrix.arch == 'x86_64'
+        shell: pwsh
+        run: |
+          choco install -y nasm
+          Add-Content -Path $env:GITHUB_PATH -Value "C:\Program Files\NASM"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-${{ matrix.arch }}
+
+      - name: Build
+        run: cargo build --release -p rv-app
+
+      - name: Package zip
+        shell: pwsh
+        run: |
+          $Version = $env:GITHUB_REF_NAME -replace '^v', ''
+          if ($env:GITHUB_REF_TYPE -ne 'tag') { $Version = "0.0.0-$($env:GITHUB_SHA.Substring(0, 7))" }
+          $Stage = "rv-$Version-windows-${{ matrix.arch }}"
+          New-Item -ItemType Directory -Path "dist/$Stage" | Out-Null
+          Copy-Item "target/release/$env:BINARY.exe", "LICENSE", "README.md" "dist/$Stage/"
+          Compress-Archive -Path "dist/$Stage" -DestinationPath "dist/$Stage.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-${{ matrix.arch }}
+          path: dist/*.zip
+          if-no-files-found: error
+
+  release:
+    name: Attach to release
+    if: github.ref_type == 'tag'
+    needs: [build-macos, build-linux, build-windows]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum -- * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          generate_release_notes: true
+          files: |
+            dist/*
