@@ -27,5 +27,6 @@ tokio-openssl.workspace = true
 zeroize = "1"
 
 [dev-dependencies]
+flate2 = "1"
 openssl.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-util", "time"] }

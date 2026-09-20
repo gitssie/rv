@@ -1,15 +1,23 @@
 use super::{Phase, SessionOptions, SessionView};
 use crate::actions::*;
 use gpui::{
-    AppContext, Bounds, Entity, Modifiers, MouseButton, MouseExitEvent, Pixels, TestAppContext,
-    VisualTestContext, point, px, size,
+    AppContext, Bounds, ClipboardItem, Entity, Modifiers, MouseButton, MouseExitEvent, Pixels,
+    TestAppContext, VisualTestContext, point, px, size,
 };
-use rv_core::{ConnectRequest, ScaleMode};
+use rv_core::{ClipboardMode, ConnectRequest, LocalCursorMode, ScaleMode};
 use rv_session::{SessionCommand, SessionEvent, SessionHandle, SessionTestPeer};
 
 fn setup(
     cx: &mut TestAppContext,
     view_only: bool,
+) -> (Entity<SessionView>, &mut VisualTestContext, SessionTestPeer) {
+    setup_with_cursor_mode(cx, view_only, LocalCursorMode::Automatic)
+}
+
+fn setup_with_cursor_mode(
+    cx: &mut TestAppContext,
+    view_only: bool,
+    local_cursor: LocalCursorMode,
 ) -> (Entity<SessionView>, &mut VisualTestContext, SessionTestPeer) {
     cx.update(|cx| {
         gpui_component::init(cx);
@@ -17,6 +25,7 @@ fn setup(
     });
     let mut connection = rv_core::Connection::new("Offscreen desktop", "example.test", 5900);
     connection.view_only = view_only;
+    connection.local_cursor = local_cursor;
     let request = ConnectRequest::from_connection(&connection, None);
     let (handle, peer) = SessionHandle::test_pair();
     handle.framebuffer.lock().unwrap().resize(800, 400);
@@ -78,7 +87,9 @@ fn commands(peer: &mut SessionTestPeer) -> Vec<SessionCommand> {
 }
 
 #[gpui::test]
-fn offscreen_pointer_maps_to_framebuffer_and_releases_buttons(cx: &mut TestAppContext) {
+fn offscreen_pointer_maps_to_framebuffer_releases_buttons_and_keeps_cursor_visible(
+    cx: &mut TestAppContext,
+) {
     let (view, cx, mut peer) = setup(cx, false);
     let center = picture(&view, cx).center();
     cx.simulate_mouse_move(center, None, Modifiers::default());
@@ -98,15 +109,15 @@ fn offscreen_pointer_maps_to_framebuffer_and_releases_buttons(cx: &mut TestAppCo
         assert_eq!(view.map_pointer(center), Some((400, 200)));
         assert_eq!(view.buttons, 0);
     });
-    assert!(hidden(&view, cx));
+    assert!(!hidden(&view, cx));
 }
 
 #[gpui::test]
-fn offscreen_letterbox_and_local_menu_restore_cursor(cx: &mut TestAppContext) {
+fn offscreen_letterbox_and_local_menu_keep_cursor_visible(cx: &mut TestAppContext) {
     let (view, cx, mut peer) = setup(cx, false);
     let bounds = picture(&view, cx);
     cx.simulate_mouse_move(bounds.center(), None, Modifiers::default());
-    assert!(hidden(&view, cx));
+    assert!(!hidden(&view, cx));
     commands(&mut peer);
     cx.simulate_mouse_move(
         bounds.origin + point(px(2.), px(2.)),
@@ -122,8 +133,35 @@ fn offscreen_letterbox_and_local_menu_restore_cursor(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn offscreen_mouse_exit_and_focus_loss_survive_frame_redraw(cx: &mut TestAppContext) {
-    let (view, cx, peer) = setup(cx, false);
+fn offscreen_explicit_show_cursor_mode_keeps_cursor_visible(cx: &mut TestAppContext) {
+    let (view, cx, _peer) = setup_with_cursor_mode(cx, false, LocalCursorMode::Show);
+    cx.simulate_mouse_move(picture(&view, cx).center(), None, Modifiers::default());
+    assert!(!hidden(&view, cx));
+}
+
+#[gpui::test]
+fn offscreen_hide_cursor_mode_only_hides_over_remote_picture(cx: &mut TestAppContext) {
+    let (view, cx, _peer) = setup_with_cursor_mode(cx, false, LocalCursorMode::Hide);
+    let bounds = picture(&view, cx);
+    cx.simulate_mouse_move(bounds.center(), None, Modifiers::default());
+    assert!(hidden(&view, cx));
+    cx.simulate_mouse_move(
+        bounds.origin + point(px(2.), px(2.)),
+        None,
+        Modifiers::default(),
+    );
+    assert!(!hidden(&view, cx));
+    cx.simulate_mouse_move(bounds.center(), None, Modifiers::default());
+    assert!(hidden(&view, cx));
+    cx.simulate_keystrokes("f8");
+    assert!(!hidden(&view, cx));
+}
+
+#[gpui::test]
+fn offscreen_cursor_stays_visible_across_mouse_exit_focus_loss_and_frame_redraw(
+    cx: &mut TestAppContext,
+) {
+    let (view, cx, peer) = setup_with_cursor_mode(cx, false, LocalCursorMode::Hide);
     let center = picture(&view, cx).center();
     cx.simulate_mouse_move(center, None, Modifiers::default());
     assert!(hidden(&view, cx));
@@ -158,12 +196,22 @@ fn offscreen_view_only_blocks_remote_input_and_keeps_cursor(cx: &mut TestAppCont
 }
 
 #[gpui::test]
-fn offscreen_disconnect_restores_cursor_and_stops_pointer_input(cx: &mut TestAppContext) {
-    let (view, cx, mut peer) = setup(cx, false);
+fn offscreen_disconnect_keeps_cursor_visible_and_stops_pointer_input(cx: &mut TestAppContext) {
+    let (view, cx, mut peer) = setup_with_cursor_mode(cx, false, LocalCursorMode::Hide);
     let center = picture(&view, cx).center();
     cx.simulate_mouse_move(center, None, Modifiers::default());
     assert!(hidden(&view, cx));
     commands(&mut peer);
+    cx.dispatch_action(SessionDisconnect);
+    assert!(!hidden(&view, cx));
+    assert!(matches!(
+        peer.commands.try_recv(),
+        Ok(SessionCommand::Close)
+    ));
+    view.read_with(cx, |view, _| assert_eq!(view.phase, Phase::Disconnecting));
+    cx.simulate_mouse_move(center, None, Modifiers::default());
+    assert!(!hidden(&view, cx));
+    assert!(commands(&mut peer).is_empty());
     peer.events.send(SessionEvent::Disconnected).unwrap();
     view.update(cx, |view, cx| view.pump(cx));
     cx.run_until_parked();
@@ -174,8 +222,32 @@ fn offscreen_disconnect_restores_cursor_and_stops_pointer_input(cx: &mut TestApp
 }
 
 #[gpui::test]
-fn offscreen_close_restores_cursor_and_closes_session(cx: &mut TestAppContext) {
-    let (view, cx, mut peer) = setup(cx, false);
+fn offscreen_late_connected_event_cannot_cancel_pending_disconnect(cx: &mut TestAppContext) {
+    let (view, cx, mut peer) = setup_with_cursor_mode(cx, false, LocalCursorMode::Hide);
+    let center = picture(&view, cx).center();
+    commands(&mut peer);
+    view.update(cx, |view, _| view.phase = Phase::Connecting);
+    cx.dispatch_action(SessionDisconnect);
+    assert!(matches!(
+        peer.commands.try_recv(),
+        Ok(SessionCommand::Close)
+    ));
+    peer.events
+        .send(SessionEvent::Connected {
+            width: 800,
+            height: 400,
+        })
+        .unwrap();
+    view.update(cx, |view, cx| view.pump(cx));
+    cx.simulate_mouse_move(center, None, Modifiers::default());
+    assert!(!hidden(&view, cx));
+    assert!(commands(&mut peer).is_empty());
+    view.read_with(cx, |view, _| assert_eq!(view.phase, Phase::Disconnecting));
+}
+
+#[gpui::test]
+fn offscreen_close_keeps_cursor_visible_and_closes_session(cx: &mut TestAppContext) {
+    let (view, cx, mut peer) = setup_with_cursor_mode(cx, false, LocalCursorMode::Hide);
     cx.simulate_mouse_move(picture(&view, cx).center(), None, Modifiers::default());
     assert!(hidden(&view, cx));
     commands(&mut peer);
@@ -209,4 +281,36 @@ fn offscreen_keyboard_forwards_pairs_and_consumes_menu_shortcuts(cx: &mut TestAp
         .collect();
     assert_eq!(keys, [(u32::from(b'a'), true), (u32::from(b'a'), false)]);
     view.read_with(cx, |view, _| assert!(!view.show_menu));
+}
+
+#[gpui::test]
+fn offscreen_clipboard_sends_utf8_text_to_remote(cx: &mut TestAppContext) {
+    let (view, cx, mut peer) = setup(cx, false);
+    commands(&mut peer);
+    cx.write_to_clipboard(ClipboardItem::new_string("中文剪贴板".into()));
+    view.update(cx, |view, cx| view.send_clipboard(cx));
+    assert!(matches!(
+        peer.commands.try_recv(),
+        Ok(SessionCommand::Input(vnc::X11Event::CopyText(text)))
+            if text == "中文剪贴板"
+    ));
+    view.read_with(cx, |view, _| {
+        assert_eq!(view.status.as_ref(), "Clipboard sent")
+    });
+}
+
+#[gpui::test]
+fn offscreen_latin1_clipboard_rejects_chinese_text(cx: &mut TestAppContext) {
+    let (view, cx, mut peer) = setup(cx, false);
+    commands(&mut peer);
+    view.update(cx, |view, _| view.req.clipboard = ClipboardMode::Latin1);
+    cx.write_to_clipboard(ClipboardItem::new_string("中文剪贴板".into()));
+    view.update(cx, |view, cx| view.send_clipboard(cx));
+    assert!(peer.commands.try_recv().is_err());
+    view.read_with(cx, |view, _| {
+        assert_eq!(
+            view.status.as_ref(),
+            "Clipboard not sent: text is not valid Latin-1"
+        )
+    });
 }

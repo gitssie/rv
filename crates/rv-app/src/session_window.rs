@@ -15,7 +15,10 @@ use gpui_component::{
 use image::{ImageBuffer, Rgba};
 use smallvec::SmallVec;
 
-use rv_core::{CAD_KEYSYMS, ConnectRequest, Keyboard, ScaleMode, XK_ALT_L, XK_CONTROL_L};
+use rv_core::{
+    CAD_KEYSYMS, ClipboardMode, ConnectRequest, Keyboard, LocalCursorMode, ScaleMode, XK_ALT_L,
+    XK_CONTROL_L,
+};
 use rv_session::{SessionEvent, SessionHandle};
 
 use crate::actions::*;
@@ -68,6 +71,7 @@ pub fn open(req: ConnectRequest, title: String, session: SessionOptions, cx: &mu
 enum Phase {
     Connecting,
     Connected,
+    Disconnecting,
     /// The session is over; `error` says whether it failed.
     Ended,
 }
@@ -182,11 +186,12 @@ impl SessionView {
     }
 
     fn update_local_cursor(&mut self, window: &mut Window, _: &mut Context<Self>) {
-        // The server paints its pointer into the framebuffer. Only hide ours
-        // over the live picture; letterboxing and local controls keep a cursor.
-        let hidden = self.phase == Phase::Connected
+        // RFB does not reliably say whether the server paints a pointer into
+        // the framebuffer. Automatic therefore favors a visible local cursor;
+        // Hide is an explicit opt-in for servers that paint their own pointer.
+        let hidden = self.req.local_cursor == LocalCursorMode::Hide
+            && self.phase == Phase::Connected
             && self.render_image.is_some()
-            && !self.view_only()
             && !self.show_menu
             && self.canvas_hovered
             && self.pointer_in_window
@@ -212,6 +217,11 @@ impl SessionView {
         let mut frame = None;
         let mut changed = false;
         for ev in self.handle.drain() {
+            if self.phase == Phase::Disconnecting
+                && !matches!(&ev, SessionEvent::Error(_) | SessionEvent::Disconnected)
+            {
+                continue;
+            }
             changed = true;
             match ev {
                 SessionEvent::Status(s) => self.status = s.into(),
@@ -388,8 +398,10 @@ impl SessionView {
         if let Some(item) = cx.read_from_clipboard()
             && let Some(text) = item.text()
         {
-            if text.chars().any(|c| c as u32 > 255) {
-                self.status = "Clipboard not sent: RFB carries Latin-1 text only".into();
+            if self.req.clipboard == ClipboardMode::Latin1
+                && text.chars().any(|character| character as u32 > 0xff)
+            {
+                self.status = "Clipboard not sent: text is not valid Latin-1".into();
                 return;
             }
             self.handle.copy_text(text);
@@ -408,13 +420,15 @@ impl SessionView {
     }
 
     fn disconnect(&mut self, cx: &mut Context<Self>) {
-        if self.phase == Phase::Ended {
+        if matches!(self.phase, Phase::Disconnecting | Phase::Ended) {
             return;
         }
         self.save_thumb();
         let released = self.keys.release_all();
         self.send_keys(released);
         self.handle.close();
+        self.phase = Phase::Disconnecting;
+        self.local_cursor.set_hidden(false);
         self.status = "Disconnecting…".into();
         cx.notify();
     }
@@ -636,7 +650,7 @@ impl SessionView {
                     .icon(IconName::WindowClose)
                     .text_color(theme::danger(cx))
                     .tooltip("Disconnect")
-                    .disabled(self.phase == Phase::Ended)
+                    .disabled(matches!(self.phase, Phase::Disconnecting | Phase::Ended))
                     .on_click(cx.listener(|this, _, _, cx| this.disconnect(cx))),
             )
     }
@@ -834,25 +848,27 @@ impl SessionView {
                         }),
                     ))
                     .child(div().h(px(1.)).my_1().bg(theme::toolbar_line()))
-                    .child(if self.phase == Phase::Ended {
-                        menu_item(
-                            "m-close",
-                            IconName::WindowClose,
-                            "Close window",
-                            cx.listener(|this, _, window, cx| this.close_window(window, cx)),
-                        )
-                    } else {
-                        menu_item(
-                            "m-disc",
-                            IconName::WindowClose,
-                            "Disconnect",
-                            cx.listener(|this, _, _, cx| {
-                                this.show_menu = false;
-                                this.disconnect(cx);
-                            }),
-                        )
-                        .text_color(theme::danger(cx))
-                    }),
+                    .child(
+                        if matches!(self.phase, Phase::Disconnecting | Phase::Ended) {
+                            menu_item(
+                                "m-close",
+                                IconName::WindowClose,
+                                "Close window",
+                                cx.listener(|this, _, window, cx| this.close_window(window, cx)),
+                            )
+                        } else {
+                            menu_item(
+                                "m-disc",
+                                IconName::WindowClose,
+                                "Disconnect",
+                                cx.listener(|this, _, _, cx| {
+                                    this.show_menu = false;
+                                    this.disconnect(cx);
+                                }),
+                            )
+                            .text_color(theme::danger(cx))
+                        },
+                    ),
             )
     }
 

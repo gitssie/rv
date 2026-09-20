@@ -333,7 +333,7 @@ async fn connect(
         .set_auth_method(async move { Ok(password) })
         .allow_shared(request.shared)
         .set_pixel_format(PixelFormat::bgra());
-    for enc in encodings_for(request.quality) {
+    for enc in encodings_for(request.quality, request.clipboard) {
         connector = connector.add_encoding(enc);
     }
     Ok(connector.build()?.try_start().await?.finish()?)

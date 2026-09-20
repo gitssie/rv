@@ -18,8 +18,8 @@ use gpui_component::{
 };
 
 use rv_core::{
-    AddressBook, ConnectRequest, Connection, ConnectionId, EncryptionMode, QualityPreset,
-    delete_password, load_password, parse_server, save_password,
+    AddressBook, ClipboardMode, ConnectRequest, Connection, ConnectionId, EncryptionMode,
+    LocalCursorMode, QualityPreset, delete_password, load_password, parse_server, save_password,
 };
 
 use crate::actions::*;
@@ -101,6 +101,8 @@ pub struct AddressBookApp {
     remember_password: bool,
     encryption: EncryptionMode,
     quality: QualityPreset,
+    clipboard_mode: ClipboardMode,
+    local_cursor_mode: LocalCursorMode,
     view_only: bool,
     shared: bool,
     editing: Option<ConnectionId>,
@@ -214,6 +216,8 @@ impl AddressBookApp {
             remember_password: true,
             encryption: EncryptionMode::LetServerChoose,
             quality: QualityPreset::Auto,
+            clipboard_mode: ClipboardMode::Utf8,
+            local_cursor_mode: LocalCursorMode::Automatic,
             view_only: false,
             shared: true,
             editing: None,
@@ -281,6 +285,8 @@ impl AddressBookApp {
         self.editing = conn.map(|c| c.id);
         self.encryption = conn.map_or(EncryptionMode::LetServerChoose, |c| c.encryption);
         self.quality = conn.map_or(QualityPreset::Auto, |c| c.quality);
+        self.clipboard_mode = conn.map_or(ClipboardMode::Utf8, |c| c.clipboard);
+        self.local_cursor_mode = conn.map_or(LocalCursorMode::Automatic, |c| c.local_cursor);
         self.view_only = conn.is_some_and(|c| c.view_only);
         self.shared = conn.is_none_or(|c| c.shared);
         self.remember_password = conn.is_none_or(|c| c.remember_password);
@@ -362,6 +368,8 @@ impl AddressBookApp {
         conn.labels = labels;
         conn.encryption = self.encryption;
         conn.quality = self.quality;
+        conn.clipboard = self.clipboard_mode;
+        conn.local_cursor = self.local_cursor_mode;
         conn.view_only = self.view_only;
         conn.shared = self.shared;
         let forget_password = conn.remember_password && !self.remember_password;
@@ -1049,12 +1057,15 @@ impl AddressBookApp {
             .child(
                 v_flex()
                     .id("modal-card")
+                    .debug_selector(|| "modal-card".into())
                     .w(px(480.))
+                    .max_h(relative(0.9))
                     .rounded_lg()
                     .bg(theme::card(cx))
                     .border_1()
                     .border_color(theme::line(cx))
                     .shadow_lg()
+                    .overflow_hidden()
                     .p_5()
                     .gap_4()
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
@@ -1073,7 +1084,14 @@ impl AddressBookApp {
                                 this.child(div().text_sm().text_color(theme::ink(cx)).child(s))
                             }),
                     )
-                    .child(body),
+                    .child(
+                        v_flex()
+                            .id("modal-body-scroll")
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .child(body),
+                    ),
             )
             .into_any_element()
     }
@@ -1498,6 +1516,34 @@ fn connection_options(app: &AddressBookApp, cx: &mut Context<AddressBookApp>) ->
                 .tooltip("Click to cycle")
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.quality = this.quality.cycle();
+                    cx.notify();
+                })),
+            cx,
+        ))
+        .child(setting_row(
+            "Clipboard text",
+            Button::new("clipboard")
+                .debug_selector(|| "clipboard-mode".into())
+                .outline()
+                .small()
+                .label(app.clipboard_mode.label())
+                .tooltip("Click to switch between UTF-8 Extended Clipboard and Latin-1")
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.clipboard_mode = this.clipboard_mode.cycle();
+                    cx.notify();
+                })),
+            cx,
+        ))
+        .child(setting_row(
+            "Local cursor",
+            Button::new("cursor")
+                .debug_selector(|| "cursor-mode".into())
+                .outline()
+                .small()
+                .label(app.local_cursor_mode.label())
+                .tooltip("Click to cycle")
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.local_cursor_mode = this.local_cursor_mode.cycle();
                     cx.notify();
                 })),
             cx,

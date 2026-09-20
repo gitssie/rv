@@ -9,8 +9,8 @@ mod prefs;
 mod store;
 
 pub use connection::{
-    ConnectRequest, Connection, ConnectionId, EncryptionMode, QualityPreset, ScaleMode,
-    parse_server,
+    ClipboardMode, ConnectRequest, Connection, ConnectionId, EncryptionMode, LocalCursorMode,
+    QualityPreset, ScaleMode, parse_server,
 };
 pub use keyboard::{Keyboard, keysym_for_keystroke};
 pub use keysym::{

@@ -1,8 +1,8 @@
 use super::{AddressBookApp, Modal, ViewMode, WindowRoot};
 use crate::actions::*;
-use gpui::{AppContext, Entity, Modifiers, TestAppContext, VisualTestContext, px};
+use gpui::{AppContext, Entity, Modifiers, TestAppContext, VisualTestContext, px, size};
 use gpui_component::Root;
-use rv_core::{AddressBook, ConnectRequest, Connection};
+use rv_core::{AddressBook, ClipboardMode, ConnectRequest, Connection, LocalCursorMode};
 use tempfile::TempDir;
 
 fn setup(
@@ -97,6 +97,68 @@ fn offscreen_invalid_server_keeps_editor_open(cx: &mut TestAppContext) {
         assert!(!app.status.is_empty());
         assert_ne!(app.status.as_ref(), "Ready");
     });
+}
+
+#[gpui::test]
+fn offscreen_local_cursor_mode_cycles_and_persists(cx: &mut TestAppContext) {
+    let (app, cx, dir) = setup(cx, vec![]);
+    cx.simulate_keystrokes("ctrl-n");
+    cx.simulate_input("example.test");
+    app.read_with(cx, |app, _| {
+        assert_eq!(app.local_cursor_mode, LocalCursorMode::Automatic)
+    });
+    click(cx, "cursor-mode");
+    app.read_with(cx, |app, _| {
+        assert_eq!(app.local_cursor_mode, LocalCursorMode::Show)
+    });
+    click(cx, "modal-save");
+    let book = AddressBook::load(rv_core::StorePaths::in_dir(dir.path().into())).unwrap();
+    let saved = &book.connections()[0];
+    assert_eq!(saved.local_cursor, LocalCursorMode::Show);
+    assert_eq!(
+        ConnectRequest::from_connection(saved, None).local_cursor,
+        LocalCursorMode::Show
+    );
+}
+
+#[gpui::test]
+fn offscreen_clipboard_mode_has_two_choices_and_persists(cx: &mut TestAppContext) {
+    let (app, cx, dir) = setup(cx, vec![]);
+    cx.simulate_keystrokes("ctrl-n");
+    cx.simulate_input("example.test");
+    app.read_with(cx, |app, _| {
+        assert_eq!(app.clipboard_mode, ClipboardMode::Utf8)
+    });
+    click(cx, "clipboard-mode");
+    app.read_with(cx, |app, _| {
+        assert_eq!(app.clipboard_mode, ClipboardMode::Latin1)
+    });
+    click(cx, "clipboard-mode");
+    app.read_with(cx, |app, _| {
+        assert_eq!(app.clipboard_mode, ClipboardMode::Utf8)
+    });
+    click(cx, "clipboard-mode");
+    click(cx, "modal-save");
+    let book = AddressBook::load(rv_core::StorePaths::in_dir(dir.path().into())).unwrap();
+    let saved = &book.connections()[0];
+    assert_eq!(saved.clipboard, ClipboardMode::Latin1);
+    assert_eq!(
+        ConnectRequest::from_connection(saved, None).clipboard,
+        ClipboardMode::Latin1
+    );
+}
+
+#[gpui::test]
+fn offscreen_connection_modal_stays_within_minimum_window_height(cx: &mut TestAppContext) {
+    let (_app, cx, _dir) = setup(cx, vec![]);
+    cx.simulate_resize(size(px(800.), px(520.)));
+    cx.simulate_keystrokes("ctrl-n");
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let bounds = cx
+        .debug_bounds("modal-card")
+        .expect("connection modal must be rendered");
+    assert!(bounds.origin.y >= px(0.));
+    assert!(bounds.bottom() <= px(520.));
 }
 
 #[gpui::test]

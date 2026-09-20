@@ -84,11 +84,67 @@ impl QualityPreset {
     }
 }
 
+/// Clipboard text encoding used for this connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ClipboardMode {
+    /// UltraVNC Extended Clipboard with UTF-8 text.
+    #[default]
+    Utf8,
+    /// Classic RFB ClientCutText / ServerCutText with ISO-8859-1 text.
+    Latin1,
+}
+
+impl ClipboardMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Utf8 => "UTF-8",
+            Self::Latin1 => "Latin-1",
+        }
+    }
+
+    pub fn cycle(self) -> Self {
+        match self {
+            Self::Utf8 => Self::Latin1,
+            Self::Latin1 => Self::Utf8,
+        }
+    }
+}
+
+/// How the native pointer is shown over a remote session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum LocalCursorMode {
+    /// Prefer a visible native pointer when server cursor support is unknown.
+    #[default]
+    Automatic,
+    /// Always keep the native pointer visible.
+    Show,
+    /// Hide the native pointer while it is over the active remote desktop.
+    Hide,
+}
+
+impl LocalCursorMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Automatic => "Automatic",
+            Self::Show => "Always show",
+            Self::Hide => "Hide over desktop",
+        }
+    }
+
+    pub fn cycle(self) -> Self {
+        match self {
+            Self::Automatic => Self::Show,
+            Self::Show => Self::Hide,
+            Self::Hide => Self::Automatic,
+        }
+    }
+}
+
 /// How the remote desktop is fitted into the session window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum ScaleMode {
-    #[default]
     Fit,
+    #[default]
     Actual,
     Stretch,
 }
@@ -127,6 +183,10 @@ pub struct Connection {
     #[serde(default)]
     pub quality: QualityPreset,
     #[serde(default)]
+    pub clipboard: ClipboardMode,
+    #[serde(default)]
+    pub local_cursor: LocalCursorMode,
+    #[serde(default)]
     pub view_only: bool,
     #[serde(default = "default_shared")]
     pub shared: bool,
@@ -160,6 +220,8 @@ impl Connection {
             remember_password: false,
             encryption: EncryptionMode::default(),
             quality: QualityPreset::default(),
+            clipboard: ClipboardMode::default(),
+            local_cursor: LocalCursorMode::default(),
             view_only: false,
             shared: true,
             labels: Vec::new(),
@@ -183,6 +245,8 @@ pub struct ConnectRequest {
     pub password: Option<String>,
     pub encryption: EncryptionMode,
     pub quality: QualityPreset,
+    pub clipboard: ClipboardMode,
+    pub local_cursor: LocalCursorMode,
     pub view_only: bool,
     pub shared: bool,
 }
@@ -198,6 +262,8 @@ impl ConnectRequest {
             password,
             encryption: conn.encryption,
             quality: conn.quality,
+            clipboard: conn.clipboard,
+            local_cursor: conn.local_cursor,
             view_only: conn.view_only,
             shared: conn.shared,
         }
@@ -344,11 +410,41 @@ mod tests {
 
     #[test]
     fn connection_round_trip() {
-        let c = Connection::new("office", "10.0.0.8", 5900);
+        let mut c = Connection::new("office", "10.0.0.8", 5900);
+        c.clipboard = ClipboardMode::Latin1;
+        c.local_cursor = LocalCursorMode::Hide;
         let json = serde_json::to_string(&c).unwrap();
         let back: Connection = serde_json::from_str(&json).unwrap();
         assert_eq!(back.name, "office");
         assert_eq!(back.port, 5900);
         assert!(back.shared);
+        assert_eq!(back.clipboard, ClipboardMode::Latin1);
+        assert_eq!(back.local_cursor, LocalCursorMode::Hide);
+        assert_eq!(
+            ConnectRequest::from_connection(&back, None).clipboard,
+            ClipboardMode::Latin1
+        );
+        assert_eq!(
+            ConnectRequest::from_connection(&back, None).local_cursor,
+            LocalCursorMode::Hide
+        );
+    }
+
+    #[test]
+    fn legacy_connection_defaults_to_automatic_local_cursor() {
+        let c = Connection::new("office", "10.0.0.8", 5900);
+        let mut json = serde_json::to_value(&c).unwrap();
+        json.as_object_mut().unwrap().remove("local_cursor");
+        let back: Connection = serde_json::from_value(json).unwrap();
+        assert_eq!(back.local_cursor, LocalCursorMode::Automatic);
+    }
+
+    #[test]
+    fn legacy_connection_defaults_to_utf8_clipboard() {
+        let c = Connection::new("office", "10.0.0.8", 5900);
+        let mut json = serde_json::to_value(&c).unwrap();
+        json.as_object_mut().unwrap().remove("clipboard");
+        let back: Connection = serde_json::from_value(json).unwrap();
+        assert_eq!(back.clipboard, ClipboardMode::Utf8);
     }
 }

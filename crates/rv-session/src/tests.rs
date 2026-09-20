@@ -7,7 +7,8 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rv_core::{ConnectRequest, EncryptionMode, QualityPreset};
+use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
+use rv_core::{ClipboardMode, ConnectRequest, EncryptionMode, QualityPreset};
 
 use crate::{SessionEvent, SessionHandle, coalesce_frames};
 
@@ -23,6 +24,44 @@ fn read_exact(s: &mut TcpStream, n: usize) -> Vec<u8> {
     let mut buf = vec![0u8; n];
     s.read_exact(&mut buf).unwrap();
     buf
+}
+
+const EXTENDED_CLIPBOARD_ENCODING: u32 = 0xC0A1_E5CE;
+const CLIPBOARD_TEXT: u32 = 1;
+const CLIPBOARD_CAPS: u32 = 1 << 24;
+const CLIPBOARD_REQUEST: u32 = 1 << 25;
+const CLIPBOARD_PEEK: u32 = 1 << 26;
+const CLIPBOARD_NOTIFY: u32 = 1 << 27;
+const CLIPBOARD_PROVIDE: u32 = 1 << 28;
+
+fn write_extended_clipboard(sock: &mut TcpStream, flags: u32, payload: &[u8]) {
+    let length = i32::try_from(4 + payload.len()).unwrap();
+    sock.write_all(&[3, 0, 0, 0]).unwrap();
+    sock.write_all(&(-length).to_be_bytes()).unwrap();
+    sock.write_all(&flags.to_be_bytes()).unwrap();
+    sock.write_all(payload).unwrap();
+}
+
+fn extended_clipboard_provide(text: &str) -> Vec<u8> {
+    let normalized = text.replace("\r\n", "\n").replace(['\r', '\n'], "\r\n");
+    let mut plain = Vec::new();
+    plain.extend_from_slice(&((normalized.len() + 1) as u32).to_be_bytes());
+    plain.extend_from_slice(normalized.as_bytes());
+    plain.push(0);
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&plain).unwrap();
+    encoder.finish().unwrap()
+}
+
+fn decode_extended_clipboard_text(payload: &[u8]) -> String {
+    let mut decoder = ZlibDecoder::new(payload);
+    let mut plain = Vec::new();
+    decoder.read_to_end(&mut plain).unwrap();
+    let length = u32::from_be_bytes(plain[..4].try_into().unwrap()) as usize;
+    let text = &plain[4..4 + length - 1];
+    String::from_utf8(text.to_vec())
+        .unwrap()
+        .replace("\r\n", "\n")
 }
 
 /// RFB 3.8 handshake: None auth, `width`×`height` framebuffer named `name`.
@@ -121,6 +160,90 @@ fn mock_rfb_messages(mut sock: TcpStream) -> bool {
     sent_frame && saw_pointer && saw_key
 }
 
+fn extended_clipboard_server(
+    mut sock: TcpStream,
+    ready: mpsc::Sender<()>,
+    release: mpsc::Receiver<()>,
+    accepts_notify: bool,
+) -> String {
+    rfb_handshake(&mut sock, 8, 8, b"clipboard-test");
+    sock.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    let mut capabilities =
+        CLIPBOARD_CAPS | CLIPBOARD_REQUEST | CLIPBOARD_PEEK | CLIPBOARD_PROVIDE | CLIPBOARD_TEXT;
+    if accepts_notify {
+        capabilities |= CLIPBOARD_NOTIFY;
+    }
+    let mut local_text = None;
+
+    loop {
+        let message_type = read_exact(&mut sock, 1)[0];
+        match message_type {
+            0 => {
+                let _ = read_exact(&mut sock, 3 + 16);
+            }
+            2 => {
+                let _ = read_exact(&mut sock, 1);
+                let count = u16::from_be_bytes(read_exact(&mut sock, 2).try_into().unwrap());
+                let encodings = read_exact(&mut sock, count as usize * 4);
+                let advertised = encodings.chunks_exact(4).any(|encoding| {
+                    u32::from_be_bytes(encoding.try_into().unwrap()) == EXTENDED_CLIPBOARD_ENCODING
+                });
+                assert!(advertised, "client did not advertise Extended Clipboard");
+                let unsolicited_limit = if accepts_notify { 0 } else { 0x0010_0000_u32 };
+                write_extended_clipboard(&mut sock, capabilities, &unsolicited_limit.to_be_bytes());
+            }
+            3 => {
+                let _ = read_exact(&mut sock, 9);
+            }
+            4 => {
+                let _ = read_exact(&mut sock, 7);
+            }
+            5 => {
+                let _ = read_exact(&mut sock, 5);
+            }
+            6 => {
+                let _ = read_exact(&mut sock, 3);
+                let length = i32::from_be_bytes(read_exact(&mut sock, 4).try_into().unwrap());
+                assert!(length < 0, "UTF-8 mode sent legacy ClientCutText");
+                let data = read_exact(&mut sock, (-length) as usize);
+                let flags = u32::from_be_bytes(data[..4].try_into().unwrap());
+                let action = flags & 0xFF00_0000;
+                if action & CLIPBOARD_CAPS != 0 {
+                    ready.send(()).unwrap();
+                    continue;
+                }
+                match action {
+                    CLIPBOARD_NOTIFY => {
+                        assert!(accepts_notify, "server did not advertise Notify support");
+                        write_extended_clipboard(
+                            &mut sock,
+                            CLIPBOARD_REQUEST | CLIPBOARD_TEXT,
+                            &[],
+                        );
+                    }
+                    CLIPBOARD_PROVIDE => {
+                        local_text = Some(decode_extended_clipboard_text(&data[4..]));
+                        write_extended_clipboard(&mut sock, CLIPBOARD_NOTIFY | CLIPBOARD_TEXT, &[]);
+                    }
+                    CLIPBOARD_REQUEST => {
+                        assert!(local_text.is_some());
+                        let compressed = extended_clipboard_provide("远程剪贴板");
+                        write_extended_clipboard(
+                            &mut sock,
+                            CLIPBOARD_PROVIDE | CLIPBOARD_TEXT,
+                            &compressed,
+                        );
+                        let _ = release.recv_timeout(Duration::from_secs(5));
+                        return local_text.unwrap();
+                    }
+                    action => panic!("unexpected Extended Clipboard action: {action:#x}"),
+                }
+            }
+            message_type => panic!("unexpected client message: {message_type}"),
+        }
+    }
+}
+
 fn wait_for(
     handle: &SessionHandle,
     timeout: Duration,
@@ -148,6 +271,8 @@ fn request_for(port: u16) -> ConnectRequest {
         password: None,
         encryption: EncryptionMode::Off,
         quality: QualityPreset::Fast,
+        clipboard: ClipboardMode::Utf8,
+        local_cursor: rv_core::LocalCursorMode::Automatic,
         view_only: false,
         shared: true,
     }
@@ -197,6 +322,43 @@ fn handshake_frame_and_input() {
     handle.close();
     drop(handle);
     let _ = server.join();
+}
+
+fn assert_extended_clipboard_roundtrip(accepts_notify: bool) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let (sock, _) = listener.accept().unwrap();
+        extended_clipboard_server(sock, ready_tx, release_rx, accepts_notify)
+    });
+
+    let handle = SessionHandle::spawn(request_for(addr.port()));
+    ready_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("client should complete Extended Clipboard capabilities exchange");
+    handle.copy_text("中文剪贴板".into());
+    assert!(
+        wait_for(&handle, Duration::from_secs(5), |event| {
+            matches!(event, SessionEvent::Clipboard(text) if text == "远程剪贴板")
+        }),
+        "expected UTF-8 clipboard text from the server"
+    );
+    release_tx.send(()).unwrap();
+    handle.close();
+    drop(handle);
+    assert_eq!(server.join().unwrap(), "中文剪贴板");
+}
+
+#[test]
+fn utf8_clipboard_matches_trollvnc_capabilities_in_both_directions() {
+    assert_extended_clipboard_roundtrip(false);
+}
+
+#[test]
+fn utf8_clipboard_uses_notify_when_the_server_supports_it() {
+    assert_extended_clipboard_roundtrip(true);
 }
 
 /// Regression: a busy desktop produces one `FrameReady` per rectangle. The UI

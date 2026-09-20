@@ -30,7 +30,7 @@ impl Default for Preferences {
             theme: ThemePref::System,
             hide_screenshots: false,
             menu_key: default_menu_key(),
-            default_scale: ScaleMode::Fit,
+            default_scale: ScaleMode::Actual,
             pin_toolbar: true,
         }
     }
@@ -59,5 +59,18 @@ impl ThemePref {
             Self::Light => Self::Dark,
             Self::Dark => Self::System,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_scaling_is_actual_size() {
+        assert_eq!(Preferences::default().default_scale, ScaleMode::Actual);
+
+        let legacy: Preferences = serde_json::from_str("{}").unwrap();
+        assert_eq!(legacy.default_scale, ScaleMode::Actual);
     }
 }

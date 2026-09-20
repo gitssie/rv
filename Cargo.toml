@@ -1,5 +1,6 @@
 [workspace]
 members = ["crates/rv-core", "crates/rv-session", "crates/rv-app"]
+exclude = ["vendor/vnc-rs"]
 resolver = "2"
 default-members = ["crates/rv-app"]
 
@@ -22,7 +23,7 @@ tokio = { version = "1", features = ["net", "rt-multi-thread", "macros", "time",
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "serde"] }
-vnc = { package = "vnc-rs", version = "0.5.3" }
+vnc = { package = "vnc-rs", path = "vendor/vnc-rs" }
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 webpki-roots = "0.26"
