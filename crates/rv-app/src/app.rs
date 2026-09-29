@@ -19,7 +19,7 @@ use gpui_component::{
 
 use rv_core::{
     AddressBook, ClipboardMode, ConnectRequest, Connection, ConnectionId, EncryptionMode,
-    LocalCursorMode, QualityPreset, delete_password, load_password, parse_server, save_password,
+    LocalCursorMode, QualityPreset, StoreError, TransferFolders, parse_server,
 };
 
 use crate::actions::*;
@@ -238,6 +238,68 @@ impl AddressBookApp {
         }
     }
 
+    pub(crate) fn remember_transfer_folders(
+        &mut self,
+        id: ConnectionId,
+        folders: TransferFolders,
+        cx: &mut Context<Self>,
+    ) {
+        if self.read_only {
+            return;
+        }
+        if let Some(connection) = self.book.get_mut(id)
+            && connection.transfer_folders != folders
+        {
+            connection.transfer_folders = folders;
+            self.persist();
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn save_retried_password(
+        &mut self,
+        request: &ConnectRequest,
+        remember: bool,
+        cx: &mut Context<Self>,
+    ) -> Result<Option<ConnectionId>, StoreError> {
+        if self.read_only {
+            return Err(StoreError::Credential("address book is read-only".into()));
+        }
+        let id = match request.connection_id {
+            Some(id) if self.book.get(id).is_some() => id,
+            Some(_) => return Err(StoreError::UnknownConnection),
+            None if remember => {
+                let mut connection = Connection::new(&request.name, &request.host, request.port);
+                connection.username = request.username.clone();
+                connection.encryption = request.encryption;
+                connection.quality = request.quality;
+                connection.clipboard = request.clipboard;
+                connection.local_cursor = request.local_cursor;
+                connection.view_only = request.view_only;
+                connection.shared = request.shared;
+                connection.last_connected = Some(unix_now());
+                let id = connection.id;
+                self.book.upsert(connection);
+                self.selected = Some(id);
+                id
+            }
+            None => return Ok(None),
+        };
+        if remember {
+            if let Some(password) = request.password.as_deref() {
+                self.book.paths().save_password(id, password)?;
+            }
+        } else {
+            self.book.paths().delete_password(id)?;
+        }
+        if let Some(connection) = self.book.get_mut(id) {
+            connection.remember_password = remember;
+        }
+        self.book.save()?;
+        cx.notify();
+        Ok(Some(id))
+    }
+
     fn set_status(&mut self, text: impl Into<SharedString>, cx: &mut Context<Self>) {
         self.status = text.into();
         cx.notify();
@@ -376,6 +438,7 @@ impl AddressBookApp {
         conn.remember_password = self.remember_password;
         let id = conn.id;
         let remember = conn.remember_password;
+        let paths = self.book.paths().clone();
         self.credential_busy = true;
         self.set_status("Preparing connection…", cx);
         cx.spawn_in(window, async move |this, cx| {
@@ -383,13 +446,13 @@ impl AddressBookApp {
                 .background_executor()
                 .spawn(async move {
                     if forget_password {
-                        delete_password(id)?;
+                        paths.delete_password(id)?;
                     }
                     if remember && !password.is_empty() {
-                        save_password(id, &password)?;
+                        paths.save_password(id, &password)?;
                     }
                     if remember && password.is_empty() && connect {
-                        load_password(id)
+                        paths.load_password(id)
                     } else {
                         Ok((!password.is_empty()).then_some(password))
                     }
@@ -464,10 +527,11 @@ impl AddressBookApp {
             return;
         };
         let remember = conn.remember_password;
+        let paths = self.book.paths().clone();
         self.credential_busy = true;
         self.set_status(
             if remember {
-                "Unlocking saved password…"
+                "Loading saved password…"
             } else {
                 "Preparing connection…"
             },
@@ -478,7 +542,7 @@ impl AddressBookApp {
                 .background_executor()
                 .spawn(async move {
                     if remember {
-                        load_password(id)
+                        paths.load_password(id)
                     } else {
                         Ok(None)
                     }
@@ -509,12 +573,23 @@ impl AddressBookApp {
         self.status = format!("Connecting to {}…", req.display_name()).into();
         let title = req.display_name().to_string();
         let prefs = self.book.prefs();
+        let transfer_folders = req
+            .connection_id
+            .and_then(|id| self.book.get(id))
+            .map(|connection| connection.transfer_folders.clone())
+            .unwrap_or_default();
         let options = session_window::SessionOptions {
             scale: prefs.default_scale,
             pin_toolbar: prefs.pin_toolbar,
             menu_key: prefs.menu_key.clone(),
             hide_shots: prefs.hide_screenshots,
             thumb_path: req.connection_id.map(|id| self.book.paths().thumb_path(id)),
+            address_book: Some(cx.entity().downgrade()),
+            transfer_folders,
+            remember_password: req
+                .connection_id
+                .and_then(|id| self.book.get(id))
+                .is_some_and(|conn| conn.remember_password),
         };
         session_window::open(req, title, options, cx);
         cx.notify();

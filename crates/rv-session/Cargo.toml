@@ -25,8 +25,12 @@ webpki-roots.workspace = true
 openssl.workspace = true
 tokio-openssl.workspace = true
 zeroize = "1"
+serde_json.workspace = true
+base64 = "0.22"
+uuid.workspace = true
 
 [dev-dependencies]
 flate2 = "1"
+tempfile = "3"
 openssl.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-util", "time"] }

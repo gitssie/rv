@@ -3,14 +3,12 @@
 mod connection;
 mod keyboard;
 mod keysym;
-#[cfg(target_os = "macos")]
-mod macos_keychain;
 mod prefs;
 mod store;
 
 pub use connection::{
     ClipboardMode, ConnectRequest, Connection, ConnectionId, EncryptionMode, LocalCursorMode,
-    QualityPreset, ScaleMode, parse_server,
+    QualityPreset, ScaleMode, TransferFolders, parse_server,
 };
 pub use keyboard::{Keyboard, keysym_for_keystroke};
 pub use keysym::{
@@ -18,7 +16,4 @@ pub use keysym::{
     keysym_name, keysym_of,
 };
 pub use prefs::{Preferences, ThemePref};
-pub use store::{
-    AddressBook, StoreError, StorePaths, delete_password, load_password, password_key,
-    save_password,
-};
+pub use store::{AddressBook, StoreError, StorePaths};

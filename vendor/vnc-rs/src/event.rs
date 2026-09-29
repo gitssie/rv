@@ -1,3 +1,4 @@
+use crate::tight::{TightFileCommand, TightFileEvent};
 use crate::PixelFormat;
 
 type ImageData = Vec<u8>;
@@ -83,6 +84,8 @@ pub enum VncEvent {
     Text(String),
     #[doc(hidden)]
     ExtendedClipboard(ExtendedClipboardEvent),
+    /// TightVNC 1.x file transfer capability and data messages.
+    TightFile(TightFileEvent),
     /// If any unexpected error happens in the async process routines
     /// This event will propagate the error to the current context
     Error(String),
@@ -161,4 +164,6 @@ pub enum X11Event {
     /// Uses UTF-8 when Extended Clipboard was advertised, otherwise Latin-1.
     ///
     CopyText(String),
+    /// TightVNC 1.x file transfer request or upload block.
+    TightFile(TightFileCommand),
 }

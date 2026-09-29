@@ -16,8 +16,7 @@ A native desktop VNC viewer written in Rust with [GPUI](https://www.gpui.rs/). D
 - VNC Auth, Tight / ZRLE / TRLE / Raw encodings
 - Mac Screen Sharing / Apple Remote Desktop (ARD) login using the **Username** and **Password** fields in connection properties. ARD encrypts credentials, but requires no legacy VNC password setting on the Mac. Use **Let server choose**; **Always on** still requires VeNCrypt session TLS.
 - VeNCrypt TLS: `TLSVnc` / `TLSNone` (anonymous TLS, TigerVNC's default) via OpenSSL, `X509Vnc` / `X509None` via rustls with WebPKI roots. `Let server choose` picks encryption automatically when the server offers nothing else
-- Passwords stored in the OS keychain
-- Touch ID for saved passwords in signed macOS builds (with macOS password fallback)
+- Remembered passwords encrypted in the local application data directory
 
 ## Build
 
@@ -80,6 +79,84 @@ RV_DATA_DIR=/tmp/rv-scratch cargo run -p rv-app -- 127.0.0.1:5999
 
 `RV_DATA_DIR` overrides the address-book location (default: the platform data directory).
 
+To preview file transfer without an iPhone, start the local TightVNC 1.x fixture
+with an existing folder as its remote root:
+
+```bash
+mkdir -p /tmp/rv-file-fixture
+cargo run -p rv-session --example tight_file_server -- /tmp/rv-file-fixture 127.0.0.1:5999
+cargo run -p rv-app -- 127.0.0.1:5999
+```
+
+Open the folder button in RV's session toolbar. Select local files and click
+**Upload**, or select remote files and click **Download**. Command-click or
+Shift-click to select multiple items. Selected files enter a serial transfer
+queue with per-item progress, errors, and **Retry**. The queue scrolls when there are many
+items and collapses after all queued jobs succeed. Click the Name, Size, or
+Modified column heading to sort that pane; no file search is provided.
+The arrow button in
+the session toolbar opens a native file picker for a single upload. Downloads
+are saved in the folder shown on the left. If a destination name exists, choose
+**Skip**, **Rename**, or **Replace** before the batch starts. Replacement first
+transfers to a temporary name, verifies it, then replaces the original.
+Each pane has Back, Up, and an editable path. Right-click a file to copy its
+name or path, inspect its details, upload or download it, rename it, or delete it after a
+confirmation. Each pane also has a compact **New folder** action. Delete is
+permanent, and folders must be empty.
+In full screen, hover over the small top-edge handle to reveal **Exit full screen**,
+or press Shift-Command-F.
+Enable File Transfer in TrollVNC settings and apply the change to offer this extension. The fixture runs
+only on localhost and keeps uploads inside the folder passed to it.
+TrollVNC 3.2-278 or newer advertises its own file-management capability after
+RV requests it. Remote Delete, Rename, and New folder are available only when that
+capability is received; older TightVNC servers retain list, upload, and
+download. TrollVNC confines management operations to its file-transfer root
+and rejects symlink traversal through parent folders.
+TrollVNC 3.2-283 adds a negotiated Photos capability. The file-transfer window
+switches between filesystem **Files** and the PhotoKit-backed **Photos** list.
+The Photos header can filter the list to an iOS photo album; pages show 12
+images with compact thumbnails.
+**Upload to Photos** stages an image, checks its SHA-256 on the device, imports
+it through PhotoKit, and verifies the new asset ID. Remote image context menus
+can import an existing file. Imported assets retain their source filenames.
+**Download original** exports the selected asset
+to a temporary remote file and transfers it through TightVNC. PhotoKit access
+requires the TrollVNC RootHide package and a real iOS device.
+The Photos context menu labels this action **Download** and offers **Delete…**
+when the server advertises photo deletion. Deletion uses PhotoKit, moves the
+asset to Recently Deleted, and requires iOS confirmation in the VNC window.
+With a server that advertises batch deletion, use Command-click to toggle
+photos or Shift-click to select a range on the current page, then choose
+**Delete (N)**. Up to 50 selected assets go through one PhotoKit change request.
+The protocol implementation currently handles uncompressed TightVNC file lists
+and data. Cancelling an in-progress download requires reconnecting before the
+next download, because TightVNC's file frames have no transfer identifier.
+Uploads are first checked against a fresh remote listing and the expected
+size. TrollVNC 3.2-285 also exposes a SHA-256 query; RV checks both uploads and
+downloads and reports **SHA-256 verified** only when the digests match. A
+mismatched download is removed before local replacement. Older servers can
+only confirm file size and the uploaded name. **Sent · unverified** means the final
+verification has not completed.
+
+`tests/fixtures/libvncserver_file_fixture.c` is a localhost harness for
+checking against LibVNCServer itself. On macOS, with a host build of
+LibVNCServer installed:
+
+```bash
+LIBVNCSERVER_PREFIX="$(brew --prefix libvncserver)"
+clang -I "$LIBVNCSERVER_PREFIX/include" tests/fixtures/libvncserver_file_fixture.c \
+  tests/fixtures/photo_library_fake.c ../TrollVNC/src/FileManagement.c \
+  -L "$LIBVNCSERVER_PREFIX/lib" -lvncserver -o /tmp/rv-libvncserver-file-fixture
+RV_LIBVNCSERVER_FIXTURE=/tmp/rv-libvncserver-file-fixture \
+  cargo test -p rv-session tight_file_roundtrip_with_real_libvncserver_when_available
+```
+
+This test checks real file listing, download, upload, SHA-256 verification,
+atomic replacement, folder creation, rename, deletion, symlink escape rejection, and the Photos
+list/import/export protocol with a fake PhotoKit backend
+without an iOS device. The archive in `TrollVNC/lib-simulator` targets iOS
+Simulator and cannot be linked into a macOS executable.
+
 To test Mac authentication locally:
 
 ```sh
@@ -93,34 +170,23 @@ logins. ARD mode takes precedence over `RV_MOCK_TLS`. Automated TCP tests cover
 accepted/rejected logins, missing credentials, desktop frames, and input after
 authentication; malformed DH parameters and credential byte limits have unit tests.
 
-## macOS signing and Touch ID
+## macOS packaging
 
-Touch ID-protected passwords require a Developer ID-signed app and a matching macOS
-Developer ID provisioning profile for `io.github.madeye.rv`. Package a release build with:
+Package a release build with:
 
 ```bash
 cargo build --release -p rv-app --locked
 python3 scripts/package-macos.py \
-  --binary target/release/rv --output target/release/RV.app \
-  --identity "$RV_SIGN_IDENTITY" --profile "$RV_PROVISION_PROFILE"
+  --binary target/release/rv --output target/release/RV.app
 ```
 
-The packager embeds the profile, derives the app's Keychain entitlements from it,
-and verifies the signature. Omit both signing arguments for an ad-hoc bundle;
-ad-hoc builds and plain `cargo run` cannot access protected saved passwords. VNC
-connections with **Remember password** turned off still work in those builds.
-
-On first use, existing login-Keychain passwords are copied into the protected
-Keychain, then removed from the old store. macOS may request the login password
-once to authorize reading an old entry. Later reads use Touch ID when available;
-macOS retains its password fallback for unavailable or locked-out biometrics.
-Cancelling authentication cancels the connection attempt. Editing connection
-settings leaves saved passwords untouched unless a replacement is entered.
-
-For a manual authentication check, run `cargo build -p rv-core --example keychain_roundtrip`,
-package `target/debug/examples/keychain_roundtrip` with the
-same signing arguments, and run that bundle's `Contents/MacOS/rv` executable. The
-check creates, updates, authenticates, and removes a temporary test credential.
+Pass `--identity "$RV_SIGN_IDENTITY"` to sign with a Developer ID identity;
+without it the bundle is ad-hoc signed. Saved passwords are stored as AES-256-GCM
+files in `passwords/` under the RV data directory. Each save uses a random nonce,
+but the encryption key is fixed in the executable: anyone with the binary and
+password files can recover them. Existing passwords in the OS keychain are not
+copied; enter and save each password again after upgrading. Editing connection
+settings leaves a saved password untouched unless a replacement is entered.
 
 ## Layout
 

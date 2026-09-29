@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::ops::Range;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -10,18 +10,23 @@ use gpui::*;
 use gpui_component::{
     Disableable as _, Icon, IconName, Selectable as _, Sizable, StyledExt, TitleBar,
     button::{Button, ButtonVariants as _},
-    h_flex, v_flex,
+    checkbox::Checkbox,
+    h_flex,
+    input::{Input, InputEvent, InputState},
+    v_flex,
 };
 use image::{ImageBuffer, Rgba};
 use smallvec::SmallVec;
 
 use rv_core::{
-    CAD_KEYSYMS, ClipboardMode, ConnectRequest, Keyboard, LocalCursorMode, ScaleMode, XK_ALT_L,
-    XK_CONTROL_L,
+    CAD_KEYSYMS, ClipboardMode, ConnectRequest, Keyboard, LocalCursorMode, ScaleMode,
+    TransferFolders, XK_ALT_L, XK_CONTROL_L,
 };
-use rv_session::{SessionEvent, SessionHandle};
+use rv_session::{FileCommand, SessionEvent, SessionHandle, TransferStatus};
 
 use crate::actions::*;
+use crate::app::AddressBookApp;
+use crate::file_transfer_window;
 use crate::theme;
 
 pub struct SessionOptions {
@@ -30,6 +35,9 @@ pub struct SessionOptions {
     pub menu_key: String,
     pub hide_shots: bool,
     pub thumb_path: Option<PathBuf>,
+    pub address_book: Option<WeakEntity<AddressBookApp>>,
+    pub transfer_folders: TransferFolders,
+    pub remember_password: bool,
 }
 
 /// Pixels of scroll per RFB wheel click. One notch of a mouse wheel is one
@@ -76,6 +84,22 @@ enum Phase {
     Ended,
 }
 
+fn password_error(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    [
+        "password check failed",
+        "wrong password",
+        "invalid password",
+        "password rejected",
+        "authentication failed",
+        "authentication rejected",
+        "auth is required but no password provided",
+        "mac login was rejected",
+    ]
+    .iter()
+    .any(|reason| message.contains(reason))
+}
+
 pub struct SessionView {
     req: ConnectRequest,
     handle: SessionHandle,
@@ -93,10 +117,20 @@ pub struct SessionView {
     buttons: u8,
     wheel_accum: Point<f32>,
     last_generation: u64,
+    last_file_revision: u64,
     render_image: Option<Arc<RenderImage>>,
     fb_w: u16,
     fb_h: u16,
     error: Option<SharedString>,
+    password_input: Entity<InputState>,
+    remember_password: bool,
+    retried_password: bool,
+    password_validation: Option<SharedString>,
+    file_transfer_window: Option<WindowHandle<gpui_component::Root>>,
+    file_transfer_opening: bool,
+    transfer_folders: Rc<RefCell<TransferFolders>>,
+    address_book: Option<WeakEntity<AddressBookApp>>,
+    _password_subscription: Subscription,
     /// Where the remote picture was last painted, in window pixels. Filled
     /// in by a probe element so pointer mapping never guesses chrome sizes.
     image_box: Rc<Cell<Bounds<Pixels>>>,
@@ -141,7 +175,29 @@ impl SessionView {
             menu_key,
             hide_shots,
             thumb_path,
+            address_book,
+            transfer_folders,
+            remember_password,
         } = options;
+        let password_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Enter a new password")
+                .masked(true)
+        });
+        let password_subscription = cx.subscribe_in(
+            &password_input,
+            window,
+            |this, _, event: &InputEvent, window, cx| match event {
+                InputEvent::PressEnter { .. } if this.phase == Phase::Ended => {
+                    this.retry_with_password(window, cx);
+                }
+                InputEvent::Change => {
+                    this.password_validation = None;
+                    cx.notify();
+                }
+                _ => {}
+            },
+        );
         cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor()
@@ -171,10 +227,20 @@ impl SessionView {
             buttons: 0,
             wheel_accum: point(0.0, 0.0),
             last_generation: 0,
+            last_file_revision: 0,
             render_image: None,
             fb_w: 0,
             fb_h: 0,
             error: None,
+            password_input,
+            remember_password,
+            retried_password: false,
+            password_validation: None,
+            file_transfer_window: None,
+            file_transfer_opening: false,
+            transfer_folders: Rc::new(RefCell::new(transfer_folders)),
+            address_book,
+            _password_subscription: password_subscription,
             image_box: Rc::new(Cell::new(Bounds::default())),
             keys: Keyboard::new(),
             focus,
@@ -209,6 +275,79 @@ impl SessionView {
         format!("{}:{}", self.req.host, self.req.port)
     }
 
+    fn open_file_transfer(&mut self, cx: &mut Context<Self>) {
+        // Claim the request before scheduling it, so rapid clicks from either
+        // the toolbar or menu cannot queue multiple window creations.
+        if self.file_transfer_opening {
+            return;
+        }
+        self.file_transfer_opening = true;
+        let existing = self.file_transfer_window;
+        let host = self.host();
+        let client = self.handle.file_client();
+        let allow_upload = !self.view_only();
+        let memory = file_transfer_window::TransferMemory {
+            folders: self.transfer_folders.clone(),
+            address_book: self.address_book.clone(),
+            connection_id: self.req.connection_id,
+        };
+        cx.spawn(async move |this, cx| {
+            if this.upgrade().is_none() {
+                return;
+            }
+            if let Some(handle) = existing
+                && handle
+                    .update(cx, |_, window, _| window.activate_window())
+                    .is_ok()
+            {
+                let _ = this.update(cx, |view, _| view.file_transfer_opening = false);
+                return;
+            }
+            let result = file_transfer_window::open(host, client, allow_upload, memory, cx);
+            let _ = this.update(cx, |view, cx| {
+                view.file_transfer_opening = false;
+                match result {
+                    Ok(handle) => view.file_transfer_window = Some(handle),
+                    Err(error) => {
+                        view.file_transfer_window = None;
+                        view.status = format!("Cannot open file transfer: {error}").into();
+                        cx.notify();
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn quick_upload(&mut self, cx: &mut Context<Self>) {
+        let client = self.handle.file_client();
+        let selected = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Upload".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = selected.await
+                && let Some(source) = paths.into_iter().next()
+                && let Some(name) = source.file_name().and_then(|name| name.to_str())
+            {
+                let path = client.snapshot().remote_path;
+                let remote = if path == "/" {
+                    format!("/{name}")
+                } else {
+                    format!("{path}/{name}")
+                };
+                let _ = this.update(cx, |this, cx| {
+                    this.status = "Uploading file…".into();
+                    cx.notify();
+                });
+                client.send(FileCommand::Upload { source, remote });
+            }
+        })
+        .detach();
+    }
+
     fn pump(&mut self, cx: &mut Context<Self>) {
         // Rebuild the GPU image at most once per tick: each rebuild copies the
         // whole framebuffer on the UI thread, and this thread also delivers key
@@ -231,6 +370,27 @@ impl SessionView {
                     self.phase = Phase::Connected;
                     self.status = format!("{width}×{height}").into();
                     self.error = None;
+                    if self.retried_password {
+                        self.retried_password = false;
+                        if let Some(book) = self.address_book.as_ref().and_then(WeakEntity::upgrade)
+                        {
+                            match book.update(cx, |book, cx| {
+                                book.save_retried_password(&self.req, self.remember_password, cx)
+                            }) {
+                                Ok(Some(id)) => self.req.connection_id = Some(id),
+                                Ok(None) => {}
+                                Err(error) => {
+                                    self.status =
+                                        format!("Connected, but password was not saved: {error}")
+                                            .into();
+                                }
+                            }
+                        } else if self.remember_password {
+                            self.status =
+                                "Connected, but the address book is closed; password was not saved"
+                                    .into();
+                        }
+                    }
                 }
                 SessionEvent::FrameReady { generation } => frame = Some(generation),
                 SessionEvent::Clipboard(text) => {
@@ -252,6 +412,31 @@ impl SessionView {
                     self.save_thumb();
                 }
             }
+        }
+        let file_revision = self.handle.file_client().revision();
+        if file_revision != self.last_file_revision {
+            self.last_file_revision = file_revision;
+            if self.status.as_ref().starts_with("Uploading file") {
+                let files = self.handle.file_client().snapshot();
+                if let Some(error) = files.error {
+                    self.status = format!("Upload failed: {error}").into();
+                } else if let Some(upload) = files.transfers.iter().rev().find(|transfer| {
+                    matches!(transfer.direction, rv_session::TransferDirection::Upload)
+                }) {
+                    self.status = match &upload.status {
+                        TransferStatus::Running => {
+                            format!("Uploading file… {} bytes", upload.bytes)
+                        }
+                        TransferStatus::Sent => "File sent; verify it in the remote folder".into(),
+                        TransferStatus::Complete => "Upload complete".into(),
+                        TransferStatus::Verified => "Upload complete · SHA-256 verified".into(),
+                        TransferStatus::Cancelled => "Upload cancelled".into(),
+                        TransferStatus::Failed(reason) => format!("Upload failed: {reason}"),
+                    }
+                    .into();
+                }
+            }
+            changed = true;
         }
         if let Some(generation) = frame
             && generation != self.last_generation
@@ -433,8 +618,9 @@ impl SessionView {
         cx.notify();
     }
 
-    fn reconnect(&mut self, cx: &mut Context<Self>) {
+    fn reconnect(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.local_cursor.set_hidden(false);
+        self.focus.focus(window, cx);
         self.handle = SessionHandle::spawn(self.req.clone());
         self.phase = Phase::Connecting;
         self.error = None;
@@ -446,6 +632,22 @@ impl SessionView {
             cx.drop_image(old, None);
         }
         cx.notify();
+    }
+
+    fn retry_with_password(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.phase != Phase::Ended || !self.error.as_deref().is_some_and(password_error) {
+            return;
+        }
+        let password = self.password_input.read(cx).unmask_value().to_string();
+        if password.is_empty() {
+            self.password_validation = Some("Enter a password to reconnect.".into());
+            cx.notify();
+            return;
+        }
+        self.req.password = Some(password);
+        self.retried_password = true;
+        self.password_validation = None;
+        self.reconnect(window, cx);
     }
 
     fn close_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -460,6 +662,9 @@ impl SessionView {
     }
 
     fn handle_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.phase != Phase::Connected || !self.focus.is_focused(window) {
+            return;
+        }
         let key = event.keystroke.key.as_str();
         tracing::debug!(
             key,
@@ -496,6 +701,9 @@ impl SessionView {
     }
 
     fn handle_key_up(&mut self, event: &KeyUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.phase != Phase::Connected || !self.focus.is_focused(window) {
+            return;
+        }
         let key = event.keystroke.key.as_str();
         let mods = event.keystroke.modifiers;
         let mut events = self.keys.key_up(key);
@@ -509,7 +717,10 @@ impl SessionView {
         }
     }
 
-    fn handle_modifiers(&mut self, event: &ModifiersChangedEvent) {
+    fn handle_modifiers(&mut self, event: &ModifiersChangedEvent, window: &Window) {
+        if self.phase != Phase::Connected || !self.focus.is_focused(window) {
+            return;
+        }
         let events = self.keys.set_modifiers(
             event.modifiers.control,
             event.modifiers.alt,
@@ -622,6 +833,33 @@ impl SessionView {
                     }),
                 )
                 .disabled(!live),
+            )
+            .child(toolbar_sep())
+            .child(
+                tool_btn(
+                    "files",
+                    IconName::Folder,
+                    "File transfer window",
+                    cx.listener(|this, _, _, cx| {
+                        this.open_file_transfer(cx);
+                    }),
+                )
+                .disabled(self.phase != Phase::Connected),
+            )
+            .child(
+                Button::new("quick-upload")
+                    .ghost()
+                    .icon(IconName::ArrowUp)
+                    .text_color(theme::toolbar_muted())
+                    .tooltip("Upload one file to the current remote folder")
+                    .disabled(
+                        !live || {
+                            let files = self.handle.file_client().snapshot();
+                            !files.caps.is_some_and(|caps| caps.upload)
+                                || files.listed_path.as_deref() != Some(files.remote_path.as_str())
+                        },
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| this.quick_upload(cx))),
             )
             .child(div().flex_1())
             .child(
@@ -814,6 +1052,19 @@ impl SessionView {
                         )
                         .disabled(!live),
                     )
+                    .child(
+                        menu_item(
+                            "m-files",
+                            IconName::Folder,
+                            "File transfer window",
+                            cx.listener(|this, _, _, cx| {
+                                this.show_menu = false;
+                                this.open_file_transfer(cx);
+                                cx.notify();
+                            }),
+                        )
+                        .disabled(self.phase != Phase::Connected),
+                    )
                     .child(menu_item(
                         "m-info",
                         IconName::Info,
@@ -930,6 +1181,7 @@ impl SessionView {
 
     fn render_ended(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let failed = self.error.is_some();
+        let auth_failed = self.error.as_deref().is_some_and(password_error);
         div()
             .id("session-ended")
             .occlude()
@@ -941,7 +1193,8 @@ impl SessionView {
             .bg(theme::scrim())
             .child(
                 v_flex()
-                    .w(px(380.))
+                    .w(px(if auth_failed { 480. } else { 380. }))
+                    .max_w_full()
                     .gap_3()
                     .p_5()
                     .rounded_lg()
@@ -952,45 +1205,95 @@ impl SessionView {
                     .text_color(theme::ink(cx))
                     .child(
                         h_flex()
-                            .gap_2()
-                            .items_center()
+                            .gap_3()
+                            .items_start()
                             .child(
                                 Icon::new(if failed {
                                     IconName::TriangleAlert
                                 } else {
                                     IconName::CircleCheck
                                 })
+                                .large()
                                 .text_color(if failed {
-                                    theme::danger(cx)
+                                    rgb(0xE9A11B).into()
                                 } else {
                                     theme::muted(cx)
                                 }),
                             )
-                            .child(div().text_lg().font_semibold().child(if failed {
-                                "Connection failed"
-                            } else {
-                                "Disconnected"
-                            })),
+                            .child(
+                                v_flex()
+                                    .min_w_0()
+                                    .gap_2()
+                                    .child(div().text_lg().font_semibold().child(if failed {
+                                        "Connection failed"
+                                    } else {
+                                        "Disconnected"
+                                    }))
+                                    .child(div().text_sm().text_color(theme::muted(cx)).child(
+                                        if auth_failed {
+                                            "Password rejected. Enter a new password to reconnect."
+                                                .into()
+                                        } else {
+                                            self.error.clone().unwrap_or_else(|| {
+                                                format!(
+                                                    "The session with {} has ended.",
+                                                    self.host()
+                                                )
+                                                .into()
+                                            })
+                                        },
+                                    )),
+                            ),
                     )
-                    .child(div().text_sm().text_color(theme::muted(cx)).child(
-                        self.error.clone().unwrap_or_else(|| {
-                            format!("The session with {} has ended.", self.host()).into()
-                        }),
-                    ))
+                    .when(auth_failed, |this| {
+                        this.child(
+                            v_flex()
+                                .gap_2()
+                                .child(div().text_sm().font_medium().child("Password"))
+                                .child(
+                                    Input::new(&self.password_input)
+                                        .large()
+                                        .w_full()
+                                        .aria_label("Password for reconnect"),
+                                )
+                                .when_some(self.password_validation.clone(), |this, error| {
+                                    this.child(
+                                        div().text_xs().text_color(theme::danger(cx)).child(error),
+                                    )
+                                })
+                                .child(
+                                    div().mt_1().child(
+                                        Checkbox::new("retry-remember-password")
+                                            .checked(self.remember_password)
+                                            .label("Remember password")
+                                            .on_click(cx.listener(
+                                                |this, checked: &bool, _, cx| {
+                                                    this.remember_password = *checked;
+                                                    cx.notify();
+                                                },
+                                            )),
+                                    ),
+                                ),
+                        )
+                    })
                     .child(
                         h_flex()
                             .justify_end()
-                            .gap_2()
-                            .mt_1()
+                            .gap_3()
                             .child(Button::new("ended-close").label("Close").on_click(
                                 cx.listener(|this, _, window, cx| this.close_window(window, cx)),
                             ))
                             .child(
                                 Button::new("ended-retry")
                                     .primary()
-                                    .icon(IconName::Replace)
                                     .label("Reconnect")
-                                    .on_click(cx.listener(|this, _, _, cx| this.reconnect(cx))),
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        if auth_failed {
+                                            this.retry_with_password(window, cx);
+                                        } else {
+                                            this.reconnect(window, cx);
+                                        }
+                                    })),
                             ),
                     ),
             )
@@ -1122,6 +1425,8 @@ impl Render for SessionView {
         self.update_local_cursor(window, cx);
         let fullscreen = window.is_fullscreen();
         let show_pinned = self.pin_toolbar;
+        let remote_keyboard_active =
+            self.phase == Phase::Connected && self.focus.is_focused(window);
 
         v_flex()
             .size_full()
@@ -1134,8 +1439,10 @@ impl Render for SessionView {
                 canvas(
                     |_, _, _| (),
                     move |_, _, window, cx| {
-                        disable_platform_ime(window);
-                        window.handle_input(&focus, DisabledIme, cx);
+                        set_platform_ime_disabled(window, remote_keyboard_active);
+                        if remote_keyboard_active {
+                            window.handle_input(&focus, DisabledIme, cx);
+                        }
                     },
                 )
                 .w(px(0.))
@@ -1143,7 +1450,9 @@ impl Render for SessionView {
             })
             .on_key_down(cx.listener(|this, ev, window, cx| this.handle_key(ev, window, cx)))
             .on_key_up(cx.listener(|this, ev, window, cx| this.handle_key_up(ev, window, cx)))
-            .on_modifiers_changed(cx.listener(|this, ev, _, _| this.handle_modifiers(ev)))
+            .on_modifiers_changed(
+                cx.listener(|this, ev, window, _| this.handle_modifiers(ev, window)),
+            )
             .on_action(cx.listener(|this, _: &SessionFullscreen, window, cx| {
                 this.toggle_fullscreen(window, cx);
             }))
@@ -1451,8 +1760,8 @@ impl InputHandler for DisabledIme {
     }
 }
 
-fn disable_platform_ime(window: &Window) {
-    macos_ime::disable(window);
+fn set_platform_ime_disabled(window: &Window, disabled: bool) {
+    macos_ime::set_disabled(window, disabled);
 }
 
 mod local_cursor {
@@ -1538,7 +1847,7 @@ mod macos_ime {
     use objc2_foundation::{NSArray, NSString};
     use raw_window_handle::RawWindowHandle;
 
-    pub fn disable(window: &Window) {
+    pub fn set_disabled(window: &Window, disabled: bool) {
         let Ok(handle) = raw_window_handle::HasWindowHandle::window_handle(window) else {
             return;
         };
@@ -1556,17 +1865,23 @@ mod macos_ime {
                 return;
             }
             let ctx = &*ctx;
-            // Empty locale list: no input sources, so CJK/dead-key IMEs cannot attach.
-            let empty = NSArray::<NSString>::new();
-            let _: () = msg_send![ctx, setAllowedInputSourceLocales: &*empty];
-            let _: () = msg_send![ctx, discardMarkedText];
+            if disabled {
+                // Empty locale list prevents CJK/dead-key IMEs from intercepting VNC keys.
+                let empty = NSArray::<NSString>::new();
+                let _: () = msg_send![ctx, setAllowedInputSourceLocales: &*empty];
+                let _: () = msg_send![ctx, discardMarkedText];
+            } else {
+                // A text field needs the window's normal input sources again.
+                let _: () =
+                    msg_send![ctx, setAllowedInputSourceLocales: std::ptr::null::<AnyObject>()];
+            }
         }
     }
 }
 
 #[cfg(not(target_os = "macos"))]
 mod macos_ime {
-    pub fn disable(_window: &gpui::Window) {}
+    pub fn set_disabled(_window: &gpui::Window, _disabled: bool) {}
 }
 
 #[cfg(test)]

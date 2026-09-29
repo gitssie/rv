@@ -2,6 +2,7 @@ use std::io::Cursor;
 
 use flate2::{read::ZlibDecoder, write::ZlibEncoder, Compression};
 
+use crate::tight::{TightFileCommand, TightFileEvent};
 use crate::{ExtendedClipboardEvent, PixelFormat, Rect, VncEncoding, VncError};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -27,6 +28,7 @@ pub(super) enum ClientMsg {
     ExtendedClipboardNotify(bool),
     ExtendedClipboardRequest,
     ExtendedClipboardProvide(String),
+    TightFile(TightFileCommand),
 }
 
 impl ClientMsg {
@@ -177,6 +179,7 @@ impl ClientMsg {
                 data.extend_from_slice(&compressed);
                 write_extended_clipboard(writer, &data).await
             }
+            ClientMsg::TightFile(command) => command.write(writer).await,
         }
     }
 }
@@ -215,16 +218,20 @@ pub(super) enum ServerMsg {
     Bell,
     ServerCutText(String),
     ExtendedClipboard(ExtendedClipboardEvent),
+    TightFile(TightFileEvent),
 }
 
 impl ServerMsg {
-    pub(super) async fn read<S>(reader: &mut S) -> Result<Self, VncError>
+    pub(super) async fn read<S>(reader: &mut S, tight_security: bool) -> Result<Self, VncError>
     where
         S: AsyncRead + Unpin,
     {
         let server_msg = reader.read_u8().await?;
 
         match server_msg {
+            130..=133 | 137..=138 if tight_security => Ok(Self::TightFile(
+                crate::tight::read_message(reader, server_msg).await?,
+            )),
             0 => {
                 // FramebufferUpdate
                 //   +--------------+--------------+----------------------+
@@ -425,7 +432,7 @@ mod tests {
     async fn server_cut_text_decodes_latin1_instead_of_lossy_utf8() {
         let mut wire: &[u8] = &[3, 0, 0, 0, 0, 0, 0, 4, b'c', b'a', b'f', 0xe9];
         assert!(matches!(
-            ServerMsg::read(&mut wire).await.unwrap(),
+            ServerMsg::read(&mut wire, false).await.unwrap(),
             ServerMsg::ServerCutText(text) if text == "café"
         ));
     }

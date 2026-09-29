@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -167,7 +169,18 @@ impl ScaleMode {
     }
 }
 
-/// A saved address-book entry. Passwords live in the OS keychain, never here.
+/// Last folders and view mode used in file transfer for one connection.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransferFolders {
+    #[serde(default)]
+    pub local: Option<PathBuf>,
+    #[serde(default)]
+    pub remote: Option<String>,
+    #[serde(default)]
+    pub photo_mode: bool,
+}
+
+/// A saved address-book entry. Remembered passwords are encrypted in a separate local file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Connection {
     pub id: ConnectionId,
@@ -194,6 +207,8 @@ pub struct Connection {
     pub labels: Vec<String>,
     #[serde(default)]
     pub last_connected: Option<i64>,
+    #[serde(default)]
+    pub transfer_folders: TransferFolders,
 }
 
 fn default_shared() -> bool {
@@ -226,6 +241,7 @@ impl Connection {
             shared: true,
             labels: Vec::new(),
             last_connected: None,
+            transfer_folders: TransferFolders::default(),
         }
     }
 
@@ -413,6 +429,9 @@ mod tests {
         let mut c = Connection::new("office", "10.0.0.8", 5900);
         c.clipboard = ClipboardMode::Latin1;
         c.local_cursor = LocalCursorMode::Hide;
+        c.transfer_folders.local = Some("/tmp/working-dir".into());
+        c.transfer_folders.remote = Some("/documents".into());
+        c.transfer_folders.photo_mode = true;
         let json = serde_json::to_string(&c).unwrap();
         let back: Connection = serde_json::from_str(&json).unwrap();
         assert_eq!(back.name, "office");
@@ -420,6 +439,7 @@ mod tests {
         assert!(back.shared);
         assert_eq!(back.clipboard, ClipboardMode::Latin1);
         assert_eq!(back.local_cursor, LocalCursorMode::Hide);
+        assert_eq!(back.transfer_folders, c.transfer_folders);
         assert_eq!(
             ConnectRequest::from_connection(&back, None).clipboard,
             ClipboardMode::Latin1
@@ -446,5 +466,31 @@ mod tests {
         json.as_object_mut().unwrap().remove("clipboard");
         let back: Connection = serde_json::from_value(json).unwrap();
         assert_eq!(back.clipboard, ClipboardMode::Utf8);
+    }
+
+    #[test]
+    fn legacy_connection_has_no_transfer_folders() {
+        let c = Connection::new("office", "10.0.0.8", 5900);
+        let mut json = serde_json::to_value(&c).unwrap();
+        json.as_object_mut().unwrap().remove("transfer_folders");
+        let back: Connection = serde_json::from_value(json).unwrap();
+        assert_eq!(back.transfer_folders, TransferFolders::default());
+    }
+
+    #[test]
+    fn legacy_transfer_folders_default_to_files_mode() {
+        let mut connection = Connection::new("office", "10.0.0.8", 5900);
+        connection.transfer_folders.remote = Some("/documents".into());
+        let mut json = serde_json::to_value(&connection).unwrap();
+        json["transfer_folders"]
+            .as_object_mut()
+            .unwrap()
+            .remove("photo_mode");
+        let restored: Connection = serde_json::from_value(json).unwrap();
+        assert!(!restored.transfer_folders.photo_mode);
+        assert_eq!(
+            restored.transfer_folders.remote.as_deref(),
+            Some("/documents")
+        );
     }
 }

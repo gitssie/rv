@@ -2,7 +2,9 @@ use super::{AddressBookApp, Modal, ViewMode, WindowRoot};
 use crate::actions::*;
 use gpui::{AppContext, Entity, Modifiers, TestAppContext, VisualTestContext, px, size};
 use gpui_component::Root;
-use rv_core::{AddressBook, ClipboardMode, ConnectRequest, Connection, LocalCursorMode};
+use rv_core::{
+    AddressBook, ClipboardMode, ConnectRequest, Connection, LocalCursorMode, TransferFolders,
+};
 use tempfile::TempDir;
 
 fn setup(
@@ -37,6 +39,23 @@ fn click(cx: &mut VisualTestContext, selector: &'static str) {
     cx.simulate_mouse_move(bounds.center(), None, Modifiers::default());
     cx.simulate_click(bounds.center(), Modifiers::default());
     cx.run_until_parked();
+}
+
+#[gpui::test]
+fn transfer_folders_are_saved_with_the_connection(cx: &mut TestAppContext) {
+    let connection = Connection::new("Office", "example.test", 5900);
+    let id = connection.id;
+    let (app, cx, dir) = setup(cx, vec![connection]);
+    let folders = TransferFolders {
+        local: Some("/tmp/rv-last-folder".into()),
+        remote: Some("/remote/work".into()),
+        photo_mode: true,
+    };
+    app.update(cx, |app, cx| {
+        app.remember_transfer_folders(id, folders.clone(), cx)
+    });
+    let reloaded = AddressBook::load(rv_core::StorePaths::in_dir(dir.path().into())).unwrap();
+    assert_eq!(reloaded.get(id).unwrap().transfer_folders, folders);
 }
 
 #[gpui::test]
@@ -168,7 +187,7 @@ fn offscreen_busy_editor_blocks_buttons_and_duplicate_actions(cx: &mut TestAppCo
     cx.simulate_input("example.test");
     app.update(cx, |app, cx| {
         app.credential_busy = true;
-        app.status = "Unlocking saved password…".into();
+        app.status = "Loading saved password…".into();
         cx.notify();
     });
     for selector in ["modal-save", "modal-connect", "modal-cancel"] {
@@ -181,7 +200,7 @@ fn offscreen_busy_editor_blocks_buttons_and_duplicate_actions(cx: &mut TestAppCo
         assert!(matches!(app.modal, Modal::Connection));
         assert!(app.book.connections().is_empty());
         assert_eq!(app.server_input.read(cx).value().as_ref(), "example.test");
-        assert_eq!(app.status.as_ref(), "Unlocking saved password…");
+        assert_eq!(app.status.as_ref(), "Loading saved password…");
     });
     app.update(cx, |app, cx| {
         app.credential_busy = false;
@@ -211,6 +230,48 @@ fn offscreen_properties_save_preserves_remembered_password_setting(cx: &mut Test
     let book = AddressBook::load(rv_core::StorePaths::in_dir(dir.path().into())).unwrap();
     assert!(book.get(id).unwrap().remember_password);
     assert_eq!(book.get(id).unwrap().username.as_deref(), Some("mac-user"));
+}
+
+#[gpui::test]
+fn offscreen_successful_password_retry_updates_saved_connection(cx: &mut TestAppContext) {
+    let connection = Connection::new("Office", "example.test", 5900);
+    let id = connection.id;
+    let (app, cx, dir) = setup(cx, vec![connection.clone()]);
+    let mut request = ConnectRequest::from_connection(&connection, Some("new password".into()));
+    app.update(cx, |app, cx| {
+        assert_eq!(
+            app.save_retried_password(&request, true, cx).unwrap(),
+            Some(id)
+        );
+    });
+    let paths = rv_core::StorePaths::in_dir(dir.path().into());
+    assert_eq!(
+        paths.load_password(id).unwrap().as_deref(),
+        Some("new password")
+    );
+    assert!(
+        AddressBook::load(paths.clone())
+            .unwrap()
+            .get(id)
+            .unwrap()
+            .remember_password
+    );
+
+    request.password = Some("one-time password".into());
+    app.update(cx, |app, cx| {
+        assert_eq!(
+            app.save_retried_password(&request, false, cx).unwrap(),
+            Some(id)
+        );
+    });
+    assert_eq!(paths.load_password(id).unwrap(), None);
+    assert!(
+        !AddressBook::load(paths)
+            .unwrap()
+            .get(id)
+            .unwrap()
+            .remember_password
+    );
 }
 
 #[gpui::test]

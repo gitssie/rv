@@ -137,6 +137,7 @@ where
                             connector.allow_shared,
                             connector.pixel_format,
                             connector.encodings,
+                            connector.tight_security,
                         )
                         .await?,
                     ))
@@ -167,6 +168,7 @@ where
     allow_shared: bool,
     pixel_format: Option<PixelFormat>,
     encodings: Vec<VncEncoding>,
+    tight_security: bool,
 }
 
 impl<S, F> VncConnector<S, F>
@@ -209,6 +211,7 @@ where
             rfb_version: VncVersion::RFB38,
             pixel_format: None,
             encodings: Vec::new(),
+            tight_security: false,
         }
     }
 
@@ -262,6 +265,12 @@ where
     ///
     pub fn set_version(mut self, version: VncVersion) -> Self {
         self.rfb_version = version;
+        self
+    }
+
+    /// The underlying stream already negotiated Tight security type 16.
+    pub fn tight_security(mut self, enabled: bool) -> Self {
+        self.tight_security = enabled;
         self
     }
 

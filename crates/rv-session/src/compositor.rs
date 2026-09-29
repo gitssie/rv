@@ -54,6 +54,7 @@ impl Framebuffer {
             VncEvent::Bell => Apply::Bell,
             VncEvent::Error(e) => Apply::Error(e),
             VncEvent::SetPixelFormat(_) => Apply::Ignored,
+            VncEvent::TightFile(_) => Apply::Ignored,
             _ => Apply::Ignored,
         }
     }

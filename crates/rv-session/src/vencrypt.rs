@@ -129,6 +129,11 @@ impl RfbStream {
         result
     }
 
+    /// Replay a standard auth exchange after the Tight 3.7t sub-handshake.
+    pub(crate) fn tight(stream: TcpStream, auth: VencryptAuth) -> Self {
+        Self::negotiated(Transport::Plain(stream), auth)
+    }
+
     fn negotiated(inner: Transport, auth: VencryptAuth) -> Self {
         Self {
             inner,
@@ -147,6 +152,67 @@ impl RfbStream {
             Transport::Anonymous(s) => Pin::new(s.as_mut()).poll_flush(cx),
         }
     }
+}
+
+/// Select Security Type 16 and its no-tunnel, None/VNC authentication path.
+/// The remaining VNC challenge and SecurityResult are consumed by vnc-rs.
+pub(crate) async fn tight_handshake(
+    stream: &mut TcpStream,
+    prefer_vnc: bool,
+) -> Result<VencryptAuth, SessionError> {
+    stream.write_u8(16).await?;
+    let tunnels = stream.read_u32().await? as usize;
+    if tunnels > 64 {
+        return Err(SessionError::msg("too many TightVNC tunnel methods"));
+    }
+    let mut cap = [0u8; 16];
+    let mut no_tunnel = false;
+    for _ in 0..tunnels {
+        stream.read_exact(&mut cap).await?;
+        no_tunnel |= u32::from_be_bytes(cap[..4].try_into().unwrap()) == 0;
+    }
+    if tunnels != 0 {
+        if !no_tunnel {
+            return Err(SessionError::msg(
+                "TightVNC server requires an unsupported tunnel",
+            ));
+        }
+        stream.write_u32(0).await?;
+    }
+    let count = stream.read_u32().await? as usize;
+    if count > 64 {
+        return Err(SessionError::msg("too many TightVNC auth methods"));
+    }
+    let mut none = false;
+    let mut vnc = false;
+    for _ in 0..count {
+        stream.read_exact(&mut cap).await?;
+        match u32::from_be_bytes(cap[..4].try_into().unwrap()) {
+            1 => none = true,
+            2 => vnc = true,
+            _ => {}
+        }
+    }
+    let auth = if vnc && prefer_vnc {
+        VencryptAuth::Vnc
+    } else if count == 0 || none {
+        VencryptAuth::None
+    } else if vnc {
+        VencryptAuth::Vnc
+    } else {
+        return Err(SessionError::msg(
+            "TightVNC server has no supported auth method",
+        ));
+    };
+    if count != 0 {
+        stream
+            .write_u32(match auth {
+                VencryptAuth::None => 1,
+                VencryptAuth::Vnc => 2,
+            })
+            .await?;
+    }
+    Ok(auth)
 }
 
 fn greeting(types: &[u8]) -> Vec<u8> {

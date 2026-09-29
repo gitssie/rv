@@ -3,6 +3,7 @@ mod ard_server;
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -10,6 +11,7 @@ use std::time::{Duration, Instant};
 use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
 use rv_core::{ClipboardMode, ConnectRequest, EncryptionMode, QualityPreset};
 
+use crate::{FileCommand, TransferDirection, TransferStatus};
 use crate::{SessionEvent, SessionHandle, coalesce_frames};
 
 fn write_u16(s: &mut TcpStream, v: u16) {
@@ -276,6 +278,834 @@ fn request_for(port: u16) -> ConnectRequest {
         view_only: false,
         shared: true,
     }
+}
+
+fn write_tight_cap(sock: &mut TcpStream, code: u32, signature: &[u8; 8]) {
+    write_u32(sock, code);
+    sock.write_all(b"TGHT").unwrap();
+    sock.write_all(signature).unwrap();
+}
+
+fn tight_file_handshake(sock: &mut TcpStream) {
+    sock.set_read_timeout(Some(Duration::from_secs(8))).unwrap();
+    sock.write_all(b"RFB 003.008\n").unwrap();
+    assert_eq!(read_exact(sock, 12), b"RFB 003.008\n");
+    sock.write_all(&[1, 16]).unwrap();
+    assert_eq!(read_exact(sock, 1), [16]);
+    write_u32(sock, 0); // no tunnels
+    write_u32(sock, 0); // no auth capabilities, implicit None
+    write_u32(sock, 0); // SecurityResult
+    rfb_server_init(sock, 8, 8, b"tight-file-test");
+    write_u16(sock, 4);
+    write_u16(sock, 6);
+    write_u16(sock, 0);
+    write_u16(sock, 0);
+    for (code, sig) in [
+        (130, b"FTS_LSDT"),
+        (131, b"FTS_DNDT"),
+        (132, b"FTS_UPCN"),
+        (133, b"FTS_DNFL"),
+    ] {
+        write_tight_cap(sock, code, sig);
+    }
+    for (code, sig) in [
+        (130, b"FTC_LSRQ"),
+        (131, b"FTC_DNRQ"),
+        (132, b"FTC_UPRQ"),
+        (133, b"FTC_UPDT"),
+        (134, b"FTC_DNCN"),
+        (135, b"FTC_UPFL"),
+    ] {
+        write_tight_cap(sock, code, sig);
+    }
+}
+
+fn tight_file_server(mut sock: TcpStream) -> Vec<u8> {
+    tight_file_handshake(&mut sock);
+    let mut uploaded = Vec::new();
+    let mut upload_started = false;
+    loop {
+        let kind = read_exact(&mut sock, 1)[0];
+        match kind {
+            0 => {
+                let _ = read_exact(&mut sock, 19);
+            }
+            2 => {
+                let _ = read_exact(&mut sock, 1);
+                let count = u16::from_be_bytes(read_exact(&mut sock, 2).try_into().unwrap());
+                let _ = read_exact(&mut sock, count as usize * 4);
+            }
+            3 => {
+                let _ = read_exact(&mut sock, 9);
+            }
+            130 => {
+                let _flags = read_exact(&mut sock, 1);
+                let len = u16::from_be_bytes(read_exact(&mut sock, 2).try_into().unwrap()) as usize;
+                assert_eq!(read_exact(&mut sock, len), b"/");
+                let names = b"folder\0hello.txt\0";
+                sock.write_all(&[130, 0]).unwrap();
+                write_u16(&mut sock, 2);
+                write_u16(&mut sock, names.len() as u16);
+                write_u16(&mut sock, names.len() as u16);
+                write_u32(&mut sock, u32::MAX);
+                write_u32(&mut sock, 0);
+                write_u32(&mut sock, 5);
+                write_u32(&mut sock, 1_700_000_000);
+                sock.write_all(names).unwrap();
+            }
+            131 | 132 => {
+                let rest = read_exact(&mut sock, 7);
+                let len = u16::from_be_bytes(rest[1..3].try_into().unwrap()) as usize;
+                let path = read_exact(&mut sock, len);
+                if kind == 131 {
+                    assert_eq!(path, b"/hello.txt");
+                    sock.write_all(&[131, 0, 0, 5, 0, 5]).unwrap();
+                    sock.write_all(b"hello").unwrap();
+                    sock.write_all(&[131, 0, 0, 0, 0, 0]).unwrap();
+                    sock.write_all(&1_700_000_000u32.to_ne_bytes()).unwrap();
+                } else {
+                    assert_eq!(path, b"/upload.txt");
+                    upload_started = true;
+                }
+            }
+            133 => {
+                assert!(upload_started);
+                let rest = read_exact(&mut sock, 5);
+                let real = u16::from_be_bytes(rest[1..3].try_into().unwrap()) as usize;
+                let compressed = u16::from_be_bytes(rest[3..5].try_into().unwrap()) as usize;
+                if real == 0 && compressed == 0 {
+                    let _mtime = read_exact(&mut sock, 4);
+                    return uploaded;
+                }
+                assert_eq!(real, compressed);
+                uploaded.extend_from_slice(&read_exact(&mut sock, compressed));
+            }
+            kind => panic!("unexpected TightVNC client message {kind}"),
+        }
+    }
+}
+
+#[test]
+fn tight_file_list_download_and_upload_roundtrip_without_ios() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        let (sock, _) = listener.accept().unwrap();
+        tight_file_server(sock)
+    });
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("upload.txt");
+    let destination = temp.path().join("download.txt");
+    std::fs::write(&source, b"upload contents").unwrap();
+    let handle = SessionHandle::spawn(request_for(port));
+    let files = handle.file_client();
+    let until = Instant::now() + Duration::from_secs(5);
+    while files.snapshot().caps.is_none() && Instant::now() < until {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(files.snapshot().caps.unwrap().upload);
+    while (files.snapshot().entries.len() != 2
+        || files.snapshot().listed_path.as_deref() != Some("/"))
+        && Instant::now() < until
+    {
+        thread::sleep(Duration::from_millis(10));
+    }
+    let entries = files.snapshot().entries;
+    assert_eq!(entries.len(), 2);
+    assert!(entries[0].is_dir);
+    assert_eq!(entries[1].name, "hello.txt");
+    files.send(FileCommand::Upload {
+        source: source.clone(),
+        remote: "/hello.txt".into(),
+    });
+    while files.snapshot().error.is_none() && Instant::now() < until {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        files
+            .snapshot()
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("already exists")
+    );
+    files.send(FileCommand::Download {
+        remote: "/hello.txt".into(),
+        destination: destination.clone(),
+        size: 5,
+    });
+    while !destination.exists() || std::fs::read(&destination).unwrap_or_default() != b"hello" {
+        assert!(
+            Instant::now() < until,
+            "download timed out: {:?}",
+            files.snapshot().error
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    files.send(FileCommand::Upload {
+        source,
+        remote: "/upload.txt".into(),
+    });
+    let uploaded = server.join().unwrap();
+    assert_eq!(uploaded, b"upload contents");
+    assert_eq!(std::fs::read(destination).unwrap(), b"hello");
+    assert!(
+        files
+            .snapshot()
+            .transfers
+            .iter()
+            .any(|item| matches!(item.status, TransferStatus::Complete))
+    );
+    handle.close();
+}
+
+#[test]
+fn tight_cancelled_download_ignores_late_frames_without_ios() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (cancelled_tx, cancelled_rx) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let (mut sock, _) = listener.accept().unwrap();
+        tight_file_handshake(&mut sock);
+        let mut download_started = false;
+        loop {
+            let kind = read_exact(&mut sock, 1)[0];
+            match kind {
+                0 => {
+                    let _ = read_exact(&mut sock, 19);
+                }
+                2 => {
+                    let _ = read_exact(&mut sock, 1);
+                    let count = u16::from_be_bytes(read_exact(&mut sock, 2).try_into().unwrap());
+                    let _ = read_exact(&mut sock, count as usize * 4);
+                }
+                3 => {
+                    let _ = read_exact(&mut sock, 9);
+                }
+                130 => {
+                    let _ = read_exact(&mut sock, 1);
+                    let len = u16::from_be_bytes(read_exact(&mut sock, 2).try_into().unwrap());
+                    assert_eq!(read_exact(&mut sock, len as usize), b"/");
+                    let names = b"slow.bin\0";
+                    sock.write_all(&[130, 0]).unwrap();
+                    write_u16(&mut sock, 1);
+                    write_u16(&mut sock, names.len() as u16);
+                    write_u16(&mut sock, names.len() as u16);
+                    write_u32(&mut sock, 10);
+                    write_u32(&mut sock, 0);
+                    sock.write_all(names).unwrap();
+                }
+                131 => {
+                    let rest = read_exact(&mut sock, 7);
+                    let len = u16::from_be_bytes(rest[1..3].try_into().unwrap());
+                    assert_eq!(read_exact(&mut sock, len as usize), b"/slow.bin");
+                    download_started = true;
+                    sock.write_all(&[131, 0, 0, 3, 0, 3]).unwrap();
+                    sock.write_all(b"abc").unwrap();
+                }
+                134 => {
+                    assert!(download_started);
+                    let _ = read_exact(&mut sock, 1);
+                    cancelled_tx.send(()).unwrap();
+                    sock.write_all(&[131, 0, 0, 7, 0, 7]).unwrap();
+                    sock.write_all(b"defghij").unwrap();
+                    sock.write_all(&[131, 0, 0, 0, 0, 0]).unwrap();
+                    sock.write_all(&0u32.to_ne_bytes()).unwrap();
+                    thread::sleep(Duration::from_millis(300));
+                    return;
+                }
+                kind => panic!("unexpected TightVNC message after cancel: {kind}"),
+            }
+        }
+    });
+    let temp = tempfile::tempdir().unwrap();
+    let destination = temp.path().join("slow.bin");
+    let second = temp.path().join("second.bin");
+    let handle = SessionHandle::spawn(request_for(port));
+    let files = handle.file_client();
+    let until = Instant::now() + Duration::from_secs(5);
+    while files.snapshot().listed_path.as_deref() != Some("/") {
+        assert!(Instant::now() < until, "file list timed out");
+        thread::sleep(Duration::from_millis(10));
+    }
+    files.send(FileCommand::Download {
+        remote: "/slow.bin".into(),
+        destination: destination.clone(),
+        size: 10,
+    });
+    while files
+        .snapshot()
+        .transfers
+        .last()
+        .map_or(0, |item| item.bytes)
+        < 3
+    {
+        assert!(Instant::now() < until, "first download block timed out");
+        thread::sleep(Duration::from_millis(10));
+    }
+    files.send(FileCommand::Cancel);
+    cancelled_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+    files.send(FileCommand::Download {
+        remote: "/slow.bin".into(),
+        destination: second.clone(),
+        size: 10,
+    });
+    while files
+        .snapshot()
+        .error
+        .as_deref()
+        .is_none_or(|error| !error.contains("Reconnect"))
+    {
+        assert!(Instant::now() < until, "second download was not rejected");
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(files.snapshot().download_blocked);
+    assert!(!destination.exists());
+    assert!(!second.exists());
+    handle.close();
+    server.join().unwrap();
+}
+
+struct FixtureChild(Child);
+
+impl Drop for FixtureChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[test]
+fn ascii_clipboard_on_real_libvncserver_matches_in_both_modes() {
+    let Ok(binary) = std::env::var("RV_LIBVNCSERVER_FIXTURE") else {
+        return;
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let remote = tempfile::tempdir().unwrap();
+    let _server = FixtureChild(
+        Command::new(binary)
+            .arg(remote.path())
+            .arg(port.to_string())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let startup_deadline = Instant::now() + Duration::from_secs(5);
+    while TcpStream::connect(("127.0.0.1", port)).is_err() {
+        assert!(
+            Instant::now() < startup_deadline,
+            "LibVNCServer fixture did not start"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    let handle = SessionHandle::spawn(request_for(port));
+    assert!(wait_for(&handle, Duration::from_secs(5), |event| matches!(
+        event,
+        SessionEvent::Connected { .. }
+    )));
+    let address = "user@example.com";
+    handle.copy_text(address.into());
+    let output = remote.path().join("clipboard.txt");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !output.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "LibVNCServer did not deliver clipboard text"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(std::fs::read(output).unwrap(), address.as_bytes());
+    let mut expected_wire = address.as_bytes().to_vec();
+    expected_wire.push(0);
+    assert_eq!(
+        std::fs::read(remote.path().join("clipboard-wire.bin")).unwrap(),
+        expected_wire
+    );
+    handle.close();
+
+    let mut latin1_request = request_for(port);
+    latin1_request.clipboard = ClipboardMode::Latin1;
+    let latin1_handle = SessionHandle::spawn(latin1_request);
+    assert!(wait_for(
+        &latin1_handle,
+        Duration::from_secs(5),
+        |event| matches!(event, SessionEvent::Connected { .. })
+    ));
+    latin1_handle.copy_text(address.into());
+    let latin1_output = remote.path().join("clipboard-latin1.txt");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !latin1_output.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "LibVNCServer did not deliver Latin-1 text"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(std::fs::read(latin1_output).unwrap(), address.as_bytes());
+    latin1_handle.close();
+}
+
+#[test]
+fn tight_file_roundtrip_with_real_libvncserver_when_available() {
+    let Ok(binary) = std::env::var("RV_LIBVNCSERVER_FIXTURE") else {
+        return;
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let remote = tempfile::tempdir().unwrap();
+    let local = tempfile::tempdir().unwrap();
+    std::fs::write(remote.path().join("hello.txt"), b"hello").unwrap();
+    std::fs::create_dir_all(remote.path().join("Media/DCIM/.MISC/Incoming")).unwrap();
+    let _server = FixtureChild(
+        Command::new(binary)
+            .arg(remote.path())
+            .arg(port.to_string())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let startup_deadline = Instant::now() + Duration::from_secs(5);
+    while TcpStream::connect(("127.0.0.1", port)).is_err() {
+        assert!(
+            Instant::now() < startup_deadline,
+            "LibVNCServer fixture did not start"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    let handle = SessionHandle::spawn(request_for(port));
+    let files = handle.file_client();
+    let until = Instant::now() + Duration::from_secs(5);
+    while !files
+        .snapshot()
+        .entries
+        .iter()
+        .any(|entry| entry.name == "hello.txt")
+    {
+        assert!(
+            Instant::now() < until,
+            "LibVNCServer list: {:?}",
+            files.snapshot()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    let caps = files.snapshot().caps.unwrap();
+    assert!(caps.list && caps.download && caps.upload);
+    while !files.snapshot().can_delete
+        || !files.snapshot().can_mkdir
+        || !files.snapshot().can_rename
+        || !files.snapshot().can_replace
+        || !files.snapshot().can_checksum
+    {
+        assert!(
+            Instant::now() < until,
+            "TrollVNC management capability: {:?}",
+            files.snapshot()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    let destination = local.path().join("hello.txt");
+    files.send(FileCommand::Download {
+        remote: "/hello.txt".into(),
+        destination: destination.clone(),
+        size: 5,
+    });
+    while std::fs::read(&destination).unwrap_or_default() != b"hello" {
+        assert!(
+            Instant::now() < until,
+            "LibVNCServer download: {:?}",
+            files.snapshot()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    while !files.snapshot().transfers.iter().any(|transfer| {
+        matches!(transfer.direction, TransferDirection::Download)
+            && matches!(transfer.status, TransferStatus::Verified)
+    }) {
+        assert!(
+            Instant::now() < until,
+            "LibVNCServer download checksum: {:?}",
+            files.snapshot()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    let source = local.path().join("upload.txt");
+    std::fs::write(&source, b"uploaded").unwrap();
+    files.send(FileCommand::Upload {
+        source,
+        remote: "/upload.txt".into(),
+    });
+    while std::fs::read(remote.path().join("upload.txt")).unwrap_or_default() != b"uploaded" {
+        assert!(
+            Instant::now() < until,
+            "LibVNCServer upload: {:?}",
+            files.snapshot()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    while !files
+        .snapshot()
+        .entries
+        .iter()
+        .any(|entry| entry.name == "upload.txt")
+    {
+        assert!(
+            Instant::now() < until,
+            "LibVNCServer post-upload list: {:?}",
+            files.snapshot()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    while !files.snapshot().transfers.iter().any(|transfer| {
+        transfer.name == "upload.txt"
+            && matches!(transfer.direction, TransferDirection::Upload)
+            && matches!(transfer.status, TransferStatus::Verified)
+    }) {
+        assert!(
+            Instant::now() < until,
+            "LibVNCServer upload verification: {:?}",
+            files.snapshot()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    files.send(FileCommand::CreateFolder("/new-folder".into()));
+    while !remote.path().join("new-folder").is_dir() || files.snapshot().management_busy {
+        assert!(
+            Instant::now() < until,
+            "create folder: {:?}",
+            files.snapshot()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    files.send(FileCommand::List("/".into()));
+    while files.snapshot().listed_path.as_deref() != Some("/")
+        || !files
+            .snapshot()
+            .entries
+            .iter()
+            .any(|entry| entry.name == "new-folder")
+    {
+        assert!(
+            Instant::now() < until,
+            "list new folder: {:?}",
+            files.snapshot()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    files.send(FileCommand::Rename {
+        from: "/new-folder".into(),
+        to: "/renamed-folder".into(),
+    });
+    while remote.path().join("new-folder").exists()
+        || !remote.path().join("renamed-folder").is_dir()
+        || files.snapshot().management_busy
+    {
+        assert!(
+            Instant::now() < until,
+            "rename folder: {:?}",
+            files.snapshot()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    files.send(FileCommand::List("/".into()));
+    while files.snapshot().listed_path.as_deref() != Some("/")
+        || !files
+            .snapshot()
+            .entries
+            .iter()
+            .any(|entry| entry.name == "renamed-folder")
+    {
+        assert!(
+            Instant::now() < until,
+            "list renamed folder: {:?}",
+            files.snapshot()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    std::fs::write(remote.path().join("occupied.txt"), b"untouched").unwrap();
+    files.send(FileCommand::Rename {
+        from: "/renamed-folder".into(),
+        to: "/occupied.txt".into(),
+    });
+    while files.snapshot().error.is_none() {
+        assert!(
+            Instant::now() < until,
+            "reject overwrite: {:?}",
+            files.snapshot()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(remote.path().join("renamed-folder").is_dir());
+    assert_eq!(
+        std::fs::read(remote.path().join("occupied.txt")).unwrap(),
+        b"untouched"
+    );
+    std::fs::write(remote.path().join("replacement.txt"), b"new contents").unwrap();
+    files.send(FileCommand::List("/".into()));
+    while files.snapshot().listed_path.as_deref() != Some("/")
+        || !files
+            .snapshot()
+            .entries
+            .iter()
+            .any(|entry| entry.name == "replacement.txt")
+    {
+        assert!(
+            Instant::now() < until,
+            "list replacement: {:?}",
+            files.snapshot()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    files.send(FileCommand::Replace {
+        from: "/replacement.txt".into(),
+        to: "/occupied.txt".into(),
+    });
+    while remote.path().join("replacement.txt").exists() || files.snapshot().management_busy {
+        assert!(
+            Instant::now() < until,
+            "replace file: {:?}",
+            files.snapshot()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        std::fs::read(remote.path().join("occupied.txt")).unwrap(),
+        b"new contents"
+    );
+    files.send(FileCommand::List("/".into()));
+    while files.snapshot().listed_path.as_deref() != Some("/") {
+        assert!(
+            Instant::now() < until,
+            "list after replace: {:?}",
+            files.snapshot()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    files.send(FileCommand::Delete("/renamed-folder".into()));
+    while remote.path().join("renamed-folder").exists() || files.snapshot().management_busy {
+        assert!(
+            Instant::now() < until,
+            "delete folder: {:?}",
+            files.snapshot()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    files.send(FileCommand::List("/".into()));
+    while files.snapshot().listed_path.as_deref() != Some("/")
+        || files
+            .snapshot()
+            .entries
+            .iter()
+            .any(|entry| entry.name == "renamed-folder")
+    {
+        assert!(
+            Instant::now() < until,
+            "list after delete: {:?}",
+            files.snapshot()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("keep.txt"), b"safe").unwrap();
+    std::os::unix::fs::symlink(outside.path(), remote.path().join("escape")).unwrap();
+    files.send(FileCommand::List("/escape".into()));
+    while files.snapshot().listed_path.as_deref() != Some("/escape") {
+        assert!(
+            Instant::now() < until,
+            "list symlink: {:?}",
+            files.snapshot()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    files.send(FileCommand::Delete("/escape/keep.txt".into()));
+    while files.snapshot().error.is_none() {
+        assert!(
+            Instant::now() < until,
+            "reject symlink traversal: {:?}",
+            files.snapshot()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        std::fs::read(outside.path().join("keep.txt")).unwrap(),
+        b"safe"
+    );
+    assert!(files.snapshot().can_photos);
+    assert!(files.snapshot().can_photo_delete);
+    assert!(files.snapshot().can_photo_batch_delete);
+    files.send(FileCommand::PhotoList {
+        offset: 0,
+        album: None,
+    });
+    let photo_until = Instant::now() + Duration::from_secs(5);
+    while !files
+        .snapshot()
+        .photo_entries
+        .iter()
+        .any(|entry| entry.id == "fixture-photo")
+    {
+        assert!(
+            Instant::now() < photo_until,
+            "photo list: {:?}",
+            files.snapshot()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(files.snapshot().photo_albums[0].name, "Fixture album");
+    files.send(FileCommand::PhotoList {
+        offset: 0,
+        album: Some("fixture-album".into()),
+    });
+    while files.snapshot().photo_album.as_deref() != Some("fixture-album") {
+        assert!(
+            Instant::now() < photo_until,
+            "album filter: {:?}",
+            files.snapshot()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(files.snapshot().photo_entries[0].name, "album-photo.png");
+    let photo_revision = files.snapshot().photo_revision;
+    files.send(FileCommand::PhotoImport {
+        remote: "/upload.txt".into(),
+        expected_sha256: None,
+    });
+    while !files
+        .snapshot()
+        .photo_status
+        .as_deref()
+        .is_some_and(|status| status.contains("Imported into Photos"))
+    {
+        assert!(
+            Instant::now() < photo_until,
+            "photo import: {:?}",
+            files.snapshot()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    while files.snapshot().photo_revision <= photo_revision + 1 || files.snapshot().photo_busy {
+        assert!(
+            Instant::now() < photo_until,
+            "photo refresh: {:?}",
+            files.snapshot()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    let destination = local.path().join("fixture.png");
+    files.send(FileCommand::PhotoExport {
+        asset_id: "fixture-photo".into(),
+        destination: destination.clone(),
+    });
+    while std::fs::read(&destination).unwrap_or_default() != b"photo" {
+        assert!(
+            Instant::now() < photo_until,
+            "photo export: {:?}",
+            files.snapshot()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    while remote
+        .path()
+        .join("Media/DCIM/.MISC/Incoming/rv-export-fixture.png")
+        .exists()
+    {
+        assert!(
+            Instant::now() < photo_until,
+            "photo export cleanup: {:?}",
+            files.snapshot()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    let source = local.path().join("photo-upload.png");
+    std::fs::write(&source, b"fixture-photo-bytes").unwrap();
+    let before_photo_upload = files.snapshot().photo_revision;
+    files.send(FileCommand::UploadToPhotos(source));
+    let upload_until = Instant::now() + Duration::from_secs(5);
+    while files.snapshot().photo_revision <= before_photo_upload
+        || !files
+            .snapshot()
+            .photo_status
+            .as_deref()
+            .is_some_and(|status| status.contains("Imported into Photos"))
+        || files.snapshot().photo_busy
+    {
+        assert!(
+            Instant::now() < upload_until,
+            "upload to Photos: {:?}",
+            files.snapshot()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    while files.snapshot().photo_entries[0].name != "photo-upload.png" {
+        assert!(
+            Instant::now() < upload_until,
+            "original filename after import: {:?}",
+            files.snapshot()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    files.send(FileCommand::PhotoDelete(vec![
+        "fixture-photo".into(),
+        "fixture-photo-2".into(),
+    ]));
+    while files.snapshot().photo_total != 0 || files.snapshot().photo_busy {
+        assert!(
+            Instant::now() < upload_until,
+            "photo deletion: {:?}",
+            files.snapshot()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        std::fs::read_dir(remote.path().join("Media/DCIM/.MISC/Incoming"))
+            .unwrap()
+            .all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("rv-upload-"))
+    );
+    handle.close();
+}
+
+#[test]
+fn tight_security_vnc_auth_reaches_desktop() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        let (mut sock, _) = listener.accept().unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        sock.write_all(b"RFB 003.008\n").unwrap();
+        assert_eq!(read_exact(&mut sock, 12), b"RFB 003.008\n");
+        sock.write_all(&[1, 16]).unwrap();
+        assert_eq!(read_exact(&mut sock, 1), [16]);
+        write_u32(&mut sock, 0); // tunnels
+        write_u32(&mut sock, 1); // one auth method
+        write_u32(&mut sock, 2); // VNC auth
+        sock.write_all(b"STDVVNCAUTH_").unwrap();
+        assert_eq!(read_exact(&mut sock, 4), 2u32.to_be_bytes());
+        sock.write_all(&[7; 16]).unwrap();
+        assert_eq!(read_exact(&mut sock, 16).len(), 16); // DES challenge response
+        write_u32(&mut sock, 0); // SecurityResult
+        rfb_server_init(&mut sock, 8, 8, b"tight-auth");
+        sock.write_all(&[0; 8]).unwrap(); // no file capabilities
+        mock_rfb_messages(sock)
+    });
+    let mut request = request_for(port);
+    request.password = Some("test-password".into());
+    let handle = SessionHandle::spawn(request);
+    assert!(wait_for(&handle, Duration::from_secs(5), |event| matches!(
+        event,
+        SessionEvent::Connected { .. }
+    )));
+    handle.pointer(1, 1, 1);
+    handle.key(0xff0d, true);
+    assert!(server.join().unwrap());
+    handle.close();
 }
 
 #[test]

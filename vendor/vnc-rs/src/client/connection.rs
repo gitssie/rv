@@ -16,6 +16,7 @@ use tokio::{
 use tokio_util::compat::*;
 use tracing::*;
 
+use crate::tight::TightFileEvent;
 use crate::{
     codec, ExtendedClipboardEvent, PixelFormat, Rect, VncEncoding, VncError, VncEvent, X11Event,
 };
@@ -87,6 +88,7 @@ impl VncInner {
         shared: bool,
         mut pixel_format: Option<PixelFormat>,
         encodings: Vec<VncEncoding>,
+        tight_security: bool,
     ) -> Result<Self, VncError>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -108,6 +110,21 @@ impl VncInner {
             })
             .await?;
 
+        if tight_security {
+            let caps = crate::tight::read_caps(&mut stream).await?;
+            output_ch_tx
+                .send(VncEvent::TightFile(TightFileEvent::Capabilities(caps)))
+                .await?;
+        }
+
+        let encodings = if tight_security {
+            encodings
+        } else {
+            encodings
+                .into_iter()
+                .filter(|encoding| *encoding != VncEncoding::TrollFileManagementPseudo)
+                .collect()
+        };
         let extended_clipboard = encodings.contains(&VncEncoding::ExtendedClipboardPseudo);
         trace!("client encodings: {:?}", encodings);
         send_client_encoding(&mut stream, encodings).await?;
@@ -139,8 +156,14 @@ impl VncInner {
             };
 
             let pf = pixel_format.as_ref().unwrap();
-            if let Err(e) =
-                asycn_vnc_read_loop(&mut conn_ch_rx, pf, &output_func, decoding_stop_rx).await
+            if let Err(e) = asycn_vnc_read_loop(
+                &mut conn_ch_rx,
+                pf,
+                &output_func,
+                decoding_stop_rx,
+                tight_security,
+            )
+            .await
             {
                 if let VncError::IoError(e) = e {
                     if let std::io::ErrorKind::UnexpectedEof = e.kind() {
@@ -218,6 +241,7 @@ impl VncInner {
                     self.pending_clipboard_message()
                 }
                 X11Event::CopyText(text) => Some(ClientMsg::ClientCutText(text)),
+                X11Event::TightFile(command) => Some(ClientMsg::TightFile(command)),
             };
             if let Some(msg) = msg {
                 self.input_ch.send(msg).await?;
@@ -388,13 +412,14 @@ impl VncClient {
         shared: bool,
         pixel_format: Option<PixelFormat>,
         encodings: Vec<VncEncoding>,
+        tight_security: bool,
     ) -> Result<Self, VncError>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         Ok(Self {
             inner: Arc::new(Mutex::new(
-                VncInner::new(stream, shared, pixel_format, encodings).await?,
+                VncInner::new(stream, shared, pixel_format, encodings, tight_security).await?,
             )),
         })
     }
@@ -509,6 +534,7 @@ async fn asycn_vnc_read_loop<S, F, Fut>(
     pf: &PixelFormat,
     output_func: &F,
     mut stop_ch: oneshot::Receiver<()>,
+    tight_security: bool,
 ) -> Result<(), VncError>
 where
     S: AsyncRead + Unpin,
@@ -523,7 +549,7 @@ where
 
     // main decoding loop
     while let Err(oneshot::error::TryRecvError::Empty) = stop_ch.try_recv() {
-        let server_msg = ServerMsg::read(stream).await?;
+        let server_msg = ServerMsg::read(stream, tight_security).await?;
         trace!("Server message got: {:?}", server_msg);
         match server_msg {
             ServerMsg::FramebufferUpdate(rect_num) => {
@@ -572,7 +598,8 @@ where
                         VncEncoding::LastRectPseudo => {
                             break;
                         }
-                        VncEncoding::ExtendedClipboardPseudo => {}
+                        VncEncoding::ExtendedClipboardPseudo
+                        | VncEncoding::TrollFileManagementPseudo => {}
                     }
                 }
             }
@@ -585,6 +612,9 @@ where
             }
             ServerMsg::ExtendedClipboard(event) => {
                 output_func(VncEvent::ExtendedClipboard(event)).await?;
+            }
+            ServerMsg::TightFile(event) => {
+                output_func(VncEvent::TightFile(event)).await?;
             }
         }
     }

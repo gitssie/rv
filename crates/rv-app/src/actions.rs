@@ -21,5 +21,7 @@ actions!(
         SessionToggleToolbar,
         SessionMenu,
         SessionClose,
+        FileTransferFullscreen,
+        FileTransferSelectAll,
     ]
 );

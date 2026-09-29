@@ -1,8 +1,8 @@
-use super::{Phase, SessionOptions, SessionView};
+use super::{Phase, SessionOptions, SessionView, password_error};
 use crate::actions::*;
 use gpui::{
-    AppContext, Bounds, ClipboardItem, Entity, Modifiers, MouseButton, MouseExitEvent, Pixels,
-    TestAppContext, VisualTestContext, point, px, size,
+    AppContext, Bounds, ClipboardItem, Entity, Focusable, Modifiers, MouseButton, MouseExitEvent,
+    Pixels, TestAppContext, VisualTestContext, point, px, size,
 };
 use rv_core::{ClipboardMode, ConnectRequest, LocalCursorMode, ScaleMode};
 use rv_session::{SessionCommand, SessionEvent, SessionHandle, SessionTestPeer};
@@ -50,6 +50,9 @@ fn setup_with_cursor_mode(
                     menu_key: "f8".into(),
                     hide_shots: true,
                     thumb_path: None,
+                    address_book: None,
+                    transfer_folders: Default::default(),
+                    remember_password: false,
                 },
                 handle,
                 window,
@@ -84,6 +87,113 @@ fn commands(peer: &mut SessionTestPeer) -> Vec<SessionCommand> {
         commands.push(command);
     }
     commands
+}
+
+#[test]
+fn password_failures_offer_credential_retry() {
+    assert!(password_error(
+        "VNC error: VNC Error with message: password check failed!"
+    ));
+    assert!(password_error("VNC error: Wrong password"));
+    assert!(password_error("Mac login was rejected"));
+    assert!(!password_error("connection timed out"));
+}
+
+#[gpui::test]
+fn offscreen_password_failure_requires_input_then_retries(cx: &mut TestAppContext) {
+    let (view, cx, _peer) = setup(cx, false);
+    view.update(cx, |view, cx| {
+        view.phase = Phase::Ended;
+        view.error = Some("password check failed!".into());
+        cx.notify();
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| view.retry_with_password(window, cx));
+    });
+    view.read_with(cx, |view, _| {
+        assert_eq!(view.phase, Phase::Ended);
+        assert_eq!(
+            view.password_validation.as_deref(),
+            Some("Enter a password to reconnect.")
+        );
+    });
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.password_input
+                .update(cx, |input, cx| input.set_value("replacement", window, cx));
+            view.retry_with_password(window, cx);
+        });
+    });
+    view.read_with(cx, |view, _| {
+        assert_eq!(view.phase, Phase::Connecting);
+        assert_eq!(view.req.password.as_deref(), Some("replacement"));
+        assert!(view.retried_password);
+    });
+}
+
+#[gpui::test]
+fn offscreen_password_failure_accepts_typed_password(cx: &mut TestAppContext) {
+    let (view, cx, mut peer) = setup(cx, false);
+    view.update(cx, |view, cx| {
+        view.phase = Phase::Ended;
+        view.error = Some("password check failed!".into());
+        cx.notify();
+    });
+    cx.update(|window, cx| {
+        window.draw(cx).clear(cx);
+        view.read(cx)
+            .password_input
+            .focus_handle(cx)
+            .focus(window, cx);
+    });
+    cx.simulate_input("replacement");
+    view.read_with(cx, |view, cx| {
+        assert_eq!(view.password_input.read(cx).unmask_value(), "replacement");
+    });
+    assert!(commands(&mut peer).is_empty());
+    cx.simulate_keystrokes("enter");
+    view.read_with(cx, |view, _| {
+        assert_eq!(view.phase, Phase::Connecting);
+        assert_eq!(view.req.password.as_deref(), Some("replacement"));
+    });
+    cx.update(|window, cx| {
+        assert!(view.read(cx).focus.is_focused(window));
+    });
+}
+
+#[gpui::test]
+fn offscreen_file_transfer_opens_once_per_session(cx: &mut TestAppContext) {
+    let (view, cx, _peer) = setup(cx, false);
+    view.update(cx, |view, cx| {
+        for _ in 0..2 {
+            view.open_file_transfer(cx);
+        }
+    });
+    cx.run_until_parked();
+    assert_eq!(cx.update(|_, cx| cx.windows().len()), 2);
+    let first = view.read_with(cx, |view, _| view.file_transfer_window.unwrap());
+
+    view.update(cx, |view, cx| view.open_file_transfer(cx));
+    cx.run_until_parked();
+    assert_eq!(cx.update(|_, cx| cx.windows().len()), 2);
+    assert_eq!(
+        view.read_with(cx, |view, _| view.file_transfer_window.unwrap()),
+        first
+    );
+
+    cx.update(|_, cx| {
+        first
+            .update(cx, |_, window, _| window.remove_window())
+            .unwrap();
+    });
+    view.update(cx, |view, cx| view.open_file_transfer(cx));
+    cx.run_until_parked();
+    assert_eq!(cx.update(|_, cx| cx.windows().len()), 2);
+    assert_ne!(
+        view.read_with(cx, |view, _| view.file_transfer_window.unwrap()),
+        first
+    );
 }
 
 #[gpui::test]

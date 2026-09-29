@@ -218,3 +218,4 @@ pub use client::VncConnector;
 pub use config::*;
 pub use error::*;
 pub use event::*;
+pub mod tight;

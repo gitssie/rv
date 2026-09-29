@@ -1,5 +1,6 @@
 mod actions;
 mod app;
+mod file_transfer_window;
 mod session_window;
 mod theme;
 
@@ -49,9 +50,8 @@ fn main() {
                     }
                 })
                 .expect("open address book");
-            // Connect only after the window has painted: loading the saved
-            // password may pop a modal Keychain prompt, and the user should
-            // see the address book behind it rather than nothing.
+            // Connect after the address book has opened so connection status
+            // and any errors are visible in the window.
             let book = slot.borrow().clone();
             if let (Some(target), Some(book)) = (connect_to, book) {
                 cx.background_executor()
@@ -88,6 +88,9 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-backspace", DeleteSelected, Some("AddressBook")),
         KeyBinding::new("cmd-q", QuitApp, None),
         KeyBinding::new("cmd-shift-f", SessionFullscreen, Some("Session")),
+        KeyBinding::new("cmd-shift-f", FileTransferFullscreen, Some("FileTransfer")),
+        KeyBinding::new("cmd-a", FileTransferSelectAll, Some("FileTransfer")),
+        KeyBinding::new("ctrl-a", FileTransferSelectAll, Some("FileTransfer")),
         KeyBinding::new("cmd-w", SessionClose, Some("Session")),
         KeyBinding::new("f8", SessionMenu, Some("Session")),
     ]);

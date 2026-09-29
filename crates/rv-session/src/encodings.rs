@@ -13,6 +13,7 @@ pub fn encodings_for(quality: QualityPreset, clipboard: ClipboardMode) -> Vec<Vn
         ],
     };
     list.push(VncEncoding::DesktopSizePseudo);
+    list.push(VncEncoding::TrollFileManagementPseudo);
     if clipboard == ClipboardMode::Utf8 {
         list.push(VncEncoding::ExtendedClipboardPseudo);
     }
