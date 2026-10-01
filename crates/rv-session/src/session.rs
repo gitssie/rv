@@ -47,6 +47,7 @@ pub enum SessionEvent {
     Connected { width: u16, height: u16 },
     FrameReady { generation: u64 },
     Clipboard(String),
+    Apps(crate::AppEvent),
     Bell,
     Error(String),
     Disconnected,
@@ -56,6 +57,7 @@ pub enum SessionEvent {
 pub enum SessionCommand {
     Input(X11Event),
     File(FileCommand),
+    App(crate::AppCommand),
     Close,
 }
 
@@ -146,6 +148,10 @@ impl SessionHandle {
         }
         coalesce_frames(&mut out);
         out
+    }
+
+    pub fn app(&self, command: crate::AppCommand) {
+        self.send(SessionCommand::App(command));
     }
 
     pub fn pointer(&self, x: u16, y: u16, buttons: u8) {
@@ -274,7 +280,7 @@ async fn wait_for_close(cmd_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Sessio
         match cmd_rx.recv().await {
             Some(SessionCommand::Close) | None => return,
             Some(SessionCommand::Input(_)) => {}
-            Some(SessionCommand::File(_)) => {}
+            Some(SessionCommand::File(_)) | Some(SessionCommand::App(_)) => {}
         }
     }
 }
@@ -428,13 +434,15 @@ async fn session_loop(
     // requests the server has not answered yet.
     let mut refresh_answered = true;
     let mut files = FileRuntime::new(file_state, allow_upload);
+    let mut apps = crate::apps::AppRuntime::new(allow_upload);
+    let app_send = |event| send(SessionEvent::Apps(event));
     loop {
         // Input first: a key-up queued behind frame decoding turns into
         // auto-repeat on the server, so pixels never take priority over commands.
         loop {
             match cmd_rx.try_recv() {
                 Ok(cmd) => {
-                    if !apply_command(&mut client, cmd, &mut files).await? {
+                    if !apply_command(&mut client, cmd, &mut files, &mut apps, &app_send).await? {
                         return Ok(());
                     }
                 }
@@ -450,7 +458,9 @@ async fn session_loop(
         while applied < MAX_EVENTS_PER_SLOT {
             match client.poll_event().await {
                 Ok(Some(ev)) => {
-                    if let VncEvent::TightFile(event) = ev {
+                    if let VncEvent::Device(reply) = ev {
+                        apps.reply(reply, &app_send);
+                    } else if let VncEvent::TightFile(event) = ev {
                         if let TightFileEvent::Capabilities(caps) = event {
                             files.event(TightFileEvent::Capabilities(caps));
                             if caps.list {
@@ -472,6 +482,7 @@ async fn session_loop(
                 }
             }
         }
+        apps.advance(&client, &app_send).await;
         files.advance_upload(&client).await;
         if let Some(command) = files.followup.pop_front() {
             files.command(&client, command).await;
@@ -499,7 +510,7 @@ async fn session_loop(
                         return Ok(());
                     }
                     Some(cmd) => {
-                        if !apply_command(&mut client, cmd, &mut files).await? {
+                        if !apply_command(&mut client, cmd, &mut files, &mut apps, &app_send).await? {
                             return Ok(());
                         }
                     }
@@ -515,6 +526,8 @@ async fn apply_command(
     client: &mut vnc::VncClient,
     cmd: SessionCommand,
     files: &mut FileRuntime,
+    apps: &mut crate::apps::AppRuntime,
+    app_send: &impl Fn(crate::AppEvent),
 ) -> Result<bool, SessionError> {
     match cmd {
         SessionCommand::Close => {
@@ -523,6 +536,10 @@ async fn apply_command(
         }
         SessionCommand::Input(ev) => {
             client.input(ev).await?;
+            Ok(true)
+        }
+        SessionCommand::App(command) => {
+            apps.command(command, app_send);
             Ok(true)
         }
         SessionCommand::File(command) => {

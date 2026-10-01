@@ -37,6 +37,7 @@ pub struct SessionOptions {
     pub thumb_path: Option<PathBuf>,
     pub address_book: Option<WeakEntity<AddressBookApp>>,
     pub transfer_folders: TransferFolders,
+    pub app_shortcuts: Vec<rv_core::AppShortcut>,
     pub remember_password: bool,
 }
 
@@ -131,6 +132,8 @@ pub struct SessionView {
     transfer_folders: Rc<RefCell<TransferFolders>>,
     address_book: Option<WeakEntity<AddressBookApp>>,
     _password_subscription: Subscription,
+    apps: apps_ui::AppToolbar,
+    unlock: unlock_ui::UnlockUI,
     /// Where the remote picture was last painted, in window pixels. Filled
     /// in by a probe element so pointer mapping never guesses chrome sizes.
     image_box: Rc<Cell<Bounds<Pixels>>>,
@@ -177,6 +180,7 @@ impl SessionView {
             thumb_path,
             address_book,
             transfer_folders,
+            app_shortcuts,
             remember_password,
         } = options;
         let password_input = cx.new(|cx| {
@@ -210,7 +214,11 @@ impl SessionView {
         })
         .detach();
 
+        let apps = apps_ui::AppToolbar::new(app_shortcuts, window, cx);
+        let unlock = unlock_ui::UnlockUI::new(window, cx);
         Self {
+            apps,
+            unlock,
             req,
             handle,
             title: title.into(),
@@ -363,6 +371,7 @@ impl SessionView {
             }
             changed = true;
             match ev {
+                SessionEvent::Apps(event) => self.apply_app_event(event, cx),
                 SessionEvent::Status(s) => self.status = s.into(),
                 SessionEvent::Connected { width, height } => {
                     self.fb_w = width;
@@ -403,16 +412,19 @@ impl SessionView {
                     self.status = e.into();
                 }
                 SessionEvent::Disconnected => {
+                    self.unlock.disconnected();
                     self.local_cursor.set_hidden(false);
                     if self.error.is_none() {
                         self.status = "Disconnected".into();
                     }
+                    self.apps.disconnected(cx);
                     self.phase = Phase::Ended;
                     self.buttons = 0;
                     self.save_thumb();
                 }
             }
         }
+        self.tick_unlock(cx);
         let file_revision = self.handle.file_client().revision();
         if file_revision != self.last_file_revision {
             self.last_file_revision = file_revision;
@@ -503,7 +515,7 @@ impl SessionView {
     }
 
     fn send_pointer(&mut self, x: u16, y: u16) {
-        if self.view_only() || self.phase != Phase::Connected {
+        if self.view_only() || self.unlock.blocks_input() || self.phase != Phase::Connected {
             return;
         }
         self.handle.pointer(x, y, self.buttons);
@@ -558,7 +570,7 @@ impl SessionView {
     }
 
     fn send_keys(&mut self, events: impl IntoIterator<Item = (u32, bool)>) {
-        if self.view_only() || self.phase != Phase::Connected {
+        if self.view_only() || self.unlock.blocks_input() || self.phase != Phase::Connected {
             return;
         }
         for (keysym, down) in events {
@@ -619,6 +631,7 @@ impl SessionView {
     }
 
     fn reconnect(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.apps.disconnected(cx);
         self.local_cursor.set_hidden(false);
         self.focus.focus(window, cx);
         self.handle = SessionHandle::spawn(self.req.clone());
@@ -662,7 +675,10 @@ impl SessionView {
     }
 
     fn handle_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if self.phase != Phase::Connected || !self.focus.is_focused(window) {
+        if self.phase != Phase::Connected
+            || self.unlock.blocks_input()
+            || !self.focus.is_focused(window)
+        {
             return;
         }
         let key = event.keystroke.key.as_str();
@@ -701,7 +717,10 @@ impl SessionView {
     }
 
     fn handle_key_up(&mut self, event: &KeyUpEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if self.phase != Phase::Connected || !self.focus.is_focused(window) {
+        if self.phase != Phase::Connected
+            || self.unlock.blocks_input()
+            || !self.focus.is_focused(window)
+        {
             return;
         }
         let key = event.keystroke.key.as_str();
@@ -718,7 +737,10 @@ impl SessionView {
     }
 
     fn handle_modifiers(&mut self, event: &ModifiersChangedEvent, window: &Window) {
-        if self.phase != Phase::Connected || !self.focus.is_focused(window) {
+        if self.phase != Phase::Connected
+            || self.unlock.blocks_input()
+            || !self.focus.is_focused(window)
+        {
             return;
         }
         let events = self.keys.set_modifiers(
@@ -729,8 +751,14 @@ impl SessionView {
         self.send_keys(events);
     }
 
-    fn render_toolbar(&self, fullscreen: bool, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_toolbar(
+        &self,
+        fullscreen: bool,
+        width: Pixels,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let live = self.phase == Phase::Connected && !self.view_only();
+        let compact = width < px(1000.);
         h_flex()
             .h(theme::toolbar_height())
             .w_full()
@@ -785,42 +813,45 @@ impl SessionView {
                     })),
             )
             .child(toolbar_sep())
-            .child(
-                tool_btn(
-                    "cad",
-                    IconName::SquareTerminal,
-                    "Send Ctrl+Alt+Del",
-                    cx.listener(|this, _, _, cx| {
-                        this.send_cad();
-                        cx.notify();
-                    }),
+            .when(!compact, |bar| {
+                bar.child(
+                    tool_btn(
+                        "cad",
+                        IconName::SquareTerminal,
+                        "Send Ctrl+Alt+Del",
+                        cx.listener(|this, _, _, cx| {
+                            this.send_cad();
+                            cx.notify();
+                        }),
+                    )
+                    .disabled(!live),
                 )
-                .disabled(!live),
-            )
-            .child(key_chip(
-                "Ctrl",
-                cx.listener(|this, _, _, _| this.tap_key(XK_CONTROL_L)),
-            ))
-            .child(key_chip(
-                "Alt",
-                cx.listener(|this, _, _, _| this.tap_key(XK_ALT_L)),
-            ))
-            .child(key_chip(
-                "Win",
-                cx.listener(|this, _, _, _| this.tap_key(rv_core::XK_SUPER_L)),
-            ))
-            .child(key_chip(
-                "Tab",
-                cx.listener(|this, _, _, _| this.tap_key(rv_core::XK_TAB)),
-            ))
-            .child(key_chip(
-                "Esc",
-                cx.listener(|this, _, _, _| this.tap_key(rv_core::XK_ESCAPE)),
-            ))
-            .child(key_chip(
-                "Caps",
-                cx.listener(|this, _, _, _| this.tap_key(rv_core::XK_CAPS_LOCK)),
-            ))
+                .child(key_chip(
+                    "Ctrl",
+                    cx.listener(|this, _, _, _| this.tap_key(XK_CONTROL_L)),
+                ))
+                .child(key_chip(
+                    "Alt",
+                    cx.listener(|this, _, _, _| this.tap_key(XK_ALT_L)),
+                ))
+                .child(key_chip(
+                    "Win",
+                    cx.listener(|this, _, _, _| this.tap_key(rv_core::XK_SUPER_L)),
+                ))
+                .child(key_chip(
+                    "Tab",
+                    cx.listener(|this, _, _, _| this.tap_key(rv_core::XK_TAB)),
+                ))
+                .child(key_chip(
+                    "Esc",
+                    cx.listener(|this, _, _, _| this.tap_key(rv_core::XK_ESCAPE)),
+                ))
+                .child(key_chip(
+                    "Caps",
+                    cx.listener(|this, _, _, _| this.tap_key(rv_core::XK_CAPS_LOCK)),
+                ))
+            })
+            .when(compact, |bar| bar.child(self.render_keyboard_shortcuts(cx)))
             .child(toolbar_sep())
             .child(
                 tool_btn(
@@ -861,13 +892,15 @@ impl SessionView {
                     )
                     .on_click(cx.listener(|this, _, _, cx| this.quick_upload(cx))),
             )
+            .child(self.render_app_toolbar(cx))
+            .child(self.render_unlock_button(cx))
             .child(div().flex_1())
             .child(
                 div()
                     .text_xs()
                     .text_color(theme::toolbar_muted())
                     .text_ellipsis()
-                    .max_w(px(260.))
+                    .max_w(px(if compact { 70. } else { 260. }))
                     .child(self.status.clone()),
             )
             .child(
@@ -883,13 +916,18 @@ impl SessionView {
                     })),
             )
             .child(
-                Button::new("disc")
-                    .ghost()
-                    .icon(IconName::WindowClose)
-                    .text_color(theme::danger(cx))
-                    .tooltip("Disconnect")
-                    .disabled(matches!(self.phase, Phase::Disconnecting | Phase::Ended))
-                    .on_click(cx.listener(|this, _, _, cx| this.disconnect(cx))),
+                div()
+                    .debug_selector(|| "disconnect-control".into())
+                    .flex_shrink_0()
+                    .child(
+                        Button::new("disc")
+                            .ghost()
+                            .icon(IconName::WindowClose)
+                            .text_color(theme::danger(cx))
+                            .tooltip("Disconnect")
+                            .disabled(matches!(self.phase, Phase::Disconnecting | Phase::Ended))
+                            .on_click(cx.listener(|this, _, _, cx| this.disconnect(cx))),
+                    ),
             )
     }
 
@@ -898,6 +936,7 @@ impl SessionView {
     fn render_floating_toolbar(
         &self,
         fullscreen: bool,
+        width: Pixels,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         div()
@@ -912,7 +951,7 @@ impl SessionView {
                     .id("float-tb")
                     .occlude()
                     .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
-                        this.toolbar_open = *hovered;
+                        this.toolbar_open = *hovered || this.apps.picker_open;
                         cx.notify();
                     }))
                     .child(if self.toolbar_open {
@@ -920,7 +959,7 @@ impl SessionView {
                             .rounded_b_lg()
                             .shadow_lg()
                             .overflow_hidden()
-                            .child(self.render_toolbar(fullscreen, cx))
+                            .child(self.render_toolbar(fullscreen, width, cx))
                             .into_any_element()
                     } else {
                         div()
@@ -1423,10 +1462,12 @@ impl Drop for SessionView {
 impl Render for SessionView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.update_local_cursor(window, cx);
+        let width = window.viewport_size().width;
         let fullscreen = window.is_fullscreen();
         let show_pinned = self.pin_toolbar;
-        let remote_keyboard_active =
-            self.phase == Phase::Connected && self.focus.is_focused(window);
+        let remote_keyboard_active = self.phase == Phase::Connected
+            && !self.unlock.blocks_input()
+            && self.focus.is_focused(window);
 
         v_flex()
             .size_full()
@@ -1502,7 +1543,7 @@ impl Render for SessionView {
                 )
             })
             .when(show_pinned, |this| {
-                this.child(self.render_toolbar(fullscreen, cx))
+                this.child(self.render_toolbar(fullscreen, width, cx))
             })
             .child(
                 div()
@@ -1569,7 +1610,7 @@ impl Render for SessionView {
                             .child(self.render_picture(cx)),
                     )
                     .when(!show_pinned && self.phase != Phase::Ended, |this| {
-                        this.child(self.render_floating_toolbar(fullscreen, cx))
+                        this.child(self.render_floating_toolbar(fullscreen, width, cx))
                     })
                     .when(self.info_open, |this| this.child(self.render_info()))
                     .when(self.show_menu, |this| {
@@ -1577,6 +1618,9 @@ impl Render for SessionView {
                     })
                     .when(self.phase == Phase::Ended, |this| {
                         this.child(self.render_ended(cx))
+                    })
+                    .when(self.unlock.editing(), |this| {
+                        this.child(self.render_unlock_setting(window, cx))
                     }),
             )
     }
@@ -1938,3 +1982,6 @@ mod tests {
         );
     }
 }
+
+mod apps_ui;
+mod unlock_ui;

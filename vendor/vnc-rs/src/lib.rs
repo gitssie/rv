@@ -219,3 +219,5 @@ pub use config::*;
 pub use error::*;
 pub use event::*;
 pub mod tight;
+
+pub mod device;

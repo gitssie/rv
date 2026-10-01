@@ -238,6 +238,35 @@ impl AddressBookApp {
         }
     }
 
+    pub(crate) fn remember_app_shortcuts(
+        &mut self,
+        id: ConnectionId,
+        shortcuts: Vec<rv_core::AppShortcut>,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        if self.read_only {
+            return Err("地址簿为只读，快捷栏修改仅在本次会话有效".into());
+        }
+        let Some(connection) = self.book.get_mut(id) else {
+            return Err("连接已删除，快捷栏修改仅在本次会话有效".into());
+        };
+        if connection.app_shortcuts == shortcuts {
+            return Ok(());
+        }
+        let previous = std::mem::replace(&mut connection.app_shortcuts, shortcuts);
+        if let Err(error) = self.book.save() {
+            if let Some(connection) = self.book.get_mut(id) {
+                connection.app_shortcuts = previous;
+            }
+            let message = format!("快捷栏保存失败：{error}");
+            self.status = message.clone().into();
+            cx.notify();
+            return Err(message);
+        }
+        cx.notify();
+        Ok(())
+    }
+
     pub(crate) fn remember_transfer_folders(
         &mut self,
         id: ConnectionId,
@@ -586,6 +615,11 @@ impl AddressBookApp {
             thumb_path: req.connection_id.map(|id| self.book.paths().thumb_path(id)),
             address_book: Some(cx.entity().downgrade()),
             transfer_folders,
+            app_shortcuts: req
+                .connection_id
+                .and_then(|id| self.book.get(id))
+                .map(|conn| conn.app_shortcuts.clone())
+                .unwrap_or_else(rv_core::default_app_shortcuts),
             remember_password: req
                 .connection_id
                 .and_then(|id| self.book.get(id))

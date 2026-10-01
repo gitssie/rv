@@ -17,6 +17,7 @@ pub enum VncEncoding {
     DesktopSizePseudo = -223,
     LastRectPseudo = -224,
     ExtendedClipboardPseudo = 0xC0A1_E5CE_u32 as i32,
+    TrollDeviceControlPseudo = 0xC0A1_A990_u32 as i32,
     TrollFileManagementPseudo = 0xC0A1_F17E_u32 as i32,
 }
 
@@ -39,6 +40,9 @@ impl From<u32> for VncEncoding {
             }
             value if value == VncEncoding::TrollFileManagementPseudo as i32 => {
                 VncEncoding::TrollFileManagementPseudo
+            }
+            value if value == VncEncoding::TrollDeviceControlPseudo as i32 => {
+                VncEncoding::TrollDeviceControlPseudo
             }
             _ => VncEncoding::Raw,
         }

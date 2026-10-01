@@ -7,6 +7,8 @@
 //! server. Any 16-byte VncAuth response is accepted.
 
 //! `RV_MOCK_ARD=1` instead offers Apple's security types and validates the
+//! `RV_MOCK_UNLOCK=1` simulates a six-digit iOS unlock without logging keys.
+//!
 //! encrypted Mac login. Defaults: username `test-user`, password `test-password`;
 //! override with `RV_MOCK_USERNAME` / `RV_MOCK_PASSWORD`.
 
@@ -44,6 +46,24 @@ fn rects() -> u16 {
 
 fn tls_enabled() -> bool {
     matches!(std::env::var("RV_MOCK_TLS").as_deref(), Ok("1"))
+}
+
+fn unlock_enabled() -> bool {
+    matches!(std::env::var("RV_MOCK_UNLOCK").as_deref(), Ok("1"))
+}
+
+fn device_reply<S: Write>(
+    sock: &mut S,
+    op: u8,
+    id: u32,
+    payload: serde_json::Value,
+) -> std::io::Result<()> {
+    let body = payload.to_string();
+    sock.write_all(&[140, 1, op, 0])?;
+    write_u32(sock, id)?;
+    write_u32(sock, body.len() as u32)?;
+    sock.write_all(body.as_bytes())?;
+    sock.flush()
 }
 
 fn now_ms() -> u128 {
@@ -172,6 +192,10 @@ fn serve(sock: TcpStream) -> std::io::Result<()> {
     sock.write_all(name)?;
 
     let start = Instant::now();
+    let mut locked = true;
+    let mut ready = false;
+    let mut digits_left = 0u8;
+    let mut device_enabled = false;
     while let Ok(message) = read_exact(&mut sock, 1) {
         match message[0] {
             0 => {
@@ -180,7 +204,20 @@ fn serve(sock: TcpStream) -> std::io::Result<()> {
             2 => {
                 let _ = read_exact(&mut sock, 1)?;
                 let n = u16::from_be_bytes(read_exact(&mut sock, 2)?.try_into().unwrap());
-                let _ = read_exact(&mut sock, n as usize * 4)?;
+                let encodings = read_exact(&mut sock, n as usize * 4)?;
+                device_enabled = unlock_enabled()
+                    && encodings
+                        .chunks_exact(4)
+                        .any(|b| b == 0xC0A1A990u32.to_be_bytes());
+                if device_enabled {
+                    device_reply(
+                        &mut sock,
+                        0,
+                        0,
+                        serde_json::json!({"control":true,"unlock":true,"lock":true}),
+                    )?;
+                    device_reply(&mut sock, 11, 0, serde_json::json!({"locked":locked}))?;
+                }
             }
             3 => {
                 let _ = read_exact(&mut sock, 9)?;
@@ -206,6 +243,25 @@ fn serve(sock: TcpStream) -> std::io::Result<()> {
             4 => {
                 let b = read_exact(&mut sock, 7)?;
                 let keysym = u32::from_be_bytes(b[3..7].try_into().unwrap());
+                if unlock_enabled() {
+                    if b[0] == 1 && (b'0' as u32..=b'9' as u32).contains(&keysym) && digits_left > 0
+                    {
+                        digits_left -= 1;
+                        if digits_left == 0 {
+                            locked = false;
+                            if device_enabled {
+                                device_reply(
+                                    &mut sock,
+                                    11,
+                                    0,
+                                    serde_json::json!({"locked":false}),
+                                )?;
+                            }
+                            eprintln!("mock unlock completed (six keys)");
+                        }
+                    }
+                    continue; // Never print unlock keys, including mock inputs.
+                }
                 eprintln!(
                     "[{}] key {} keysym=0x{keysym:04x} {:?}",
                     now_ms(),
@@ -230,6 +286,40 @@ fn serve(sock: TcpStream) -> std::io::Result<()> {
                 let _ = read_exact(&mut sock, 3)?;
                 let len = u32::from_be_bytes(read_exact(&mut sock, 4)?.try_into().unwrap());
                 let _ = read_exact(&mut sock, len as usize)?;
+            }
+            139 if unlock_enabled() => {
+                let header = read_exact(&mut sock, 11)?;
+                let op = header[1];
+                let id = u32::from_be_bytes(header[3..7].try_into().unwrap());
+                let len = u32::from_be_bytes(header[7..11].try_into().unwrap()) as usize;
+                if len > 4096 {
+                    break;
+                }
+                let body: serde_json::Value = serde_json::from_slice(&read_exact(&mut sock, len)?)?;
+                let previous_locked = locked;
+                let reply = match op {
+                    7 | 8 => {
+                        if op == 8 {
+                            ready = true;
+                        }
+                        serde_json::json!({"locked":locked,"passcode_required":true,"input_ready":ready,"input_empty":true,"reason":""})
+                    }
+                    9 => {
+                        digits_left = body["digits"].as_u64().unwrap_or(0) as u8;
+                        serde_json::json!({"armed":digits_left == 6 && locked && ready})
+                    }
+                    10 => {
+                        locked = true;
+                        ready = false;
+                        digits_left = 0;
+                        serde_json::json!({"locked":true,"passcode_required":true,"input_ready":false,"input_empty":true,"reason":""})
+                    }
+                    _ => serde_json::json!({}),
+                };
+                device_reply(&mut sock, op, id, reply)?;
+                if device_enabled && previous_locked != locked {
+                    device_reply(&mut sock, 11, 0, serde_json::json!({"locked":locked}))?;
+                }
             }
             _ => break,
         }

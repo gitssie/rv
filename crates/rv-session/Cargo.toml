@@ -26,6 +26,7 @@ openssl.workspace = true
 tokio-openssl.workspace = true
 zeroize = "1"
 serde_json.workspace = true
+serde.workspace = true
 base64 = "0.22"
 uuid.workspace = true
 

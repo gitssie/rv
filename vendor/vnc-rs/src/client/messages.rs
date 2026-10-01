@@ -29,6 +29,7 @@ pub(super) enum ClientMsg {
     ExtendedClipboardRequest,
     ExtendedClipboardProvide(String),
     TightFile(TightFileCommand),
+    Device(crate::device::DeviceRequest),
 }
 
 impl ClientMsg {
@@ -179,6 +180,7 @@ impl ClientMsg {
                 data.extend_from_slice(&compressed);
                 write_extended_clipboard(writer, &data).await
             }
+            ClientMsg::Device(command) => command.write(writer).await,
             ClientMsg::TightFile(command) => command.write(writer).await,
         }
     }
@@ -219,6 +221,7 @@ pub(super) enum ServerMsg {
     ServerCutText(String),
     ExtendedClipboard(ExtendedClipboardEvent),
     TightFile(TightFileEvent),
+    Device(crate::device::DeviceReply),
 }
 
 impl ServerMsg {
@@ -229,6 +232,7 @@ impl ServerMsg {
         let server_msg = reader.read_u8().await?;
 
         match server_msg {
+            140 => Ok(Self::Device(crate::device::read_reply(reader).await?)),
             130..=133 | 137..=138 if tight_security => Ok(Self::TightFile(
                 crate::tight::read_message(reader, server_msg).await?,
             )),

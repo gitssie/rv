@@ -1,6 +1,8 @@
 //! Tokio-backed VNC session for RV.
 
+mod apps;
 mod ard;
+pub use apps::{AppCapabilities, AppCommand, AppEvent, RemoteApp, ScreenState, valid_bundle_id};
 mod compositor;
 mod encodings;
 mod error;

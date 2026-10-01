@@ -1,10 +1,14 @@
 //! Shared models for the RV VNC viewer.
 
+mod app_shortcuts;
 mod connection;
+pub use app_shortcuts::{AppShortcut, default_app_shortcuts, move_app_shortcut};
 mod keyboard;
 mod keysym;
 mod prefs;
 mod store;
+mod unlock;
+pub use unlock::{UnlockCode, delete_unlock_code, load_unlock_code, save_unlock_code};
 
 pub use connection::{
     ClipboardMode, ConnectRequest, Connection, ConnectionId, EncryptionMode, LocalCursorMode,

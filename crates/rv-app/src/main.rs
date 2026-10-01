@@ -1,5 +1,6 @@
 mod actions;
 mod app;
+mod assets;
 mod file_transfer_window;
 mod session_window;
 mod theme;
@@ -21,7 +22,7 @@ fn main() {
         )
         .init();
 
-    let app = gpui_platform::application().with_assets(gpui_component_assets::Assets);
+    let app = gpui_platform::application().with_assets(assets::Assets);
     app.run(move |cx| {
         #[cfg(target_os = "macos")]
         macos_dock_icon::set();
@@ -93,6 +94,8 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-a", FileTransferSelectAll, Some("FileTransfer")),
         KeyBinding::new("cmd-w", SessionClose, Some("Session")),
         KeyBinding::new("f8", SessionMenu, Some("Session")),
+        KeyBinding::new("enter", AppActionActivate, Some("AppActionIcon")),
+        KeyBinding::new("space", AppActionActivate, Some("AppActionIcon")),
     ]);
 }
 

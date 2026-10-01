@@ -209,6 +209,8 @@ pub struct Connection {
     pub last_connected: Option<i64>,
     #[serde(default)]
     pub transfer_folders: TransferFolders,
+    #[serde(default = "crate::default_app_shortcuts")]
+    pub app_shortcuts: Vec<crate::AppShortcut>,
 }
 
 fn default_shared() -> bool {
@@ -242,6 +244,7 @@ impl Connection {
             labels: Vec::new(),
             last_connected: None,
             transfer_folders: TransferFolders::default(),
+            app_shortcuts: crate::default_app_shortcuts(),
         }
     }
 

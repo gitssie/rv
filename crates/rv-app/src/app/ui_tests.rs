@@ -59,6 +59,39 @@ fn transfer_folders_are_saved_with_the_connection(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn offscreen_app_shortcuts_save_per_connection_and_preserve_empty(cx: &mut TestAppContext) {
+    let first = Connection::new("First", "first.test", 5900);
+    let second = Connection::new("Second", "second.test", 5900);
+    let first_id = first.id;
+    let second_id = second.id;
+    let (app, cx, dir) = setup(cx, vec![first, second]);
+    let mut favorites = rv_core::default_app_shortcuts();
+    favorites.reverse();
+    app.update(cx, |app, cx| {
+        app.remember_app_shortcuts(first_id, favorites.clone(), cx)
+            .unwrap()
+    });
+    let reload = || AddressBook::load(rv_core::StorePaths::in_dir(dir.path().into())).unwrap();
+    assert_eq!(reload().get(first_id).unwrap().app_shortcuts, favorites);
+    assert_eq!(
+        reload().get(second_id).unwrap().app_shortcuts,
+        rv_core::default_app_shortcuts()
+    );
+    app.update(cx, |app, cx| {
+        app.remember_app_shortcuts(first_id, vec![], cx).unwrap()
+    });
+    assert!(reload().get(first_id).unwrap().app_shortcuts.is_empty());
+    app.update(cx, |app, cx| {
+        app.read_only = true;
+        assert!(
+            app.remember_app_shortcuts(first_id, favorites.clone(), cx)
+                .is_err()
+        );
+    });
+    assert!(reload().get(first_id).unwrap().app_shortcuts.is_empty());
+}
+
+#[gpui::test]
 fn offscreen_save_connection_persists_form_and_clears_password(cx: &mut TestAppContext) {
     let (app, cx, dir) = setup(cx, vec![]);
     cx.simulate_keystrokes("ctrl-n");

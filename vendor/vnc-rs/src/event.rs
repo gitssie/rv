@@ -86,6 +86,7 @@ pub enum VncEvent {
     ExtendedClipboard(ExtendedClipboardEvent),
     /// TightVNC 1.x file transfer capability and data messages.
     TightFile(TightFileEvent),
+    Device(crate::device::DeviceReply),
     /// If any unexpected error happens in the async process routines
     /// This event will propagate the error to the current context
     Error(String),
@@ -166,4 +167,5 @@ pub enum X11Event {
     CopyText(String),
     /// TightVNC 1.x file transfer request or upload block.
     TightFile(TightFileCommand),
+    Device(crate::device::DeviceRequest),
 }

@@ -9,6 +9,7 @@ A native desktop VNC viewer written in Rust with [GPUI](https://www.gpui.rs/). D
 - Address book with search, labels, list/grid views, desktop previews, and recents
 - Light / dark / system appearance
 - Session window with pinned or auto-hide toolbar, F8 menu, and connection info
+- TrollVNC App shortcuts: real icons, click to open, right-click close/restart/remove, searchable `+` picker, and saved drag ordering. Requires the matching TrollVNC App-control extension; see [protocol and usage](docs/app-control-protocol.md).
 - Fit / 1:1 (scrollable) / stretch scaling and full screen
 - Mouse (left/middle/right, vertical + horizontal wheel), keyboard, Ctrl+Alt+Del and extra keys (Ctrl/Alt/Win/Tab/Esc/Caps — Caps toggles the remote caps-lock)
 - Reconnect from the disconnect / error overlay
@@ -184,8 +185,10 @@ Pass `--identity "$RV_SIGN_IDENTITY"` to sign with a Developer ID identity;
 without it the bundle is ad-hoc signed. Saved passwords are stored as AES-256-GCM
 files in `passwords/` under the RV data directory. Each save uses a random nonce,
 but the encryption key is fixed in the executable: anyone with the binary and
-password files can recover them. Existing passwords in the OS keychain are not
-copied; enter and save each password again after upgrading. Editing connection
+password files can recover them. VNC login and six-digit screen-unlock passwords
+share the same local credential file for each connection; RV does not use any
+OS keychain. Older local password files are read and upgraded on the next save.
+Enter the screen-unlock password again if it was saved by an older keychain-based build. Editing connection
 settings leaves a saved password untouched unless a replacement is entered.
 
 ## Layout

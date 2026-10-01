@@ -7,7 +7,7 @@ use gpui::{
 use rv_core::{ClipboardMode, ConnectRequest, LocalCursorMode, ScaleMode};
 use rv_session::{SessionCommand, SessionEvent, SessionHandle, SessionTestPeer};
 
-fn setup(
+pub(super) fn setup(
     cx: &mut TestAppContext,
     view_only: bool,
 ) -> (Entity<SessionView>, &mut VisualTestContext, SessionTestPeer) {
@@ -52,6 +52,7 @@ fn setup_with_cursor_mode(
                     thumb_path: None,
                     address_book: None,
                     transfer_folders: Default::default(),
+                    app_shortcuts: rv_core::default_app_shortcuts(),
                     remember_password: false,
                 },
                 handle,

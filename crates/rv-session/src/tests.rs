@@ -1490,3 +1490,262 @@ fn ard_missing_credentials_explain_mac_login_requirement() {
         "Mac requires a username and password",
     );
 }
+
+fn write_app_reply(sock: &mut TcpStream, op: u8, id: u32, payload: serde_json::Value) {
+    let json = payload.to_string();
+    sock.write_all(&[140, 1, op, 0]).unwrap();
+    write_u32(sock, id);
+    write_u32(sock, json.len() as u32);
+    sock.write_all(json.as_bytes()).unwrap();
+}
+
+#[test]
+fn passive_lock_push_over_rfb_needs_no_state_request_and_preserves_frames() {
+    use crate::AppEvent;
+    use serde_json::json;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        let (mut sock, _) = listener.accept().unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        rfb_handshake(&mut sock, 1, 1, b"lock-push");
+        let mut sent_change = false;
+        loop {
+            let mut typ = [0];
+            if sock.read_exact(&mut typ).is_err() {
+                break;
+            }
+            match typ[0] {
+                0 => {
+                    read_exact(&mut sock, 19);
+                }
+                2 => {
+                    read_exact(&mut sock, 1);
+                    let n = u16::from_be_bytes(read_exact(&mut sock, 2).try_into().unwrap());
+                    let encodings = read_exact(&mut sock, n as usize * 4);
+                    assert!(
+                        encodings
+                            .chunks_exact(4)
+                            .any(|v| v == 0xC0A1_A990u32.to_be_bytes())
+                    );
+                    write_app_reply(
+                        &mut sock,
+                        0,
+                        0,
+                        json!({"unlock":true,"lock":true,"control":true}),
+                    );
+                    write_app_reply(&mut sock, 11, 0, json!({"locked":true}));
+                }
+                3 => {
+                    read_exact(&mut sock, 9);
+                    sock.write_all(&[0, 0]).unwrap();
+                    write_u16(&mut sock, 1);
+                    for v in [0, 0, 1, 1] {
+                        write_u16(&mut sock, v);
+                    }
+                    write_u32(&mut sock, 0);
+                    sock.write_all(&[11, 22, 33, 255]).unwrap();
+                    if !sent_change {
+                        write_app_reply(&mut sock, 11, 0, json!({"locked":false}));
+                        sent_change = true;
+                    }
+                }
+                139 => panic!("Passive state push must not require a device-state request"),
+                typ => panic!("Unexpected RFB message {typ}"),
+            }
+        }
+        assert!(sent_change);
+    });
+    let handle = SessionHandle::spawn(request_for(port));
+    let mut observed = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && observed.len() < 2 {
+        for event in handle.drain() {
+            if let SessionEvent::Apps(AppEvent::LockState(locked)) = event {
+                observed.push(locked);
+            }
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(observed, [true, false]);
+    assert_eq!(
+        &handle.framebuffer.lock().unwrap().pixels[..4],
+        &[11, 22, 33, 255]
+    );
+    handle.close();
+    drop(handle);
+    server.join().unwrap();
+}
+
+#[test]
+fn app_control_roundtrip_over_plain_rfb_preserves_framebuffer() {
+    use crate::{AppCommand, AppEvent};
+    use base64::Engine;
+    use serde_json::json;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        let (mut sock, _) = listener.accept().unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        rfb_handshake(&mut sock, 1, 1, b"apps-plain");
+        let mut saw_launch = false;
+        let mut saw_icon = false;
+        loop {
+            let mut typ = [0];
+            if sock.read_exact(&mut typ).is_err() {
+                break;
+            }
+            match typ[0] {
+                0 => {
+                    read_exact(&mut sock, 19);
+                }
+                2 => {
+                    read_exact(&mut sock, 1);
+                    let n = u16::from_be_bytes(read_exact(&mut sock, 2).try_into().unwrap());
+                    let bytes = read_exact(&mut sock, n as usize * 4);
+                    let encodings: Vec<_> = bytes
+                        .chunks_exact(4)
+                        .map(|b| u32::from_be_bytes(b.try_into().unwrap()))
+                        .collect();
+                    assert!(encodings.contains(&0xC0A1_A990));
+                    assert!(
+                        !encodings.contains(&(vnc::VncEncoding::TrollFileManagementPseudo as u32)),
+                        "App extension must not depend on Tight file transfer"
+                    );
+                    write_app_reply(
+                        &mut sock,
+                        0,
+                        0,
+                        json!({"list":true,"launch":true,"icons":true,"control":true}),
+                    );
+                }
+                3 => {
+                    read_exact(&mut sock, 9);
+                    sock.write_all(&[0, 0]).unwrap();
+                    write_u16(&mut sock, 1);
+                    for v in [0, 0, 1, 1] {
+                        write_u16(&mut sock, v);
+                    }
+                    write_u32(&mut sock, 0);
+                    sock.write_all(&[11, 22, 33, 255]).unwrap();
+                }
+                139 => {
+                    let head = read_exact(&mut sock, 11);
+                    assert_eq!(head[0], 1);
+                    assert_eq!(head[2], 0);
+                    let id = u32::from_be_bytes(head[3..7].try_into().unwrap());
+                    assert_ne!(id, 0);
+                    let length = u32::from_be_bytes(head[7..11].try_into().unwrap()) as usize;
+                    let request: serde_json::Value =
+                        serde_json::from_slice(&read_exact(&mut sock, length)).unwrap();
+                    match head[1] {
+                        1 => write_app_reply(
+                            &mut sock,
+                            1,
+                            id,
+                            json!({"apps":[{"bundle_id":"com.example.app","name":"Example","can_launch":true,"can_terminate":true}]}),
+                        ),
+                        2 => {
+                            assert_eq!(request["bundle_id"], "com.example.app");
+                            saw_launch = true;
+                            write_app_reply(
+                                &mut sock,
+                                2,
+                                id,
+                                json!({"bundle_id":"com.example.app"}),
+                            );
+                        }
+                        6 => {
+                            assert_eq!(request["bundle_id"], "com.example.app");
+                            saw_icon = true;
+                            let image =
+                                image::RgbaImage::from_pixel(1, 1, image::Rgba([1, 2, 3, 255]));
+                            let mut png = std::io::Cursor::new(vec![]);
+                            image.write_to(&mut png, image::ImageFormat::Png).unwrap();
+                            write_app_reply(
+                                &mut sock,
+                                6,
+                                id,
+                                json!({"png":base64::engine::general_purpose::STANDARD.encode(png.into_inner())}),
+                            );
+                        }
+                        op => panic!("Unexpected app operation {op}"),
+                    }
+                }
+                5 => {
+                    read_exact(&mut sock, 5);
+                }
+                typ => panic!("Unexpected RFB message {typ}"),
+            }
+        }
+        assert!(saw_launch && saw_icon);
+    });
+    let handle = SessionHandle::spawn(request_for(port));
+    assert!(wait_for(
+        &handle,
+        Duration::from_secs(5),
+        |e| matches!(e, SessionEvent::Apps(AppEvent::List(apps)) if apps.len() == 1)
+    ));
+    handle.app(AppCommand::Icon("com.example.app".into()));
+    handle.app(AppCommand::Launch("com.example.app".into()));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut icon = false;
+    let mut launched = false;
+    while Instant::now() < deadline && !(icon && launched) {
+        for event in handle.drain() {
+            match event {
+                SessionEvent::Apps(AppEvent::Icon {
+                    bgra,
+                    width,
+                    height,
+                    ..
+                }) => {
+                    assert_eq!((width, height), (1, 1));
+                    assert_eq!(bgra, [3, 2, 1, 255]);
+                    icon = true;
+                }
+                SessionEvent::Apps(AppEvent::Finished(AppCommand::Launch(_))) => launched = true,
+                SessionEvent::Apps(AppEvent::Failed { message, .. }) => panic!("{message}"),
+                _ => {}
+            }
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(icon && launched);
+    assert_eq!(
+        &handle.framebuffer.lock().unwrap().pixels[..4],
+        &[11, 22, 33, 255]
+    );
+    handle.close();
+    drop(handle);
+    server.join().unwrap();
+}
+
+#[test]
+fn unsupported_app_command_does_not_break_old_rfb_peer() {
+    use crate::{AppCommand, AppEvent};
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        let (mut sock, _) = listener.accept().unwrap();
+        rfb_handshake(&mut sock, 8, 8, b"old-peer");
+        mock_rfb_messages(sock)
+    });
+    let handle = SessionHandle::spawn(request_for(port));
+    assert!(wait_for(&handle, Duration::from_secs(5), |e| matches!(
+        e,
+        SessionEvent::Connected { .. }
+    )));
+    handle.app(AppCommand::Launch("com.example.app".into()));
+    assert!(wait_for(&handle, Duration::from_secs(3), |e| matches!(
+        e,
+        SessionEvent::Apps(AppEvent::Failed { .. })
+    )));
+    handle.pointer(1, 1, 0);
+    handle.key(0xff0d, true);
+    assert!(
+        server.join().unwrap(),
+        "normal frame/input must survive unsupported App control"
+    );
+    handle.close();
+}

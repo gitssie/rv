@@ -11,9 +11,27 @@ use ring::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{Connection, ConnectionId, Preferences};
+use crate::{ConnectRequest, Connection, ConnectionId, Preferences, UnlockCode};
+use std::sync::Mutex;
 
-const PASSWORD_FILE_VERSION: &[u8; 4] = b"RVP1";
+const PASSWORD_FILE_VERSION: &[u8; 4] = b"RVP2";
+const LEGACY_PASSWORD_FILE_VERSION: &[u8; 4] = b"RVP1";
+static CREDENTIAL_IO: Mutex<()> = Mutex::new(());
+
+#[derive(Default, Serialize, Deserialize)]
+struct ConnectionCredentials {
+    #[serde(default)]
+    password: Option<String>,
+    #[serde(default)]
+    unlock: Option<SavedUnlock>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SavedUnlock {
+    host: String,
+    port: u16,
+    code: String,
+}
 const PASSWORD_KEY: [u8; 32] = [
     0x7a, 0xf7, 0x4d, 0x61, 0x24, 0xa6, 0x38, 0x77, 0xc4, 0x15, 0x3b, 0x9e, 0x1a, 0x05, 0xb0, 0xb2,
     0x68, 0x22, 0x16, 0x61, 0x3b, 0x8c, 0x19, 0xe5, 0x30, 0xe8, 0x34, 0x79, 0xfa, 0x72, 0x44, 0x06,
@@ -76,12 +94,26 @@ impl StorePaths {
     }
 
     pub fn save_password(&self, id: ConnectionId, password: &str) -> Result<(), StoreError> {
+        let _guard = CREDENTIAL_IO.lock().unwrap_or_else(|e| e.into_inner());
+        let mut credentials = self.load_credentials(id)?;
+        credentials.password = Some(password.to_owned());
+        self.save_credentials(id, &credentials)
+    }
+
+    fn save_credentials(
+        &self,
+        id: ConnectionId,
+        credentials: &ConnectionCredentials,
+    ) -> Result<(), StoreError> {
+        if credentials.password.is_none() && credentials.unlock.is_none() {
+            return self.delete_credentials(id);
+        }
         let key = password_cipher()?;
         let mut nonce = [0; 12];
         SystemRandom::new()
             .fill(&mut nonce)
             .map_err(|_| StoreError::Credential("cannot generate nonce".into()))?;
-        let mut encrypted = password.as_bytes().to_vec();
+        let mut encrypted = serde_json::to_vec(credentials)?;
         key.seal_in_place_append_tag(
             aead::Nonce::assume_unique_for_key(nonce),
             aead::Aad::from(id.to_string().as_bytes()),
@@ -98,12 +130,20 @@ impl StorePaths {
     }
 
     pub fn load_password(&self, id: ConnectionId) -> Result<Option<String>, StoreError> {
+        let _guard = CREDENTIAL_IO.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(self.load_credentials(id)?.password)
+    }
+
+    fn load_credentials(&self, id: ConnectionId) -> Result<ConnectionCredentials, StoreError> {
         let data = match fs::read(self.password_path(id)) {
             Ok(data) => data,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(ConnectionCredentials::default());
+            }
             Err(error) => return Err(error.into()),
         };
-        if data.len() < 4 + 12 + aead::AES_256_GCM.tag_len() || &data[..4] != PASSWORD_FILE_VERSION
+        if data.len() < 4 + 12 + aead::AES_256_GCM.tag_len()
+            || (&data[..4] != PASSWORD_FILE_VERSION && &data[..4] != LEGACY_PASSWORD_FILE_VERSION)
         {
             return Err(StoreError::Credential("invalid password file".into()));
         }
@@ -116,18 +156,79 @@ impl StorePaths {
                 &mut encrypted,
             )
             .map_err(|_| StoreError::Credential("password authentication failed".into()))?;
-        String::from_utf8(plaintext.to_vec())
-            .map(Some)
-            .map_err(|_| StoreError::Credential("saved password is not UTF-8".into()))
+        if &data[..4] == LEGACY_PASSWORD_FILE_VERSION {
+            let password = String::from_utf8(plaintext.to_vec())
+                .map_err(|_| StoreError::Credential("saved password is not UTF-8".into()))?;
+            Ok(ConnectionCredentials {
+                password: Some(password),
+                unlock: None,
+            })
+        } else {
+            Ok(serde_json::from_slice(plaintext)?)
+        }
     }
 
     pub fn delete_password(&self, id: ConnectionId) -> Result<(), StoreError> {
+        let _guard = CREDENTIAL_IO.lock().unwrap_or_else(|e| e.into_inner());
+        let mut credentials = self.load_credentials(id)?;
+        credentials.password = None;
+        self.save_credentials(id, &credentials)
+    }
+
+    pub fn load_unlock_code(&self, req: &ConnectRequest) -> Result<Option<UnlockCode>, StoreError> {
+        let _guard = CREDENTIAL_IO.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = self.load_credentials(credential_id(req))?.unlock;
+        match saved {
+            Some(saved) if saved.host == req.host && saved.port == req.port => {
+                UnlockCode::new(saved.code).map(Some)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    pub fn save_unlock_code(
+        &self,
+        req: &ConnectRequest,
+        code: &UnlockCode,
+    ) -> Result<(), StoreError> {
+        let _guard = CREDENTIAL_IO.lock().unwrap_or_else(|e| e.into_inner());
+        let id = credential_id(req);
+        let mut credentials = self.load_credentials(id)?;
+        credentials.unlock = Some(SavedUnlock {
+            host: req.host.clone(),
+            port: req.port,
+            code: std::str::from_utf8(code.digits())
+                .expect("validated ASCII digits")
+                .to_owned(),
+        });
+        self.save_credentials(id, &credentials)
+    }
+
+    pub fn delete_unlock_code(&self, req: &ConnectRequest) -> Result<(), StoreError> {
+        let _guard = CREDENTIAL_IO.lock().unwrap_or_else(|e| e.into_inner());
+        let id = credential_id(req);
+        let mut credentials = self.load_credentials(id)?;
+        credentials.unlock = None;
+        self.save_credentials(id, &credentials)
+    }
+
+    fn delete_credentials(&self, id: ConnectionId) -> Result<(), StoreError> {
         match fs::remove_file(self.password_path(id)) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(error.into()),
         }
     }
+}
+
+// Ad-hoc targets share the same credential store, identified by their endpoint.
+fn credential_id(req: &ConnectRequest) -> ConnectionId {
+    req.connection_id.unwrap_or_else(|| {
+        let endpoint = format!("rv-ad-hoc|{}:{}", req.host, req.port);
+        let digest = ring::digest::digest(&ring::digest::SHA256, endpoint.as_bytes());
+        let bytes: [u8; 16] = digest.as_ref()[..16].try_into().unwrap();
+        ConnectionId(uuid::Uuid::from_bytes(bytes))
+    })
 }
 
 fn password_cipher() -> Result<aead::LessSafeKey, StoreError> {
@@ -216,7 +317,7 @@ impl AddressBook {
         if !self.connections.iter().any(|c| c.id == id) {
             return Err(StoreError::UnknownConnection);
         }
-        self.paths.delete_password(id)?;
+        self.paths.delete_credentials(id)?;
         self.connections.retain(|c| c.id != id);
         let thumb = self.paths.thumb_path(id);
         let _ = fs::remove_file(thumb);
@@ -280,7 +381,7 @@ impl AddressBook {
 
     pub fn forget_sensitive(&mut self) -> Result<(), StoreError> {
         for conn in &self.connections {
-            self.paths.delete_password(conn.id)?;
+            self.paths.delete_credentials(conn.id)?;
             let _ = fs::remove_file(self.paths.thumb_path(conn.id));
         }
         for conn in &mut self.connections {
@@ -459,8 +560,107 @@ mod tests {
         *tampered.last_mut().unwrap() ^= 1;
         fs::write(&path, tampered).unwrap();
         assert!(book.paths.load_password(id).is_err());
-        book.paths.delete_password(id).unwrap();
+        book.paths.delete_credentials(id).unwrap();
         assert_eq!(book.paths.load_password(id).unwrap(), None);
+    }
+
+    #[test]
+    fn connection_and_unlock_passwords_share_one_file_and_clear_independently() {
+        let (mut book, _guard) = tmp_book();
+        let connection = Connection::new("phone", "phone-a", 5900);
+        let id = connection.id;
+        let mut req = ConnectRequest::from_connection(&connection, None);
+        book.upsert(connection);
+        let code = UnlockCode::new("001234".into()).unwrap();
+        book.paths.save_password(id, "vnc-password").unwrap();
+        book.paths.save_unlock_code(&req, &code).unwrap();
+        assert_eq!(
+            fs::read_dir(book.paths.root.join("passwords"))
+                .unwrap()
+                .count(),
+            1
+        );
+        assert_eq!(
+            book.paths.load_password(id).unwrap().as_deref(),
+            Some("vnc-password")
+        );
+        assert_eq!(
+            book.paths.load_unlock_code(&req).unwrap().unwrap().digits(),
+            b"001234"
+        );
+        req.host = "phone-b".into();
+        assert!(book.paths.load_unlock_code(&req).unwrap().is_none());
+        req.host = "phone-a".into();
+        book.paths.delete_password(id).unwrap();
+        assert!(book.paths.load_password(id).unwrap().is_none());
+        assert!(book.paths.load_unlock_code(&req).unwrap().is_some());
+        book.paths.save_password(id, "replacement").unwrap();
+        book.paths.delete_unlock_code(&req).unwrap();
+        assert!(book.paths.load_unlock_code(&req).unwrap().is_none());
+        assert_eq!(
+            book.paths.load_password(id).unwrap().as_deref(),
+            Some("replacement")
+        );
+        book.paths.save_unlock_code(&req, &code).unwrap();
+        book.remove(id).unwrap();
+        assert!(!book.paths.password_path(id).exists());
+    }
+
+    #[test]
+    fn legacy_password_file_survives_adding_unlock_password() {
+        let (book, _guard) = tmp_book();
+        let conn = Connection::new("phone", "localhost", 5900);
+        let req = ConnectRequest::from_connection(&conn, None);
+        let nonce = [1; 12];
+        let mut encrypted = b"legacy-vnc".to_vec();
+        password_cipher()
+            .unwrap()
+            .seal_in_place_append_tag(
+                aead::Nonce::assume_unique_for_key(nonce),
+                aead::Aad::from(conn.id.to_string().as_bytes()),
+                &mut encrypted,
+            )
+            .unwrap();
+        let data = [LEGACY_PASSWORD_FILE_VERSION.as_slice(), &nonce, &encrypted].concat();
+        fs::create_dir_all(book.paths.root.join("passwords")).unwrap();
+        fs::write(book.paths.password_path(conn.id), data).unwrap();
+        assert_eq!(
+            book.paths.load_password(conn.id).unwrap().as_deref(),
+            Some("legacy-vnc")
+        );
+        book.paths
+            .save_unlock_code(&req, &UnlockCode::new("001234".into()).unwrap())
+            .unwrap();
+        assert_eq!(
+            book.paths.load_password(conn.id).unwrap().as_deref(),
+            Some("legacy-vnc")
+        );
+        assert_eq!(
+            &fs::read(book.paths.password_path(conn.id)).unwrap()[..4],
+            PASSWORD_FILE_VERSION
+        );
+        book.paths.delete_unlock_code(&req).unwrap();
+        assert_eq!(
+            book.paths.load_password(conn.id).unwrap().as_deref(),
+            Some("legacy-vnc")
+        );
+    }
+
+    #[test]
+    fn ad_hoc_unlock_uses_same_local_store_and_isolates_endpoints() {
+        let (book, _guard) = tmp_book();
+        let conn = Connection::new("phone", "localhost", 5900);
+        let mut req = ConnectRequest::from_connection(&conn, None);
+        req.connection_id = None;
+        book.paths
+            .save_unlock_code(&req, &UnlockCode::new("001234".into()).unwrap())
+            .unwrap();
+        assert!(book.paths.load_unlock_code(&req).unwrap().is_some());
+        req.port = 5901;
+        assert!(book.paths.load_unlock_code(&req).unwrap().is_none());
+        req.port = 5900;
+        book.paths.delete_unlock_code(&req).unwrap();
+        assert!(book.paths.load_unlock_code(&req).unwrap().is_none());
     }
 
     #[test]

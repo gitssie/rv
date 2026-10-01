@@ -21,6 +21,7 @@ actions!(
         SessionToggleToolbar,
         SessionMenu,
         SessionClose,
+        AppActionActivate,
         FileTransferFullscreen,
         FileTransferSelectAll,
     ]

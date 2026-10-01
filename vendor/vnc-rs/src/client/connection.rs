@@ -241,6 +241,7 @@ impl VncInner {
                     self.pending_clipboard_message()
                 }
                 X11Event::CopyText(text) => Some(ClientMsg::ClientCutText(text)),
+                X11Event::Device(command) => Some(ClientMsg::Device(command)),
                 X11Event::TightFile(command) => Some(ClientMsg::TightFile(command)),
             };
             if let Some(msg) = msg {
@@ -599,7 +600,8 @@ where
                             break;
                         }
                         VncEncoding::ExtendedClipboardPseudo
-                        | VncEncoding::TrollFileManagementPseudo => {}
+                        | VncEncoding::TrollFileManagementPseudo
+                        | VncEncoding::TrollDeviceControlPseudo => {}
                     }
                 }
             }
@@ -612,6 +614,9 @@ where
             }
             ServerMsg::ExtendedClipboard(event) => {
                 output_func(VncEvent::ExtendedClipboard(event)).await?;
+            }
+            ServerMsg::Device(event) => {
+                output_func(VncEvent::Device(event)).await?;
             }
             ServerMsg::TightFile(event) => {
                 output_func(VncEvent::TightFile(event)).await?;
