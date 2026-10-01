@@ -40,6 +40,13 @@ const POLL_EVERY: Duration = Duration::from_millis(4);
 /// updates must not keep the loop busy so long that a queued key-up waits;
 /// the remote side would auto-repeat the key in the meantime.
 const MAX_EVENTS_PER_SLOT: usize = 64;
+// Keep wire-compatible 8 KiB packets, but send a bounded burst per slot.
+// Never build a multi-megabyte backlog ahead of keyboard input or cancel.
+const UPLOAD_CHUNKS_PER_SLOT: usize = 32;
+const MAX_QUEUED_UPLOAD_EVENTS: usize = 32;
+const UPLOAD_SLOT_BUDGET: Duration = Duration::from_millis(2);
+const PHOTO_POLL_MIN: Duration = Duration::from_millis(25);
+const PHOTO_POLL_MAX: Duration = Duration::from_millis(200);
 
 #[derive(Debug, Clone)]
 pub enum SessionEvent {
@@ -618,6 +625,7 @@ enum PhotoAction {
     },
     Import {
         restore_path: Option<String>,
+        refresh: bool,
     },
     Export {
         destination: PathBuf,
@@ -633,6 +641,7 @@ struct PendingPhoto {
     op: u8,
     token: Option<String>,
     poll_due: Instant,
+    poll_delay: Duration,
     action: PhotoAction,
 }
 
@@ -683,6 +692,7 @@ impl PendingPhotoPage {
 }
 
 struct PendingPhotoUpload {
+    refresh: bool,
     remote: String,
     expected_sha256: String,
     restore_path: String,
@@ -795,6 +805,7 @@ impl FileRuntime {
             op,
             token: None,
             poll_due: Instant::now(),
+            poll_delay: PHOTO_POLL_MIN,
             action,
         });
         file_transfer::update(&self.state, |state| {
@@ -892,7 +903,8 @@ impl FileRuntime {
         }
         if status == 2 {
             pending.id = 0;
-            pending.poll_due = Instant::now() + Duration::from_millis(200);
+            pending.poll_due = Instant::now() + pending.poll_delay;
+            pending.poll_delay = (pending.poll_delay * 2).min(PHOTO_POLL_MAX);
             self.pending_photo = Some(pending);
             return;
         }
@@ -982,6 +994,7 @@ impl FileRuntime {
                 }
                 let page = self.pending_photo_page.take().unwrap();
                 file_transfer::update(&self.state, |state| {
+                    state.photos_need_refresh = false;
                     state.photo_entries = page.entries;
                     state.photo_albums = page.albums;
                     state.photo_album = page.album;
@@ -994,26 +1007,32 @@ impl FileRuntime {
                     state.photo_revision = state.photo_revision.wrapping_add(1);
                 });
             }
-            PhotoAction::Import { restore_path } => {
+            PhotoAction::Import {
+                restore_path,
+                refresh,
+            } => {
                 let Some(asset_id) = json.get("assetId").and_then(Value::as_str) else {
                     self.photo_fail("Photos did not return an asset ID");
                     return;
                 };
                 self.pending_photo_upload = None;
                 file_transfer::update(&self.state, |state| {
-                    // Keep Photos busy until the follow-up list finishes, so a
-                    // queued upload cannot start while the refresh is in flight.
-                    state.photo_busy = true;
+                    // Single imports wait for their refresh; a queue refreshes
+                    // once at the end instead of rebuilding 50 thumbnails per file.
+                    state.photo_busy = refresh;
+                    state.photos_need_refresh = true;
                     state.photo_status = Some(format!("Imported into Photos · {asset_id}"));
                     state.photo_revision = state.photo_revision.wrapping_add(1);
                 });
                 if let Some(path) = restore_path {
                     self.followup.push_back(FileCommand::List(path));
                 }
-                self.followup.push_back(FileCommand::PhotoList {
-                    offset: 0,
-                    album: None,
-                });
+                if refresh {
+                    self.followup.push_back(FileCommand::PhotoList {
+                        offset: 0,
+                        album: None,
+                    });
+                }
             }
             PhotoAction::Export { destination } => {
                 let Some(remote) = json.get("path").and_then(Value::as_str) else {
@@ -1065,6 +1084,7 @@ impl FileRuntime {
 
     async fn command(&mut self, client: &vnc::VncClient, command: FileCommand) {
         let caps = self.state.lock().unwrap().caps.unwrap_or_default();
+        let refresh_after_import = !matches!(&command, FileCommand::UploadToPhotosQueued(_));
         match command {
             FileCommand::List(path) => {
                 if !caps.list || !valid_remote_path(&path) {
@@ -1311,6 +1331,11 @@ impl FileRuntime {
                     } else {
                         self.pending_photo_page =
                             Some(PendingPhotoPage::new(offset, album.clone()));
+                        // Consume the refresh request once. A failed refresh stays
+                        // visible and must not turn into an automatic retry loop.
+                        file_transfer::update(&self.state, |state| {
+                            state.photos_need_refresh = false
+                        });
                     }
                     let request = if let Some(id) = &album {
                         serde_json::json!({"offset": offset, "album": id}).to_string()
@@ -1345,7 +1370,13 @@ impl FileRuntime {
                     4,
                     remote,
                     expected_sha256,
-                    PhotoAction::Import { restore_path },
+                    PhotoAction::Import {
+                        restore_path,
+                        refresh: self
+                            .pending_photo_upload
+                            .as_ref()
+                            .is_none_or(|upload| upload.refresh),
+                    },
                 )
                 .await;
             }
@@ -1394,7 +1425,7 @@ impl FileRuntime {
                 )
                 .await;
             }
-            FileCommand::UploadToPhotos(source) => {
+            FileCommand::UploadToPhotos(source) | FileCommand::UploadToPhotosQueued(source) => {
                 if !self.allow_upload || !self.state.lock().unwrap().can_photos {
                     self.photo_fail("Uploading to Photos is unavailable");
                     return;
@@ -1480,6 +1511,7 @@ impl FileRuntime {
                 );
                 let restore_path = self.state.lock().unwrap().remote_path.clone();
                 self.pending_photo_upload = Some(PendingPhotoUpload {
+                    refresh: refresh_after_import,
                     remote,
                     expected_sha256: hash,
                     restore_path,
@@ -1684,6 +1716,19 @@ impl FileRuntime {
     }
 
     async fn advance_upload(&mut self, client: &vnc::VncClient) {
+        let started = Instant::now();
+        for _ in 0..UPLOAD_CHUNKS_PER_SLOT {
+            if !matches!(self.active, Some(ActiveFile::Upload { .. }))
+                || started.elapsed() >= UPLOAD_SLOT_BUDGET
+                || client.queued_input_events().await >= MAX_QUEUED_UPLOAD_EVENTS
+            {
+                break;
+            }
+            self.advance_upload_chunk(client).await;
+        }
+    }
+
+    async fn advance_upload_chunk(&mut self, client: &vnc::VncClient) {
         let Some(ActiveFile::Upload {
             file,
             remote,
@@ -2236,7 +2281,11 @@ mod transport_tests {
             op: 4,
             token: Some("import-token".into()),
             poll_due: Instant::now(),
-            action: PhotoAction::Import { restore_path: None },
+            poll_delay: PHOTO_POLL_MIN,
+            action: PhotoAction::Import {
+                restore_path: None,
+                refresh: true,
+            },
         });
         runtime.photo_result(7, 7, 0, r#"{"assetId":"new-photo"}"#.into());
         {
@@ -2260,6 +2309,7 @@ mod transport_tests {
             op: 5,
             token: Some("list-token".into()),
             poll_due: Instant::now(),
+            poll_delay: PHOTO_POLL_MIN,
             action: PhotoAction::List {
                 offset: 0,
                 album: None,
@@ -2268,6 +2318,76 @@ mod transport_tests {
         runtime.pending_photo_page = Some(PendingPhotoPage::new(0, None));
         runtime.photo_result(7, 8, 0, r#"{"entries":[],"total":0}"#.into());
         assert!(!state.lock().unwrap().photo_busy);
+    }
+
+    #[test]
+    fn queued_photo_imports_leave_one_refresh_for_the_queue_owner() {
+        let state = Arc::new(Mutex::new(FileTransferSnapshot {
+            can_photos: true,
+            photo_busy: true,
+            ..Default::default()
+        }));
+        let mut runtime = FileRuntime::new(state.clone(), true);
+        for id in 1..=3 {
+            runtime.pending_photo = Some(PendingPhoto {
+                id,
+                op: 4,
+                token: Some("import-token".into()),
+                poll_due: Instant::now(),
+                poll_delay: PHOTO_POLL_MIN,
+                action: PhotoAction::Import {
+                    restore_path: Some("/".into()),
+                    refresh: false,
+                },
+            });
+            runtime.photo_result(7, id, 0, r#"{"assetId":"new-photo"}"#.into());
+            let snapshot = state.lock().unwrap();
+            assert!(
+                !snapshot.photo_busy,
+                "next queued image must be allowed to upload"
+            );
+            assert!(snapshot.photos_need_refresh);
+            assert!(
+                !runtime
+                    .followup
+                    .iter()
+                    .any(|cmd| matches!(cmd, FileCommand::PhotoList { .. }))
+            );
+        }
+        runtime.photo_fail("next queued import failed");
+        assert!(
+            state.lock().unwrap().photos_need_refresh,
+            "earlier successful imports still need a refresh after failure"
+        );
+    }
+
+    #[test]
+    fn photo_job_polling_backs_off_without_delaying_short_jobs() {
+        let state = Arc::new(Mutex::new(FileTransferSnapshot::default()));
+        let mut runtime = FileRuntime::new(state, true);
+        runtime.pending_photo = Some(PendingPhoto {
+            id: 1,
+            op: 6,
+            token: Some("export-token".into()),
+            poll_due: Instant::now(),
+            poll_delay: PHOTO_POLL_MIN,
+            action: PhotoAction::Export {
+                destination: PathBuf::from("photo.jpg"),
+            },
+        });
+        for delay in [25, 50, 100, 200, 200] {
+            let before = Instant::now();
+            runtime.photo_result(7, 1, 2, "pending".into());
+            let pending = runtime.pending_photo.as_mut().unwrap();
+            let wait = pending.poll_due.duration_since(before);
+            assert!(wait >= Duration::from_millis(delay));
+            assert_eq!(
+                pending.poll_delay,
+                (Duration::from_millis(delay) * 2).min(PHOTO_POLL_MAX)
+            );
+            assert!(pending.poll_delay <= PHOTO_POLL_MAX);
+            pending.id = 1;
+        }
     }
 
     #[test]
@@ -2286,6 +2406,7 @@ mod transport_tests {
                 op: 5,
                 token: Some(format!("page-{chunk}")),
                 poll_due: Instant::now(),
+                poll_delay: PHOTO_POLL_MIN,
                 action: PhotoAction::List {
                     offset,
                     album: None,
@@ -2325,6 +2446,7 @@ mod transport_tests {
             op: 5,
             token: Some("second-page".into()),
             poll_due: Instant::now(),
+            poll_delay: PHOTO_POLL_MIN,
             action: PhotoAction::List {
                 offset: 50,
                 album: None,

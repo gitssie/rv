@@ -380,7 +380,7 @@ impl FileTransferView {
         cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor()
-                    .timer(Duration::from_millis(100))
+                    .timer(Duration::from_millis(16))
                     .await;
                 if this.update(cx, |this, cx| this.poll_remote(cx)).is_err() {
                     break;
@@ -395,11 +395,10 @@ impl FileTransferView {
         let Some(client) = &self.client else {
             return;
         };
-        let snapshot = client.snapshot();
-        if snapshot.revision == self.remote.revision {
+        let Some(snapshot) = client.snapshot_if_changed(self.remote.revision) else {
             self.advance_queue(cx);
             return;
-        }
+        };
         let first_caps = self.remote.caps.is_none() && snapshot.caps.is_some_and(|caps| caps.list);
         let download_finished = snapshot.transfers.iter().enumerate().any(|(index, new)| {
             matches!(new.direction, TransferDirection::Download)
@@ -419,6 +418,13 @@ impl FileTransferView {
         let management_finished = self.remote.management_revision != snapshot.management_revision
             && snapshot.error.is_none();
         let photos_changed = self.remote.photo_revision != snapshot.photo_revision;
+        let thumbnails_changed = photos_changed
+            && (snapshot.photo_entries.len() != self.remote.photo_entries.len()
+                || snapshot
+                    .photo_entries
+                    .iter()
+                    .zip(&self.remote.photo_entries)
+                    .any(|(new, old)| new.id != old.id || new.thumbnail != old.thumbnail));
         let photo_page_changed = self.remote.photo_offset != snapshot.photo_offset
             || self.remote.photo_album != snapshot.photo_album;
         self.remote = snapshot;
@@ -436,7 +442,9 @@ impl FileTransferView {
                 self.photo_selected_ids.clear();
                 self.photo_anchor = None;
             }
-            self.reconcile_photo_thumbs(cx);
+            if thumbnails_changed {
+                self.reconcile_photo_thumbs(cx);
+            }
         }
         if self.remote.listed_path.as_deref() == Some(self.remote.remote_path.as_str())
             && self.remote_selected.as_ref().is_some_and(|selected| {
@@ -487,7 +495,13 @@ impl FileTransferView {
         }
         for entry in &self.remote.photo_entries {
             if let Ok(decoded) = image::load_from_memory(&entry.thumbnail) {
-                let frame = image::Frame::new(decoded.to_rgba8());
+                let mut pixels = decoded.to_rgba8();
+                // GPUI RenderImage textures use BGRA, while image decoders
+                // return RGBA. Preserve green/alpha and swap red/blue once.
+                for pixel in pixels.pixels_mut() {
+                    pixel.0.swap(0, 2);
+                }
+                let frame = image::Frame::new(pixels);
                 let image = Arc::new(RenderImage::new(SmallVec::from_elem(frame, 1)));
                 if let Some(previous) = self.photo_thumbs.insert(entry.id.clone(), image) {
                     cx.drop_image(previous, None);
@@ -1234,6 +1248,18 @@ impl FileTransferView {
             .iter()
             .position(|job| matches!(job.state, QueueState::Queued))
         else {
+            if self.remote.photos_need_refresh && !self.remote.photo_busy {
+                // Includes failed/cancelled batches: refresh successfully imported
+                // items even when the last queued upload did not complete.
+                self.remote.photo_busy = true;
+                self.remote.photos_need_refresh = false;
+                if let Some(client) = &self.client {
+                    client.send(FileCommand::PhotoList {
+                        offset: self.remote.photo_offset,
+                        album: self.remote.photo_album.clone(),
+                    });
+                }
+            }
             if self.auto_collapse_armed
                 && self
                     .queue
@@ -1317,7 +1343,7 @@ impl FileTransferView {
             QueueAction::PhotoUpload(source) => {
                 job.transfer_start = self.remote.transfers.len();
                 if let Some(client) = &self.client {
-                    client.send(FileCommand::UploadToPhotos(source.clone()));
+                    client.send(FileCommand::UploadToPhotosQueued(source.clone()));
                 }
             }
             QueueAction::DeleteRemote(path) => {
@@ -4384,13 +4410,22 @@ mod tests {
         });
 
         let mut thumbnail = std::io::Cursor::new(Vec::new());
-        image::DynamicImage::new_rgba8(2, 2)
-            .write_to(&mut thumbnail, image::ImageFormat::Png)
-            .unwrap();
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            2,
+            2,
+            image::Rgba([231, 73, 17, 255]),
+        ))
+        .write_to(&mut thumbnail, image::ImageFormat::Png)
+        .unwrap();
         view_entity.update(cx, |view, cx| {
             view.remote.photo_entries[0].thumbnail = thumbnail.into_inner();
             view.reconcile_photo_thumbs(cx);
             assert!(view.photo_thumbs.contains_key("photo-0"));
+            assert_eq!(
+                &view.photo_thumbs["photo-0"].as_bytes(0).unwrap()[..4],
+                &[17, 73, 231, 255],
+                "Photos thumbnails must use GPUI's BGRA channel order",
+            );
 
             view.remote.photo_entries[0].thumbnail.clear();
             view.reconcile_photo_thumbs(cx);
@@ -4469,14 +4504,33 @@ mod tests {
 
             view.remote.photo_revision += 1;
             view.remote.photo_busy = false;
+            view.remote.photos_need_refresh = true;
             view.advance_queue(cx);
             assert!(matches!(view.queue[2].state, QueueState::Complete));
+            assert!(
+                view.remote.photos_need_refresh,
+                "do not refresh between queued images"
+            );
             assert!(matches!(view.queue[3].state, QueueState::Running));
 
             view.remote.photo_status = Some("Imported into Photos · second".into());
             view.remote.photo_revision += 1;
             view.advance_queue(cx);
             assert!(matches!(view.queue[3].state, QueueState::Complete));
+            assert!(
+                view.remote.photo_busy,
+                "refresh once at the end of the batch"
+            );
+            assert!(!view.remote.photos_need_refresh);
+            // A failed refresh must not trigger another automatic attempt.
+            view.remote.photo_busy = false;
+            view.remote.photo_error = Some("Photos refresh failed".into());
+            view.advance_queue(cx);
+            assert!(!view.remote.photo_busy);
+            assert_eq!(
+                view.remote.photo_error.as_deref(),
+                Some("Photos refresh failed")
+            );
         });
     }
 }

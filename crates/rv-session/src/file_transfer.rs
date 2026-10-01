@@ -67,6 +67,7 @@ pub struct FileTransferSnapshot {
     pub photo_total: usize,
     pub photo_offset: usize,
     pub photo_busy: bool,
+    pub photos_need_refresh: bool,
     pub photo_status: Option<String>,
     pub photo_error: Option<String>,
     pub photo_revision: u64,
@@ -100,6 +101,7 @@ impl Default for FileTransferSnapshot {
             photo_total: 0,
             photo_offset: 0,
             photo_busy: false,
+            photos_need_refresh: false,
             photo_status: None,
             photo_error: None,
             photo_revision: 0,
@@ -159,6 +161,8 @@ pub enum FileCommand {
     },
     PhotoDelete(Vec<String>),
     UploadToPhotos(PathBuf),
+    /// Queue owner refreshes Photos once after all imports finish.
+    UploadToPhotosQueued(PathBuf),
     PhotoCleanupExport(String),
 }
 
@@ -174,6 +178,12 @@ impl FileTransferClient {
             .lock()
             .expect("file transfer state lock")
             .revision
+    }
+
+    /// Avoid copying directory entries and thumbnails on unchanged UI ticks.
+    pub fn snapshot_if_changed(&self, revision: u64) -> Option<FileTransferSnapshot> {
+        let state = self.state.lock().expect("file transfer state lock");
+        (state.revision != revision).then(|| state.clone())
     }
 
     pub fn snapshot(&self) -> FileTransferSnapshot {
@@ -192,4 +202,24 @@ pub(crate) fn update(
     let mut state = state.lock().expect("file transfer state lock");
     f(&mut state);
     state.revision = state.revision.wrapping_add(1);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unchanged_snapshot_is_not_cloned_and_new_revision_is_visible() {
+        let state = Arc::new(Mutex::new(FileTransferSnapshot::default()));
+        let (commands, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let client = FileTransferClient {
+            state: state.clone(),
+            commands,
+        };
+        assert!(client.snapshot_if_changed(0).is_none());
+        update(&state, |snapshot| snapshot.photos_need_refresh = true);
+        let changed = client.snapshot_if_changed(0).unwrap();
+        assert!(changed.photos_need_refresh);
+        assert!(client.snapshot_if_changed(changed.revision).is_none());
+    }
 }

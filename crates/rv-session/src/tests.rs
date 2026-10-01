@@ -385,6 +385,40 @@ fn tight_file_server(mut sock: TcpStream) -> Vec<u8> {
     }
 }
 
+// Exercises the full session scheduler and wire writer, not a chunk helper.
+#[test]
+fn tight_file_large_upload_is_not_paced_one_chunk_per_poll() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let (sock, _) = listener.accept().unwrap();
+        tx.send(tight_file_server(sock)).unwrap();
+    });
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("large.bin");
+    let contents = vec![0x5a; 4 * 1024 * 1024];
+    std::fs::write(&source, &contents).unwrap();
+    let handle = SessionHandle::spawn(request_for(port));
+    let files = handle.file_client();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while files.snapshot().listed_path.as_deref() != Some("/") {
+        assert!(Instant::now() < deadline, "initial listing timed out");
+        thread::sleep(Duration::from_millis(1));
+    }
+    files.send(FileCommand::Upload {
+        source,
+        remote: "/upload.txt".into(),
+    });
+    let received = rx.recv_timeout(Duration::from_secs(2));
+    handle.close();
+    assert_eq!(
+        received.expect("4 MiB upload took over 2 seconds on loopback"),
+        contents
+    );
+    server.join().unwrap();
+}
+
 #[test]
 fn tight_file_list_download_and_upload_roundtrip_without_ios() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();

@@ -129,6 +129,12 @@ asset to Recently Deleted, and requires iOS confirmation in the VNC window.
 With a server that advertises batch deletion, use Command-click to toggle
 photos or Shift-click to select a range on the current page, then choose
 **Delete (N)**. Up to 50 selected assets go through one PhotoKit change request.
+Uploads send bounded bursts of 8 KiB packets, with a small network backlog so
+keyboard input and cancellation remain responsive. Multi-file queues advance
+at a 16 ms cadence. Uploads to Photos refresh the visible album once after the
+queue finishes, including partially successful batches; individual imports
+still refresh immediately. Photos jobs use adaptive polling from 25 to 200 ms.
+
 The protocol implementation currently handles uncompressed TightVNC file lists
 and data. Cancelling an in-progress download requires reconnecting before the
 next download, because TightVNC's file frames have no transfer identifier.

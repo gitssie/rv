@@ -431,6 +431,13 @@ impl VncClient {
         self.inner.lock().await.input(event).await
     }
 
+    /// Number of outgoing events awaiting the network writer. Bulk senders use
+    /// this to keep a small backlog and leave room for interactive input.
+    pub async fn queued_input_events(&self) -> usize {
+        let inner = self.inner.lock().await;
+        inner.input_ch.max_capacity() - inner.input_ch.capacity()
+    }
+
     /// Receive a `VncEvent` from the engine
     /// This function will block until a `VncEvent` is received
     ///
