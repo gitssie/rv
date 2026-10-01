@@ -92,6 +92,8 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-shift-f", FileTransferFullscreen, Some("FileTransfer")),
         KeyBinding::new("cmd-a", FileTransferSelectAll, Some("FileTransfer")),
         KeyBinding::new("ctrl-a", FileTransferSelectAll, Some("FileTransfer")),
+        KeyBinding::new("cmd-v", FileTransferPaste, Some("FileTransfer")),
+        KeyBinding::new("ctrl-v", FileTransferPaste, Some("FileTransfer")),
         KeyBinding::new("cmd-w", SessionClose, Some("Session")),
         KeyBinding::new("f8", SessionMenu, Some("Session")),
         KeyBinding::new("enter", AppActionActivate, Some("AppActionIcon")),

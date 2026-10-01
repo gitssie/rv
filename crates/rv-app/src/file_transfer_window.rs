@@ -27,7 +27,7 @@ use rv_session::{
 };
 use smallvec::SmallVec;
 
-use crate::actions::{FileTransferFullscreen, FileTransferSelectAll};
+use crate::actions::{FileTransferFullscreen, FileTransferPaste, FileTransferSelectAll};
 use crate::app::AddressBookApp;
 
 const BG: u32 = 0x171c22;
@@ -659,6 +659,107 @@ impl FileTransferView {
         self.prepare_queue(jobs, cx);
     }
 
+    fn paste_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.local_path_input.focus_handle(cx).is_focused(window)
+            || self.remote_path_input.focus_handle(cx).is_focused(window)
+            || self.new_folder_input.focus_handle(cx).is_focused(window)
+        {
+            cx.propagate();
+            return;
+        }
+        let paths: Vec<_> = cx
+            .read_from_clipboard()
+            .into_iter()
+            .flat_map(|item| item.entries)
+            .filter_map(|entry| match entry {
+                ClipboardEntry::ExternalPaths(paths) => Some(paths.0),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        if paths.is_empty() {
+            self.status_error =
+                Some("Copy files in your file manager before pasting to upload".into());
+            cx.notify();
+            return;
+        }
+        self.upload_external_files(paths, cx);
+    }
+
+    fn upload_external_files(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) -> bool {
+        self.status_error = None;
+        let unavailable = if !self.allow_upload {
+            Some("Uploading is disabled in view-only mode")
+        } else if self.pending_conflicts.is_some()
+            || self.pending_batch_delete.is_some()
+            || self.pending_delete.is_some()
+            || self.pending_rename.is_some()
+            || self.new_folder_side.is_some()
+            || self.details.is_some()
+        {
+            Some("Close the current dialog before uploading more files")
+        } else if self.photo_mode && !self.remote.can_photos {
+            Some("Uploading to Photos is unavailable on this connection")
+        } else if !self.photo_mode && !self.remote.caps.is_some_and(|caps| caps.upload) {
+            Some("Uploading is unavailable on this connection")
+        } else if !self.photo_mode
+            && (self.remote.listing
+                || self.remote.listed_path.as_deref() != Some(self.remote.remote_path.as_str()))
+        {
+            Some("Wait for the remote folder to finish loading before uploading")
+        } else {
+            None
+        };
+        if let Some(message) = unavailable {
+            self.status_error = Some(message.into());
+            cx.notify();
+            return false;
+        }
+        let mut seen = HashSet::new();
+        let mut skipped = 0;
+        let mut jobs = Vec::new();
+        for source in paths {
+            if !seen.insert(source.clone()) {
+                continue;
+            }
+            let Some(name) = source.file_name().and_then(|name| name.to_str()) else {
+                skipped += 1;
+                continue;
+            };
+            if !source.is_file()
+                || name.contains(['\\', '\0'])
+                || (self.photo_mode && !is_image_name(name))
+            {
+                skipped += 1;
+                continue;
+            }
+            let action = if self.photo_mode {
+                QueueAction::PhotoUpload(source.clone())
+            } else {
+                QueueAction::Upload {
+                    source: source.clone(),
+                    remote: join_remote(&self.remote.remote_path, name),
+                    replace: None,
+                }
+            };
+            jobs.push(QueueJob::new(name.to_owned(), action));
+        }
+        if skipped > 0 {
+            self.status_error = Some(format!(
+                "Skipped {skipped} {}",
+                if self.photo_mode {
+                    "non-image, folder or unavailable items"
+                } else {
+                    "folder, invalid-name or unavailable items"
+                },
+            ));
+        }
+        let accepted = !jobs.is_empty();
+        self.prepare_queue(jobs, cx);
+        cx.notify();
+        accepted
+    }
+
     fn import_remote_photo(&mut self, path: String, cx: &mut Context<Self>) {
         if let Some(client) = &self.client {
             client.send(FileCommand::PhotoImport {
@@ -852,6 +953,27 @@ impl FileTransferView {
             .collect()
     }
 
+    fn can_replace_conflicts(&self, jobs: &[QueueJob]) -> bool {
+        let reserved = self.reserved_remote_names();
+        let mut destinations = HashSet::new();
+        let requires_remote_replace = jobs.iter().any(|job| match &job.action {
+            QueueAction::Upload { remote, .. } => {
+                !destinations.insert(remote.clone())
+                    || self
+                        .remote
+                        .entries
+                        .iter()
+                        .any(|entry| remote.ends_with(&format!("/{}", entry.name)))
+                    || remote
+                        .rsplit('/')
+                        .next()
+                        .is_some_and(|name| reserved.contains(name))
+            }
+            _ => false,
+        });
+        !requires_remote_replace || self.remote.can_replace
+    }
+
     fn prepare_queue(&mut self, jobs: Vec<QueueJob>, cx: &mut Context<Self>) {
         if jobs.is_empty() {
             return;
@@ -859,12 +981,15 @@ impl FileTransferView {
         let remote_reserved = self.reserved_remote_names();
         let local_reserved = self.reserved_local_names();
         let mut destinations = HashSet::new();
+        let mut remote_destinations = HashSet::new();
         let collision = jobs.iter().any(|job| match &job.action {
             QueueAction::Upload { remote, .. } => {
-                self.remote
-                    .entries
-                    .iter()
-                    .any(|entry| remote.ends_with(&format!("/{}", entry.name)))
+                !remote_destinations.insert(remote.clone())
+                    || self
+                        .remote
+                        .entries
+                        .iter()
+                        .any(|entry| remote.ends_with(&format!("/{}", entry.name)))
                     || remote
                         .rsplit('/')
                         .next()
@@ -2783,10 +2908,18 @@ impl Render for FileTransferView {
             && !self.photo_selected_ids.is_empty()
             && (self.photo_selected_ids.len() == 1 || self.remote.can_photo_batch_delete);
         v_flex()
+            .id("file-transfer-drop-target")
+            .debug_selector(|| "file-transfer-drop-target".into())
             .size_full()
             .relative()
             .bg(rgb(BG))
             .text_color(rgb(TEXT))
+            .drag_over::<ExternalPaths>(|style, _, _, _| style.bg(rgb(0x202f43)))
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
+                if this.upload_external_files(paths.0.to_vec(), cx) {
+                    this.focus.focus(window, cx);
+                }
+            }))
             .key_context("FileTransfer")
             .track_focus(&self.focus)
             .on_action(cx.listener(|this, _: &FileTransferFullscreen, window, cx| {
@@ -2794,6 +2927,9 @@ impl Render for FileTransferView {
             }))
             .on_action(cx.listener(|this, _: &FileTransferSelectAll, window, cx| {
                 this.select_all(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &FileTransferPaste, window, cx| {
+                this.paste_files(window, cx);
             }))
             .when(!fullscreen, |this| {
                 this.child(
@@ -3175,22 +3311,9 @@ impl Render for FileTransferView {
                 this.child(render_rename(details, &self.new_folder_input, cx))
             })
             .when_some(self.pending_conflicts.as_ref(), |this, jobs| {
-                let requires_remote_replace = jobs.iter().any(|job| match &job.action {
-                    QueueAction::Upload { remote, .. } => {
-                        self.remote
-                            .entries
-                            .iter()
-                            .any(|entry| remote.ends_with(&format!("/{}", entry.name)))
-                            || remote
-                                .rsplit('/')
-                                .next()
-                                .is_some_and(|name| self.reserved_remote_names().contains(name))
-                    }
-                    _ => false,
-                });
                 this.child(render_conflict_confirmation(
                     jobs.len(),
-                    !requires_remote_replace || self.remote.can_replace,
+                    self.can_replace_conflicts(&jobs),
                     cx,
                 ))
             })
@@ -4303,6 +4426,227 @@ mod tests {
         cx.simulate_keystrokes("cmd-a");
         view_entity.as_ref().unwrap().read_with(cx, |view, _| {
             assert_eq!(view.local_selected_paths.len(), 500);
+        });
+    }
+
+    #[gpui::test]
+    fn external_drop_and_clipboard_upload_use_current_destination_and_conflict_queue(
+        cx: &mut TestAppContext,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first.jpg");
+        let second = directory.path().join("notes.txt");
+        let other = directory.path().join("other");
+        std::fs::write(&first, b"image").unwrap();
+        std::fs::write(&second, b"text").unwrap();
+        std::fs::create_dir(&other).unwrap();
+        let duplicate_name = other.join("first.jpg");
+        std::fs::write(&duplicate_name, b"other image").unwrap();
+        let remote = FileTransferSnapshot {
+            caps: Some(vnc::tight::TightFileCaps {
+                upload: true,
+                list: true,
+                download: true,
+                ..Default::default()
+            }),
+            can_photos: true,
+            remote_path: "/target".into(),
+            listed_path: Some("/target".into()),
+            ..Default::default()
+        };
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::bind_keys(cx);
+        });
+        let mut view_entity = None;
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let focus = cx.focus_handle();
+            focus.focus(window, cx);
+            let local_path_input = cx.new(|cx| InputState::new(window, cx));
+            let remote_path_input = cx.new(|cx| InputState::new(window, cx));
+            let new_folder_input = cx.new(|cx| InputState::new(window, cx));
+            let view = cx.new(|_| FileTransferView {
+                host: "example.test:5901".into(),
+                local_dir: directory.path().to_path_buf(),
+                local_path_input,
+                remote_path_input,
+                local_back: Vec::new(),
+                remote_back: Vec::new(),
+                local_entries: read_local_dir(directory.path()).unwrap(),
+                local_selected: None,
+                local_selected_paths: Vec::new(),
+                local_anchor: None,
+                local_sort: FileSort::default(),
+                local_loading: false,
+                local_error: None,
+                transfers_open: true,
+                queue: Vec::new(),
+                current_job: None,
+                pending_conflicts: None,
+                pending_batch_delete: None,
+                queue_idle_since: None,
+                auto_collapse_armed: false,
+                client: None,
+                remote,
+                preferred_remote: None,
+                memory: test_memory(),
+                remote_selected: None,
+                remote_selected_names: Vec::new(),
+                remote_anchor: None,
+                remote_sort: FileSort::default(),
+                active_side: FileSide::Remote,
+                photo_mode: false,
+                photo_selected: Some("photo-0".into()),
+                photo_selected_ids: vec!["photo-0".into(), "photo-1".into()],
+                photo_anchor: None,
+                photo_thumbs: HashMap::new(),
+                allow_upload: true,
+                details: None,
+                pending_delete: None,
+                pending_rename: None,
+                new_folder_side: None,
+                new_folder_input,
+                status_error: None,
+                fullscreen_toolbar_open: false,
+                focus,
+                _subscriptions: Vec::new(),
+            });
+            view_entity = Some(view.clone());
+            gpui_component::Root::new(view, window, cx)
+        });
+        cx.simulate_resize(size(px(760.), px(440.)));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let view = view_entity.unwrap();
+        let position = cx
+            .debug_bounds("file-transfer-drop-target")
+            .unwrap()
+            .center();
+        cx.simulate_event(gpui::FileDropEvent::Entered {
+            position,
+            paths: gpui::ExternalPaths(
+                [first.clone(), second.clone(), first.clone(), other.clone()]
+                    .into_iter()
+                    .collect(),
+            ),
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.simulate_event(gpui::FileDropEvent::Submit { position });
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.queue.len(), 2);
+            assert!(matches!(&view.queue[0].action, QueueAction::Upload { source, remote, .. } if source == &first && remote == "/target/first.jpg"));
+            assert!(matches!(&view.queue[1].action, QueueAction::Upload { source, remote, .. } if source == &second && remote == "/target/notes.txt"));
+            assert!(view.status_error.as_deref().unwrap().contains("Skipped 1"));
+        });
+        view.update(cx, |view, _| {
+            view.queue.clear();
+            view.current_job = None;
+        });
+        cx.update(|_, cx| {
+            cx.write_to_clipboard(gpui::ClipboardItem {
+                entries: vec![
+                    gpui::ClipboardEntry::ExternalPaths(gpui::ExternalPaths(
+                        [first.clone(), duplicate_name.clone()]
+                            .into_iter()
+                            .collect(),
+                    )),
+                    gpui::ClipboardEntry::String(gpui::ClipboardString::new("first.jpg".into())),
+                ],
+            })
+        });
+        cx.simulate_keystrokes("ctrl-v");
+        view.update(cx, |view, cx| {
+            assert_eq!(view.pending_conflicts.as_ref().unwrap().len(), 2);
+            assert!(view.queue.is_empty());
+            assert!(!view.can_replace_conflicts(view.pending_conflicts.as_ref().unwrap()));
+            view.remote.can_replace = true;
+            assert!(view.can_replace_conflicts(view.pending_conflicts.as_ref().unwrap()));
+            view.remote.can_replace = false;
+            assert!(!view.upload_external_files(vec![second.clone()], cx));
+            assert_eq!(
+                view.pending_conflicts.as_ref().unwrap().len(),
+                2,
+                "a new drop must not replace an open conflict dialog"
+            );
+            view.resolve_conflicts(super::CollisionPolicy::Rename, cx);
+            assert_eq!(view.queue.len(), 2);
+            assert_ne!(view.queue[0].name, view.queue[1].name);
+            view.queue.clear();
+            view.current_job = None;
+            view.allow_upload = false;
+        });
+        cx.simulate_keystrokes("cmd-v");
+        view.update(cx, |view, _| {
+            assert!(view.queue.is_empty());
+            assert!(view.status_error.as_deref().unwrap().contains("view-only"));
+            view.allow_upload = true;
+            view.remote.listing = true;
+        });
+        cx.simulate_keystrokes("ctrl-v");
+        view.update(cx, |view, _| {
+            assert!(view.queue.is_empty());
+            assert!(
+                view.status_error
+                    .as_deref()
+                    .unwrap()
+                    .contains("finish loading")
+            );
+            view.remote.listing = false;
+            view.photo_mode = true;
+            view.remote.photo_busy = true;
+        });
+        cx.update(|_, cx| {
+            cx.write_to_clipboard(gpui::ClipboardItem {
+                entries: vec![gpui::ClipboardEntry::ExternalPaths(gpui::ExternalPaths(
+                    [first.clone(), second.clone()].into_iter().collect(),
+                ))],
+            })
+        });
+        cx.simulate_keystrokes("cmd-v");
+        view.update(cx, |view, cx| {
+            assert_eq!(view.queue.len(), 1);
+            assert!(
+                matches!(&view.queue[0].action, QueueAction::PhotoUpload(path) if path == &first)
+            );
+            assert!(matches!(view.queue[0].state, QueueState::Queued));
+            assert!(view.status_error.as_deref().unwrap().contains("Skipped 1"));
+            view.remote.photo_busy = false;
+            view.advance_queue(cx);
+            assert!(matches!(view.queue[0].state, QueueState::Running));
+            view.queue.clear();
+            view.current_job = None;
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.local_path_input
+                    .update(cx, |input, cx| input.focus(window, cx))
+            })
+        });
+        cx.simulate_keystrokes("ctrl-v");
+        view.read_with(cx, |view, _| {
+            assert!(
+                view.queue.is_empty(),
+                "paste in a path field must not upload"
+            )
+        });
+        cx.update(|_, cx| {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string("/ordinary/path".into()))
+        });
+        cx.simulate_keystrokes("cmd-v");
+        view.read_with(cx, |view, cx| {
+            assert!(view.queue.is_empty());
+            assert_eq!(
+                view.local_path_input.read(cx).value().as_ref(),
+                "/ordinary/path"
+            );
+        });
+        cx.update(|window, cx| view.update(cx, |view, cx| view.focus.focus(window, cx)));
+        cx.update(|_, cx| {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string("ordinary text".into()))
+        });
+        cx.simulate_keystrokes("cmd-v");
+        view.read_with(cx, |view, _| {
+            assert!(view.queue.is_empty());
+            assert!(view.status_error.as_deref().unwrap().contains("Copy files"));
         });
     }
 

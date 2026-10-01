@@ -24,5 +24,6 @@ actions!(
         AppActionActivate,
         FileTransferFullscreen,
         FileTransferSelectAll,
+        FileTransferPaste,
     ]
 );

@@ -129,6 +129,13 @@ asset to Recently Deleted, and requires iOS confirmation in the VNC window.
 With a server that advertises batch deletion, use Command-click to toggle
 photos or Shift-click to select a range on the current page, then choose
 **Delete (N)**. Up to 50 selected assets go through one PhotoKit change request.
+Drag one or more files from your file manager into the File transfer window,
+or copy files there and press **Ctrl+V** (also **Cmd+V** on macOS) in RV. In
+Files mode they upload to the current remote folder; in Photos mode supported
+PNG/JPEG/HEIC/HEIF images upload to the photo library. Folders and unavailable
+files are skipped. Same-name files use the existing skip/rename/replace dialog.
+Pasting into a path or rename field continues to edit text instead of uploading.
+
 Uploads send bounded bursts of 8 KiB packets, with a small network backlog so
 keyboard input and cancellation remain responsive. Multi-file queues advance
 at a 16 ms cadence. Uploads to Photos refresh the visible album once after the
