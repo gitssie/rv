@@ -131,7 +131,6 @@ pub(crate) struct AppRuntime {
     sequence: u32,
     queue: VecDeque<AppCommand>,
     pending: HashMap<u32, (AppCommand, Instant)>,
-    last_poll: Instant,
 }
 
 impl AppRuntime {
@@ -142,7 +141,6 @@ impl AppRuntime {
             sequence: 0,
             queue: VecDeque::new(),
             pending: HashMap::new(),
-            last_poll: Instant::now(),
         }
     }
     fn supported(&self, cmd: &AppCommand) -> bool {
@@ -220,10 +218,6 @@ impl AppRuntime {
                 command,
                 message: "App operation timed out; its result is unknown".into(),
             });
-        }
-        if self.caps.foreground && self.last_poll.elapsed() >= Duration::from_secs(2) {
-            self.last_poll = Instant::now();
-            self.command(AppCommand::Foreground, send);
         }
         let unlock_queued = self
             .queue

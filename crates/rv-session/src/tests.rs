@@ -1637,6 +1637,7 @@ fn app_control_roundtrip_over_plain_rfb_preserves_framebuffer() {
         rfb_handshake(&mut sock, 1, 1, b"apps-plain");
         let mut saw_launch = false;
         let mut saw_icon = false;
+        let mut foreground_queries = 0;
         loop {
             let mut typ = [0];
             if sock.read_exact(&mut typ).is_err() {
@@ -1663,7 +1664,7 @@ fn app_control_roundtrip_over_plain_rfb_preserves_framebuffer() {
                         &mut sock,
                         0,
                         0,
-                        json!({"list":true,"launch":true,"icons":true,"control":true}),
+                        json!({"list":true,"launch":true,"icons":true,"foreground":true,"control":true}),
                     );
                 }
                 3 => {
@@ -1716,6 +1717,10 @@ fn app_control_roundtrip_over_plain_rfb_preserves_framebuffer() {
                                 json!({"png":base64::engine::general_purpose::STANDARD.encode(png.into_inner())}),
                             );
                         }
+                        5 => {
+                            foreground_queries += 1;
+                            write_app_reply(&mut sock, 5, id, json!({"bundle_id":null}));
+                        }
                         op => panic!("Unexpected app operation {op}"),
                     }
                 }
@@ -1726,6 +1731,10 @@ fn app_control_roundtrip_over_plain_rfb_preserves_framebuffer() {
             }
         }
         assert!(saw_launch && saw_icon);
+        assert_eq!(
+            foreground_queries, 2,
+            "foreground queries should not poll indefinitely"
+        );
     });
     let handle = SessionHandle::spawn(request_for(port));
     assert!(wait_for(
@@ -1763,6 +1772,7 @@ fn app_control_roundtrip_over_plain_rfb_preserves_framebuffer() {
         &handle.framebuffer.lock().unwrap().pixels[..4],
         &[11, 22, 33, 255]
     );
+    thread::sleep(Duration::from_millis(2300));
     handle.close();
     drop(handle);
     server.join().unwrap();

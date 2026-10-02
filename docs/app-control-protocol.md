@@ -6,7 +6,7 @@ the installed App list by name or Bundle ID, and adds/removes favorites. Drag a
 shortcut before another icon to reorder it; drop on `+` to move it to the end.
 Favorites (up to 32) belong to a saved connection and survive restart. Unsaved
 connections keep changes for the current session. A dot marks the last reported
-foreground App, refreshed every two seconds. This is not a list of background
+foreground App, fetched on connection and after App actions. This is not a list of background
 processes. The installed list must load successfully before launch controls enable.
 
 Both RV and TrollVNC need these changes. The App extension is independent of
