@@ -116,6 +116,8 @@ Capability `unlock` enables operations 7 (screen state), 8 (prepare passcode UI)
 and 9 (arm keyboard input, `{"digits":6}`; zero cancels). State replies include
 `locked`, `passcode_required`, `input_ready`, `input_empty`, and `reason`; arm
 replies include `armed`. Neither request nor reply JSON contains the passcode.
+The server also reports `keypad_absent` when AX confirms the lock screen has no
+passcode field or digit keys; RV ignores this optional field.
 
 Capability `lock` enables operation 10 (`{}`), which returns the same screen-state
 fields. It sends one short power-key press when the screen is on and unlocked,
@@ -134,7 +136,9 @@ Automatic unlock key events are excluded from TrollVNC key logging.
 The server reads lock state through SpringBoardServices and display state through
 the existing system notification state. When the display is off it sends a power
 key press, waits for wake-up, and swipes from the physical screen bottom to open
-the passcode page. AXRuntime confirms the ready empty passcode UI before input. It does not inject a SpringBoard helper.
+the passcode page. If AX confirms that the keypad is still absent after the
+swipe, it sends a short Home-key press for devices with a physical Home button. AXRuntime confirms
+the ready empty passcode UI before input. It does not inject a SpringBoard helper.
 The native wake/swipe/AX/keyboard flow was verified on iPhone X with iOS 16.7.10.
 Other iOS versions still require device verification.
 `RV_MOCK_UNLOCK=1 cargo run -p rv-session --example mock_server -- 127.0.0.1:5999`

@@ -70,6 +70,10 @@ int tvPhotoPoll(const char *token, char **payload, char **error) {
             snprintf(result, sizeof(result), "{\"total\":2,\"offset\":0,\"albums\":[{\"id\":\"fixture-album\",\"name\":\"Fixture album\"}],\"entries\":[{\"id\":\"fixture-photo\",\"name\":\"%s\",\"date\":1720000000,\"width\":64,\"height\":64,\"thumbnail\":\"\"},{\"id\":\"fixture-photo-2\",\"name\":\"second.png\",\"date\":1710000000,\"width\":32,\"height\":32,\"thumbnail\":\"\"}]}", name);
         *payload = strdup(result);
     } else if (fake_op == 9) {
+        if (strcmp(fake_value, "fixture-cancel") == 0) {
+            *error = strdup("Photo deletion cancelled");
+            return -2;
+        }
         if ((!strstr(fake_value, "fixture-photo") ||
              (fake_value[0] == '{' && !strstr(fake_value, "fixture-photo-2"))) || fake_deleted) {
             *error = strdup("photo no longer exists");

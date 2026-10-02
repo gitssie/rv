@@ -1082,6 +1082,19 @@ fn tight_file_roundtrip_with_real_libvncserver_when_available() {
         );
         thread::sleep(Duration::from_millis(10));
     }
+    files.send(FileCommand::PhotoDelete(vec!["fixture-cancel".into()]));
+    while files.snapshot().photo_status.as_deref() != Some("Photo deletion cancelled")
+        || files.snapshot().photo_busy
+    {
+        assert!(
+            Instant::now() < upload_until,
+            "cancel photo deletion: {:?}",
+            files.snapshot()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(files.snapshot().photo_error.is_none());
+    assert_eq!(files.snapshot().photo_total, 2);
     files.send(FileCommand::PhotoDelete(vec![
         "fixture-photo".into(),
         "fixture-photo-2".into(),

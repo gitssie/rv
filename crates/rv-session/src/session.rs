@@ -491,8 +491,20 @@ async fn session_loop(
         }
         apps.advance(&client, &app_send).await;
         files.advance_upload(&client).await;
-        if let Some(command) = files.followup.pop_front() {
+        if let Some((offset, album)) = files.next_photo_page.take() {
+            files.send_photo_list(&client, offset, album).await;
+        } else if let Some(command) = files.followup.pop_front() {
             files.command(&client, command).await;
+        } else if files.pending_photo.is_none()
+            && files.pending_photo_page.is_none()
+            && files.pending_photo_upload.is_none()
+            && files.pending_export_cleanup.is_none()
+            && files.active.is_none()
+            && let Some((offset, album)) = files.queued_photo_list.take()
+        {
+            files
+                .command(&client, FileCommand::PhotoList { offset, album })
+                .await;
         }
         files.advance_photo(&client).await;
         let since_refresh = last_refresh.elapsed();
@@ -706,6 +718,8 @@ struct FileRuntime {
     pending_checksum: Option<PendingChecksum>,
     pending_photo: Option<PendingPhoto>,
     pending_photo_page: Option<PendingPhotoPage>,
+    next_photo_page: Option<(usize, Option<String>)>,
+    queued_photo_list: Option<(usize, Option<String>)>,
     pending_photo_upload: Option<PendingPhotoUpload>,
     photo_upload_source: Option<PathBuf>,
     pending_export_cleanup: Option<String>,
@@ -726,6 +740,8 @@ impl FileRuntime {
             pending_checksum: None,
             pending_photo: None,
             pending_photo_page: None,
+            next_photo_page: None,
+            queued_photo_list: None,
             pending_photo_upload: None,
             photo_upload_source: None,
             pending_export_cleanup: None,
@@ -746,6 +762,7 @@ impl FileRuntime {
         let message = message.into();
         self.pending_photo = None;
         self.pending_photo_page = None;
+        self.next_photo_page = None;
         self.photo_upload_source = None;
         if let Some(upload) = self.pending_photo_upload.take() {
             self.followup
@@ -840,6 +857,61 @@ impl FileRuntime {
         }
     }
 
+    // A second view request must not turn an in-flight page into a persistent
+    // error. Keep only the latest different target; identical refreshes are
+    // already satisfied by the page being loaded.
+    fn photo_list_ready(&mut self, offset: usize, album: &Option<String>) -> bool {
+        if self.pending_photo_upload.is_some() {
+            return false;
+        }
+        if let Some(pending) = &self.pending_photo {
+            if matches!(&pending.action, PhotoAction::List { .. }) {
+                self.queued_photo_list = (!self
+                    .pending_photo_page
+                    .as_ref()
+                    .is_some_and(|page| page.offset == offset && &page.album == album))
+                .then(|| (offset, album.clone()));
+            }
+            return false;
+        }
+        if let Some(page) = &self.pending_photo_page {
+            if &page.album == album && page.offset == offset {
+                self.queued_photo_list = None;
+                return false;
+            }
+            self.queued_photo_list = Some((offset, album.clone()));
+            return false;
+        }
+        true
+    }
+
+    async fn send_photo_list(
+        &mut self,
+        client: &vnc::VncClient,
+        offset: usize,
+        album: Option<String>,
+    ) {
+        if self.pending_photo_page.is_none() {
+            self.pending_photo_page = Some(PendingPhotoPage::new(offset, album.clone()));
+            // Consume the refresh request once. A failed refresh stays
+            // visible and must not turn into an automatic retry loop.
+            file_transfer::update(&self.state, |state| state.photos_need_refresh = false);
+        }
+        let request = if let Some(id) = &album {
+            serde_json::json!({"offset": offset, "album": id}).to_string()
+        } else {
+            offset.to_string()
+        };
+        self.start_photo(
+            client,
+            5,
+            request,
+            None,
+            PhotoAction::List { offset, album },
+        )
+        .await;
+    }
+
     async fn advance_photo(&mut self, client: &vnc::VncClient) {
         let Some(pending) = self.pending_photo.as_mut() else {
             return;
@@ -890,6 +962,15 @@ impl FileRuntime {
             self.photo_fail(message);
             return;
         }
+        if status == 3 && pending.op == 9 {
+            file_transfer::update(&self.state, |state| {
+                state.photo_busy = false;
+                state.photo_error = None;
+                state.photo_status = Some("Photo deletion cancelled".into());
+                state.photo_revision = state.photo_revision.wrapping_add(1);
+            });
+            return;
+        }
         if pending.token.is_none() {
             if status != 2 || message.len() != 36 {
                 self.photo_fail("Invalid Photos job response");
@@ -916,6 +997,7 @@ impl FileRuntime {
             self.photo_fail("Invalid Photos result");
             return;
         };
+        file_transfer::update(&self.state, |state| state.photo_error = None);
         match pending.action {
             PhotoAction::List { offset, album } => {
                 let Some(rows) = json.get("entries").and_then(Value::as_array) else {
@@ -980,10 +1062,7 @@ impl FileRuntime {
                 };
                 match next {
                     Ok(Some(next_offset)) => {
-                        self.followup.push_back(FileCommand::PhotoList {
-                            offset: next_offset,
-                            album,
-                        });
+                        self.next_photo_page = Some((next_offset, album));
                         return;
                     }
                     Ok(None) => {}
@@ -1000,7 +1079,7 @@ impl FileRuntime {
                     state.photo_album = page.album;
                     state.photo_offset = page.offset;
                     state.photo_total = page.total;
-                    state.photo_busy = false;
+                    state.photo_busy = self.queued_photo_list.is_some();
                     if state.photo_status.as_deref() == Some("Loading Photos…") {
                         state.photo_status = None;
                     }
@@ -1312,45 +1391,10 @@ impl FileRuntime {
                 }
             }
             FileCommand::PhotoList { offset, album } => {
-                if self.pending_photo_upload.is_none() {
-                    if self.pending_photo.is_some() {
-                        file_transfer::update(&self.state, |state| {
-                            state.photo_error =
-                                Some("Wait for the current photo operation to finish".into());
-                        });
-                        return;
-                    }
-                    if let Some(page) = &self.pending_photo_page {
-                        if page.next_offset != offset || page.album != album {
-                            file_transfer::update(&self.state, |state| {
-                                state.photo_error =
-                                    Some("Wait for the current Photos page to finish".into());
-                            });
-                            return;
-                        }
-                    } else {
-                        self.pending_photo_page =
-                            Some(PendingPhotoPage::new(offset, album.clone()));
-                        // Consume the refresh request once. A failed refresh stays
-                        // visible and must not turn into an automatic retry loop.
-                        file_transfer::update(&self.state, |state| {
-                            state.photos_need_refresh = false
-                        });
-                    }
-                    let request = if let Some(id) = &album {
-                        serde_json::json!({"offset": offset, "album": id}).to_string()
-                    } else {
-                        offset.to_string()
-                    };
-                    self.start_photo(
-                        client,
-                        5,
-                        request,
-                        None,
-                        PhotoAction::List { offset, album },
-                    )
-                    .await;
+                if !self.photo_list_ready(offset, &album) {
+                    return;
                 }
+                self.send_photo_list(client, offset, album).await;
             }
             FileCommand::PhotoImport {
                 remote,
@@ -2269,6 +2313,154 @@ mod transport_tests {
     use super::*;
 
     #[test]
+    fn completed_photo_list_clears_stale_concurrent_request_error() {
+        let state = Arc::new(Mutex::new(FileTransferSnapshot {
+            can_photos: true,
+            photo_busy: true,
+            photo_error: Some("Wait for the current photo operation to finish".into()),
+            ..Default::default()
+        }));
+        let mut runtime = FileRuntime::new(state.clone(), true);
+        runtime.pending_photo_page = Some(PendingPhotoPage::new(0, None));
+        runtime.pending_photo = Some(PendingPhoto {
+            id: 1,
+            op: 5,
+            token: Some("list-token".into()),
+            poll_due: Instant::now(),
+            poll_delay: PHOTO_POLL_MIN,
+            action: PhotoAction::List {
+                offset: 0,
+                album: None,
+            },
+        });
+
+        runtime.photo_result(7, 1, 0, r#"{"entries":[],"total":0}"#.into());
+
+        let snapshot = state.lock().unwrap().clone();
+        assert!(!snapshot.photo_busy);
+        assert_eq!(snapshot.photo_error, None);
+    }
+
+    #[test]
+    fn overlapping_photo_lists_coalesce_and_keep_the_latest_view() {
+        let state = Arc::new(Mutex::new(FileTransferSnapshot {
+            can_photos: true,
+            photo_busy: true,
+            ..Default::default()
+        }));
+        let mut runtime = FileRuntime::new(state.clone(), true);
+        runtime.pending_photo_page = Some(PendingPhotoPage::new(0, None));
+        runtime.pending_photo = Some(PendingPhoto {
+            id: 1,
+            op: 5,
+            token: Some("list-token".into()),
+            poll_due: Instant::now(),
+            poll_delay: PHOTO_POLL_MIN,
+            action: PhotoAction::List {
+                offset: 0,
+                album: None,
+            },
+        });
+
+        assert!(!runtime.photo_list_ready(0, &None));
+        assert!(runtime.queued_photo_list.is_none());
+        assert!(!runtime.photo_list_ready(0, &Some("album-a".into())));
+        assert!(!runtime.photo_list_ready(0, &Some("album-b".into())));
+        assert_eq!(runtime.queued_photo_list, Some((0, Some("album-b".into()))));
+        assert!(!runtime.photo_list_ready(0, &None));
+        assert!(runtime.queued_photo_list.is_none());
+        assert!(!runtime.photo_list_ready(0, &Some("album-b".into())));
+        assert!(state.lock().unwrap().photo_error.is_none());
+
+        runtime.photo_result(7, 1, 0, r#"{"entries":[],"total":0}"#.into());
+        assert!(state.lock().unwrap().photo_busy);
+        assert!(runtime.photo_list_ready(0, &Some("album-b".into())));
+    }
+
+    #[test]
+    fn external_photo_list_cannot_take_an_internal_page_continuation() {
+        let state = Arc::new(Mutex::new(FileTransferSnapshot {
+            can_photos: true,
+            photo_busy: true,
+            ..Default::default()
+        }));
+        let mut runtime = FileRuntime::new(state, true);
+        runtime.pending_photo_page = Some(PendingPhotoPage::new(0, None));
+        runtime.pending_photo_page.as_mut().unwrap().next_offset = 12;
+        runtime.next_photo_page = Some((12, None));
+
+        assert!(!runtime.photo_list_ready(12, &None));
+        assert_eq!(runtime.next_photo_page, Some((12, None)));
+        assert_eq!(runtime.queued_photo_list, Some((12, None)));
+    }
+
+    #[test]
+    fn failed_photo_page_keeps_the_latest_requested_view() {
+        let state = Arc::new(Mutex::new(FileTransferSnapshot {
+            can_photos: true,
+            photo_busy: true,
+            ..Default::default()
+        }));
+        let mut runtime = FileRuntime::new(state.clone(), true);
+        runtime.pending_photo_page = Some(PendingPhotoPage::new(0, None));
+        runtime.queued_photo_list = Some((0, Some("album-b".into())));
+        runtime.pending_photo = Some(PendingPhoto {
+            id: 1,
+            op: 5,
+            token: Some("list-token".into()),
+            poll_due: Instant::now(),
+            poll_delay: PHOTO_POLL_MIN,
+            action: PhotoAction::List {
+                offset: 0,
+                album: None,
+            },
+        });
+
+        runtime.photo_result(7, 1, 1, "First page failed".into());
+
+        assert!(runtime.pending_photo_page.is_none());
+        assert_eq!(runtime.queued_photo_list, Some((0, Some("album-b".into()))));
+        assert_eq!(
+            state.lock().unwrap().photo_error.as_deref(),
+            Some("First page failed")
+        );
+    }
+
+    #[test]
+    fn cancelled_photo_deletion_is_a_status_not_an_error() {
+        let state = Arc::new(Mutex::new(FileTransferSnapshot {
+            can_photos: true,
+            photo_busy: true,
+            photo_error: Some("old error".into()),
+            ..Default::default()
+        }));
+        let mut runtime = FileRuntime::new(state.clone(), true);
+        runtime.pending_photo = Some(PendingPhoto {
+            id: 9,
+            op: 9,
+            token: Some("delete-token".into()),
+            poll_due: Instant::now(),
+            poll_delay: PHOTO_POLL_MIN,
+            action: PhotoAction::Delete {
+                album: None,
+                count: 1,
+            },
+        });
+
+        runtime.photo_result(7, 9, 3, "Photo deletion cancelled".into());
+
+        let snapshot = state.lock().unwrap().clone();
+        assert!(!snapshot.photo_busy);
+        assert_eq!(snapshot.photo_error, None);
+        assert_eq!(
+            snapshot.photo_status.as_deref(),
+            Some("Photo deletion cancelled")
+        );
+        assert_eq!(snapshot.photo_revision, 1);
+        assert!(runtime.followup.is_empty());
+    }
+
+    #[test]
     fn photo_import_stays_busy_until_refresh_finishes() {
         let state = Arc::new(Mutex::new(FileTransferSnapshot {
             can_photos: true,
@@ -2400,6 +2592,9 @@ mod transport_tests {
         let mut runtime = FileRuntime::new(state.clone(), true);
         runtime.pending_photo_page = Some(PendingPhotoPage::new(0, None));
         for (chunk, offset) in [0, 12, 24, 36, 48].into_iter().enumerate() {
+            if chunk > 0 {
+                assert_eq!(runtime.next_photo_page.take(), Some((offset, None)));
+            }
             let id = chunk as u32 + 1;
             runtime.pending_photo = Some(PendingPhoto {
                 id,
@@ -2431,8 +2626,10 @@ mod transport_tests {
             if chunk < 4 {
                 assert!(snapshot.photo_busy);
                 assert!(snapshot.photo_entries.is_empty());
+                assert_eq!(runtime.next_photo_page, Some((offset + 12, None)));
             } else {
                 assert!(!snapshot.photo_busy);
+                assert!(runtime.next_photo_page.is_none());
                 assert_eq!(snapshot.photo_entries.len(), PHOTO_PAGE_SIZE);
                 assert_eq!(snapshot.photo_entries[49].id, "photo-49");
                 assert_eq!(snapshot.photo_total, 56);
