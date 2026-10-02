@@ -395,6 +395,171 @@ fn offscreen_keyboard_forwards_pairs_and_consumes_menu_shortcuts(cx: &mut TestAp
 }
 
 #[gpui::test]
+fn offscreen_trollvnc_ctrl_v_sends_command_v_once_and_restores_control(cx: &mut TestAppContext) {
+    use rv_core::{XK_CONTROL_L, XK_SUPER_L};
+    let (view, cx, mut peer) = setup(cx, false);
+    peer.events
+        .send(SessionEvent::Apps(rv_session::AppEvent::Capabilities(
+            rv_session::AppCapabilities::default(),
+        )))
+        .unwrap();
+    view.update(cx, |view, cx| view.pump(cx));
+    commands(&mut peer);
+    cx.simulate_event(gpui::ModifiersChangedEvent {
+        modifiers: Modifiers {
+            control: true,
+            ..Default::default()
+        },
+        capslock: gpui::Capslock { on: false },
+    });
+    for is_held in [false, false, true] {
+        cx.simulate_event(gpui::KeyDownEvent {
+            keystroke: gpui::Keystroke::parse("ctrl-v").unwrap(),
+            is_held,
+            prefer_character_input: false,
+        });
+    }
+    cx.simulate_event(gpui::KeyUpEvent {
+        keystroke: gpui::Keystroke::parse("ctrl-v").unwrap(),
+    });
+    cx.simulate_keystrokes("ctrl-a");
+    cx.simulate_event(gpui::KeyUpEvent {
+        keystroke: gpui::Keystroke::parse("ctrl-a").unwrap(),
+    });
+    cx.simulate_event(gpui::ModifiersChangedEvent {
+        modifiers: Modifiers::default(),
+        capslock: gpui::Capslock { on: false },
+    });
+    let keys: Vec<_> = commands(&mut peer)
+        .into_iter()
+        .map(|command| {
+            let SessionCommand::Input(vnc::X11Event::KeyEvent(event)) = command else {
+                panic!("unexpected command: {command:?}");
+            };
+            (event.keycode, event.down)
+        })
+        .collect();
+    assert_eq!(
+        keys,
+        [
+            (XK_CONTROL_L, true),
+            (XK_CONTROL_L, false),
+            (XK_SUPER_L, true),
+            (u32::from(b'v'), true),
+            (u32::from(b'v'), false),
+            (XK_SUPER_L, false),
+            (XK_CONTROL_L, true),
+            (u32::from(b'a'), true),
+            (u32::from(b'a'), false),
+            (XK_CONTROL_L, false),
+        ]
+    );
+    view.read_with(cx, |view, _| assert!(!view.command_paste_pressed));
+}
+
+#[gpui::test]
+fn offscreen_trollvnc_paste_recovers_after_losing_key_up(cx: &mut TestAppContext) {
+    let (view, cx, mut peer) = setup(cx, false);
+    peer.events
+        .send(SessionEvent::Apps(rv_session::AppEvent::Capabilities(
+            rv_session::AppCapabilities::default(),
+        )))
+        .unwrap();
+    view.update(cx, |view, cx| view.pump(cx));
+    commands(&mut peer);
+    cx.simulate_keystrokes("ctrl-v");
+    view.read_with(cx, |view, _| assert!(view.command_paste_pressed));
+    commands(&mut peer);
+    cx.update(|window, cx| {
+        view.read(cx)
+            .password_input
+            .focus_handle(cx)
+            .focus(window, cx);
+        window.draw(cx).clear(cx);
+    });
+    view.read_with(cx, |view, _| assert!(!view.command_paste_pressed));
+    // V is released elsewhere; no key-up reaches the session.
+    cx.update(|window, cx| {
+        let focus = view.read(cx).focus.clone();
+        focus.focus(window, cx);
+        window.draw(cx).clear(cx);
+    });
+    commands(&mut peer);
+    cx.simulate_keystrokes("ctrl-v");
+    let keys = commands(&mut peer);
+    assert!(keys.iter().any(|command| matches!(command,
+        SessionCommand::Input(vnc::X11Event::KeyEvent(event))
+            if event.keycode == rv_core::XK_SUPER_L && event.down
+    )));
+    assert_eq!(
+        keys.iter()
+            .filter(|command| matches!(command,
+                SessionCommand::Input(vnc::X11Event::KeyEvent(event))
+                    if event.keycode == u32::from(b'v')
+            ))
+            .count(),
+        2
+    );
+}
+
+#[gpui::test]
+fn offscreen_trollvnc_paste_respects_view_only(cx: &mut TestAppContext) {
+    let (view, cx, mut peer) = setup(cx, true);
+    peer.events
+        .send(SessionEvent::Apps(rv_session::AppEvent::Capabilities(
+            rv_session::AppCapabilities::default(),
+        )))
+        .unwrap();
+    view.update(cx, |view, cx| view.pump(cx));
+    commands(&mut peer);
+    cx.simulate_keystrokes("ctrl-v");
+    cx.simulate_event(gpui::KeyUpEvent {
+        keystroke: gpui::Keystroke::parse("v").unwrap(),
+    });
+    assert!(commands(&mut peer).is_empty());
+}
+
+#[gpui::test]
+fn offscreen_paste_keeps_plain_vnc_and_mac_shortcuts(cx: &mut TestAppContext) {
+    use rv_core::{XK_CONTROL_L, XK_SUPER_L};
+    let (view, cx, mut peer) = setup(cx, false);
+    for (trollvnc, shortcut, modifier) in [
+        (false, "ctrl-v", XK_CONTROL_L),
+        (true, "cmd-v", XK_SUPER_L),
+        (true, "ctrl-shift-v", XK_CONTROL_L),
+    ] {
+        if trollvnc {
+            peer.events
+                .send(SessionEvent::Apps(rv_session::AppEvent::Capabilities(
+                    rv_session::AppCapabilities::default(),
+                )))
+                .unwrap();
+            view.update(cx, |view, cx| view.pump(cx));
+        }
+        commands(&mut peer);
+        cx.simulate_keystrokes(shortcut);
+        cx.simulate_event(gpui::KeyUpEvent {
+            keystroke: gpui::Keystroke::parse("v").unwrap(),
+        });
+        let keys: Vec<_> = commands(&mut peer)
+            .into_iter()
+            .map(|command| {
+                let SessionCommand::Input(vnc::X11Event::KeyEvent(event)) = command else {
+                    panic!("unexpected command: {command:?}");
+                };
+                (event.keycode, event.down)
+            })
+            .collect();
+        assert_eq!(keys.len(), 4, "{shortcut}");
+        assert_eq!(keys[0], (modifier, true), "{shortcut}");
+        assert_eq!(keys[1].1, true);
+        assert_eq!(keys[2], (keys[1].0, false));
+        assert_eq!(keys[3], (modifier, false));
+        view.read_with(cx, |view, _| assert!(!view.command_paste_pressed));
+    }
+}
+
+#[gpui::test]
 fn offscreen_clipboard_sends_utf8_text_to_remote(cx: &mut TestAppContext) {
     let (view, cx, mut peer) = setup(cx, false);
     commands(&mut peer);

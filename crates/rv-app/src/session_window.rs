@@ -138,6 +138,7 @@ pub struct SessionView {
     /// in by a probe element so pointer mapping never guesses chrome sizes.
     image_box: Rc<Cell<Bounds<Pixels>>>,
     keys: Keyboard,
+    command_paste_pressed: bool,
     focus: FocusHandle,
     canvas_hovered: bool,
     pointer_in_window: bool,
@@ -251,6 +252,7 @@ impl SessionView {
             _password_subscription: password_subscription,
             image_box: Rc::new(Cell::new(Bounds::default())),
             keys: Keyboard::new(),
+            command_paste_pressed: false,
             focus,
             canvas_hovered: false,
             pointer_in_window: true,
@@ -260,6 +262,10 @@ impl SessionView {
     }
 
     fn update_local_cursor(&mut self, window: &mut Window, _: &mut Context<Self>) {
+        if !window.is_window_active() || !self.focus.is_focused(window) {
+            // The V key-up may go to another control or application.
+            self.command_paste_pressed = false;
+        }
         // RFB does not reliably say whether the server paints a pointer into
         // the framebuffer. Automatic therefore favors a visible local cursor;
         // Hide is an explicit opt-in for servers that paint their own pointer.
@@ -418,6 +424,7 @@ impl SessionView {
                         self.status = "Disconnected".into();
                     }
                     self.apps.disconnected(cx);
+                    self.command_paste_pressed = false;
                     self.phase = Phase::Ended;
                     self.buttons = 0;
                     self.save_thumb();
@@ -641,6 +648,7 @@ impl SessionView {
         self.buttons = 0;
         self.last_generation = 0;
         self.keys = Keyboard::new();
+        self.command_paste_pressed = false;
         if let Some(old) = self.render_image.take() {
             cx.drop_image(old, None);
         }
@@ -701,6 +709,32 @@ impl SessionView {
             return;
         }
         let mods = event.keystroke.modifiers;
+        // A device-control capabilities reply identifies a TrollVNC peer.
+        // iOS uses Command-V. Emit a complete chord so subsequent Ctrl
+        // shortcuts still see Control, even while the physical V is held.
+        if key.eq_ignore_ascii_case("v")
+            && (self.command_paste_pressed
+                || (self.apps.caps.is_some()
+                    && mods.control
+                    && !mods.alt
+                    && !mods.shift
+                    && !mods.platform))
+        {
+            if !self.command_paste_pressed && !event.is_held {
+                self.command_paste_pressed = true;
+                let mut events = self.keys.set_modifiers(false, false, true);
+                events.extend(self.keys.key_down("v", Some("v"), false, false));
+                events.extend(self.keys.key_up("v"));
+                events.extend(self.keys.set_modifiers(false, false, false));
+                events.extend(
+                    self.keys
+                        .set_modifiers(mods.control, mods.alt, mods.platform),
+                );
+                self.send_keys(events);
+            }
+            self.consume_key(window, cx);
+            return;
+        }
         let mut events = self
             .keys
             .set_modifiers(mods.control, mods.alt, mods.platform);
@@ -725,6 +759,15 @@ impl SessionView {
         }
         let key = event.keystroke.key.as_str();
         let mods = event.keystroke.modifiers;
+        if key.eq_ignore_ascii_case("v") && self.command_paste_pressed {
+            self.command_paste_pressed = false;
+            let events = self
+                .keys
+                .set_modifiers(mods.control, mods.alt, mods.platform);
+            self.send_keys(events);
+            self.consume_key(window, cx);
+            return;
+        }
         let mut events = self.keys.key_up(key);
         events.extend(
             self.keys

@@ -51,6 +51,15 @@ Icons are 64×64 PNGs. RV restricts decoded dimensions to 128×128, keeps up to
 160 decoded icons, and fetches favorites plus the current 60-App search page.
 Explicit refresh retries failed/missing icons; failures do not retry in a loop.
 
+After receiving device-control capabilities, RV translates an unmodified
+Ctrl+V shortcut into an iOS Command+V chord. It temporarily releases remote
+Control, sends Super/V down and up (TrollVNC maps Super to Command), then restores
+Control. Duplicate key-downs and held repeats produce one paste per physical
+press; losing focus clears this suppression. Command+V, other Ctrl combinations,
+and peers without this capabilities reply retain their normal keyboard behavior.
+Clipboard text is still synchronized with the **Send clipboard** button; the
+shortcut pastes the current remote clipboard and respects view-only mode.
+
 ## Execution and limitations
 
 The server serializes App work on a queue, holds a LibVNCServer client reference
