@@ -128,10 +128,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    if locked && std::env::args().any(|arg| arg == "--snapshot") {
-        if let Some(png) = session.framebuffer.lock().unwrap().thumbnail_png(1200) {
-            std::fs::write("/tmp/cazer-unlock-screen.png", png)?;
-        }
+    if locked
+        && std::env::args().any(|arg| arg == "--snapshot")
+        && let Some(png) = session.framebuffer.lock().unwrap().thumbnail_png(1200)
+    {
+        std::fs::write("/tmp/cazer-unlock-screen.png", png)?;
     }
     if unlock {
         session.app(AppCommand::ArmUnlock(1, 0));

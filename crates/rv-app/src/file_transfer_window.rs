@@ -1146,6 +1146,13 @@ impl FileTransferView {
     }
 
     fn advance_queue(&mut self, cx: &mut Context<Self>) {
+        if self
+            .client
+            .as_ref()
+            .is_some_and(|client| client.reserved_by_other())
+        {
+            return;
+        }
         let mut reload_local = false;
         if let Some(index) = self.current_job {
             let job = &mut self.queue[index];
@@ -3313,7 +3320,7 @@ impl Render for FileTransferView {
             .when_some(self.pending_conflicts.as_ref(), |this, jobs| {
                 this.child(render_conflict_confirmation(
                     jobs.len(),
-                    self.can_replace_conflicts(&jobs),
+                    self.can_replace_conflicts(jobs),
                     cx,
                 ))
             })
@@ -4447,7 +4454,6 @@ mod tests {
                 upload: true,
                 list: true,
                 download: true,
-                ..Default::default()
             }),
             can_photos: true,
             remote_path: "/target".into(),

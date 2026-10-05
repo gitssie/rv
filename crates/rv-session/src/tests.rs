@@ -1056,6 +1056,27 @@ fn tight_file_roundtrip_with_real_libvncserver_when_available() {
     }
     let source = local.path().join("photo-upload.png");
     std::fs::write(&source, b"fixture-photo-bytes").unwrap();
+    let token = uuid::Uuid::new_v4().to_string();
+    let before_preflight = files.snapshot().photo_revision;
+    files.send(FileCommand::UploadToPhotosTask {
+        source: local.path().join("missing-image.jpg"),
+        task_id: token.clone(),
+    });
+    let until_preflight = Instant::now() + Duration::from_secs(2);
+    while files.snapshot().photo_revision == before_preflight {
+        assert!(Instant::now() < until_preflight);
+        thread::sleep(Duration::from_millis(5));
+    }
+    let rejected = files.snapshot();
+    assert_eq!(rejected.photo_task_id.as_deref(), Some(token.as_str()));
+    assert_eq!(
+        rejected.photo_failure,
+        Some(crate::PhotoFailure::NotSubmitted)
+    );
+    assert_eq!(
+        rejected.photo_error.as_deref(),
+        Some("Cannot open the selected image")
+    );
     let before_photo_upload = files.snapshot().photo_revision;
     files.send(FileCommand::UploadToPhotos(source));
     let upload_until = Instant::now() + Duration::from_secs(5);
@@ -1615,6 +1636,91 @@ fn passive_lock_push_over_rfb_needs_no_state_request_and_preserves_frames() {
         thread::sleep(Duration::from_millis(10));
     }
     assert_eq!(observed, [true, false]);
+    assert_eq!(
+        &handle.framebuffer.lock().unwrap().pixels[..4],
+        &[11, 22, 33, 255]
+    );
+    handle.close();
+    drop(handle);
+    server.join().unwrap();
+}
+
+#[test]
+fn notification_push_over_rfb_preserves_frames_and_revision() {
+    use crate::AppEvent;
+    use serde_json::json;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        let (mut sock, _) = listener.accept().unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        rfb_handshake(&mut sock, 1, 1, b"lock-push");
+        let mut sent_change = false;
+        loop {
+            let mut typ = [0];
+            if sock.read_exact(&mut typ).is_err() {
+                break;
+            }
+            match typ[0] {
+                0 => {
+                    read_exact(&mut sock, 19);
+                }
+                2 => {
+                    read_exact(&mut sock, 1);
+                    let n = u16::from_be_bytes(read_exact(&mut sock, 2).try_into().unwrap());
+                    let encodings = read_exact(&mut sock, n as usize * 4);
+                    assert!(
+                        encodings
+                            .chunks_exact(4)
+                            .any(|v| v == 0xC0A1_A990u32.to_be_bytes())
+                    );
+                    write_app_reply(&mut sock, 0, 0, json!({"notifications":true}));
+                    write_app_reply(
+                        &mut sock,
+                        15,
+                        0,
+                        json!({"revision":"epoch:1", "notifications":[]}),
+                    );
+                }
+                3 => {
+                    read_exact(&mut sock, 9);
+                    sock.write_all(&[0, 0]).unwrap();
+                    write_u16(&mut sock, 1);
+                    for v in [0, 0, 1, 1] {
+                        write_u16(&mut sock, v);
+                    }
+                    write_u32(&mut sock, 0);
+                    sock.write_all(&[11, 22, 33, 255]).unwrap();
+                    if !sent_change {
+                        write_app_reply(
+                            &mut sock,
+                            15,
+                            0,
+                            json!({"revision":"epoch:2", "notifications":[{"id":"system:1","source":"com.apple.springboard","title":"电池电量低","subtitle":"","message":"剩余电量 20%","timestamp":1}]}),
+                        );
+                        sent_change = true;
+                    }
+                }
+                139 => panic!("Passive state push must not require a device-state request"),
+                typ => panic!("Unexpected RFB message {typ}"),
+            }
+        }
+        assert!(sent_change);
+    });
+    let handle = SessionHandle::spawn(request_for(port));
+    let mut observed = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && observed.len() < 2 {
+        for event in handle.drain() {
+            if let SessionEvent::Apps(AppEvent::Notifications(snapshot)) = event {
+                observed.push(snapshot);
+            }
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(observed.len(), 2);
+    assert_eq!(observed[0].revision, "epoch:1");
+    assert_eq!(observed[1].notifications[0].title, "电池电量低");
     assert_eq!(
         &handle.framebuffer.lock().unwrap().pixels[..4],
         &[11, 22, 33, 255]

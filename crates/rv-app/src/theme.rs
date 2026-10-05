@@ -8,12 +8,12 @@ use gpui::{App, Hsla, Pixels, Window, hsla, px, rgb};
 use gpui_component::{ActiveTheme as _, Theme, ThemeMode};
 use rv_core::ThemePref;
 
-pub fn accent(cx: &App) -> Hsla {
-    cx.theme().primary
+pub fn accent(_: &App) -> Hsla {
+    rgb(0x3389f5).into()
 }
 
-pub fn accent_fg(cx: &App) -> Hsla {
-    cx.theme().primary_foreground
+pub fn accent_fg(_: &App) -> Hsla {
+    rgb(0xffffff).into()
 }
 
 /// Window background behind cards and lists. Cards must read as raised, so
@@ -21,7 +21,7 @@ pub fn accent_fg(cx: &App) -> Hsla {
 /// mode, near-black under dark-gray cards in dark mode.
 pub fn surface(cx: &App) -> Hsla {
     if is_dark(cx) {
-        cx.theme().background
+        rgb(0x171c22).into()
     } else {
         cx.theme().secondary
     }
@@ -30,7 +30,7 @@ pub fn surface(cx: &App) -> Hsla {
 /// Card, dialog, and toolbar background.
 pub fn card(cx: &App) -> Hsla {
     if is_dark(cx) {
-        cx.theme().secondary
+        rgb(0x20272f).into()
     } else {
         cx.theme().background
     }
@@ -45,7 +45,11 @@ pub fn muted(cx: &App) -> Hsla {
 }
 
 pub fn line(cx: &App) -> Hsla {
-    cx.theme().border
+    if is_dark(cx) {
+        rgb(0x303944).into()
+    } else {
+        cx.theme().border
+    }
 }
 
 pub fn danger(cx: &App) -> Hsla {
@@ -53,21 +57,37 @@ pub fn danger(cx: &App) -> Hsla {
 }
 
 pub fn sidebar(cx: &App) -> Hsla {
-    cx.theme().sidebar
+    if is_dark(cx) {
+        rgb(0x13181e).into()
+    } else {
+        cx.theme().sidebar
+    }
 }
 
 /// Background of a selected list row or card.
 pub fn selected(cx: &App) -> Hsla {
-    cx.theme().accent
+    if is_dark(cx) {
+        rgb(0x233247).into()
+    } else {
+        cx.theme().accent
+    }
 }
 
 pub fn hover(cx: &App) -> Hsla {
-    cx.theme().list_hover
+    if is_dark(cx) {
+        rgb(0x27313c).into()
+    } else {
+        cx.theme().list_hover
+    }
 }
 
 /// Placeholder behind connection previews.
 pub fn thumb_bg(cx: &App) -> Hsla {
-    cx.theme().muted
+    if is_dark(cx) {
+        rgb(0x10151b).into()
+    } else {
+        cx.theme().muted
+    }
 }
 
 pub fn is_dark(cx: &App) -> bool {
@@ -101,7 +121,7 @@ pub fn scrim() -> Hsla {
 }
 
 pub fn sidebar_width() -> Pixels {
-    px(220.)
+    px(176.)
 }
 
 pub fn toolbar_height() -> Pixels {

@@ -49,9 +49,20 @@ pub enum TransferStatus {
     Failed(String),
 }
 
+/// Import failures are classified by submission phase, never by translated text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PhotoFailure {
+    NotSubmitted,
+    Unknown,
+    TaskNotFound,
+}
 #[derive(Debug, Clone)]
 pub struct FileTransferSnapshot {
     pub revision: u64,
+    #[doc(hidden)]
+    pub reserved_owner: Option<u64>,
+    #[doc(hidden)]
+    pub pending_commands: usize,
     pub caps: Option<TightFileCaps>,
     pub can_delete: bool,
     pub can_mkdir: bool,
@@ -70,7 +81,10 @@ pub struct FileTransferSnapshot {
     pub photos_need_refresh: bool,
     pub photo_status: Option<String>,
     pub photo_error: Option<String>,
+    pub photo_failure: Option<PhotoFailure>,
     pub photo_revision: u64,
+    pub photo_asset_id: Option<String>,
+    pub photo_task_id: Option<String>,
     pub management_busy: bool,
     pub management_revision: u64,
     pub remote_path: String,
@@ -86,6 +100,8 @@ impl Default for FileTransferSnapshot {
     fn default() -> Self {
         Self {
             revision: 0,
+            reserved_owner: None,
+            pending_commands: 0,
             caps: None,
             can_delete: false,
             can_mkdir: false,
@@ -104,7 +120,10 @@ impl Default for FileTransferSnapshot {
             photos_need_refresh: false,
             photo_status: None,
             photo_error: None,
+            photo_failure: None,
             photo_revision: 0,
+            photo_asset_id: None,
+            photo_task_id: None,
             management_busy: false,
             management_revision: 0,
             remote_path: "/".into(),
@@ -163,6 +182,11 @@ pub enum FileCommand {
     UploadToPhotos(PathBuf),
     /// Queue owner refreshes Photos once after all imports finish.
     UploadToPhotosQueued(PathBuf),
+    UploadToPhotosTask {
+        source: PathBuf,
+        task_id: String,
+    },
+    PhotoQueryTask(String),
     PhotoCleanupExport(String),
 }
 
@@ -170,6 +194,7 @@ pub enum FileCommand {
 pub struct FileTransferClient {
     pub(crate) state: Arc<Mutex<FileTransferSnapshot>>,
     pub(crate) commands: UnboundedSender<SessionCommand>,
+    pub(crate) owner: Option<Arc<TransferReservation>>,
 }
 
 impl FileTransferClient {
@@ -190,8 +215,66 @@ impl FileTransferClient {
         self.state.lock().expect("file transfer state lock").clone()
     }
 
-    pub fn send(&self, command: FileCommand) {
-        let _ = self.commands.send(SessionCommand::File(command));
+    pub fn send(&self, command: FileCommand) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if state.reserved_owner.is_some()
+            && state.reserved_owner != self.owner.as_ref().map(|v| v.id)
+        {
+            return false;
+        }
+        if self.commands.send(SessionCommand::File(command)).is_err() {
+            return false;
+        }
+        state.pending_commands += 1;
+        true
+    }
+    pub fn reserved_by_other(&self) -> bool {
+        let state = self.state.lock().unwrap();
+        state.reserved_owner.is_some() && state.reserved_owner != self.owner.as_ref().map(|v| v.id)
+    }
+    /// Reserve an idle transport for a batch. All clones retain ownership until dropped.
+    pub fn try_reserve(&self) -> Option<Self> {
+        if self.owner.is_some() {
+            return Some(self.clone());
+        }
+        let mut state = self.state.lock().unwrap();
+        if state.reserved_owner.is_some()
+            || state.pending_commands > 0
+            || state.photo_busy
+            || state.management_busy
+            || state.listing
+            || state
+                .transfers
+                .iter()
+                .any(|r| matches!(r.status, TransferStatus::Running | TransferStatus::Sent))
+        {
+            return None;
+        }
+        static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let id = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        state.reserved_owner = Some(id);
+        Some(Self {
+            state: self.state.clone(),
+            commands: self.commands.clone(),
+            owner: Some(Arc::new(TransferReservation {
+                id,
+                state: self.state.clone(),
+            })),
+        })
+    }
+}
+
+pub(crate) struct TransferReservation {
+    id: u64,
+    state: Arc<Mutex<FileTransferSnapshot>>,
+}
+impl Drop for TransferReservation {
+    fn drop(&mut self) {
+        let mut state = self.state.lock().unwrap();
+        if state.reserved_owner == Some(self.id) {
+            state.reserved_owner = None;
+            state.revision = state.revision.wrapping_add(1);
+        }
     }
 }
 
@@ -215,11 +298,41 @@ mod tests {
         let client = FileTransferClient {
             state: state.clone(),
             commands,
+            owner: None,
         };
         assert!(client.snapshot_if_changed(0).is_none());
         update(&state, |snapshot| snapshot.photos_need_refresh = true);
         let changed = client.snapshot_if_changed(0).unwrap();
         assert!(changed.photos_need_refresh);
         assert!(client.snapshot_if_changed(changed.revision).is_none());
+    }
+    #[test]
+    fn reservation_blocks_other_clients_and_lives_through_clones() {
+        let state = Arc::new(Mutex::new(FileTransferSnapshot::default()));
+        let (commands, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let client = FileTransferClient {
+            state: state.clone(),
+            commands,
+            owner: None,
+        };
+        let owned = client.try_reserve().unwrap();
+        let clone = owned.clone();
+        assert!(client.try_reserve().is_none());
+        assert!(!client.send(FileCommand::PhotoList {
+            offset: 0,
+            album: None
+        }));
+        drop(owned);
+        assert!(client.reserved_by_other());
+        assert!(clone.send(FileCommand::PhotoList {
+            offset: 0,
+            album: None
+        }));
+        assert!(receiver.try_recv().is_ok());
+        drop(clone);
+        assert!(!client.reserved_by_other());
+        assert!(client.try_reserve().is_none()); // queued commands retain the idle gate
+        state.lock().unwrap().pending_commands = 0;
+        assert!(client.try_reserve().is_some());
     }
 }

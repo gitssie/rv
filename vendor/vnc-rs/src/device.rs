@@ -23,7 +23,10 @@ pub struct DeviceReply {
 
 impl DeviceRequest {
     pub(crate) async fn write<S: AsyncWrite + Unpin>(self, writer: &mut S) -> Result<(), VncError> {
-        if !(1..=10).contains(&self.op) || self.id == 0 || self.payload.len() > MAX_DEVICE_REQUEST {
+        if !((1..=10).contains(&self.op) || (12..=14).contains(&self.op) || self.op == 16)
+            || self.id == 0
+            || self.payload.len() > MAX_DEVICE_REQUEST
+        {
             return Err(VncError::General("Invalid device request".into()));
         }
         let mut bytes = vec![139, 1, self.op, 0];
@@ -43,9 +46,13 @@ pub(crate) async fn read_reply<S: AsyncRead + Unpin>(
     let status = reader.read_u8().await?;
     let id = reader.read_u32().await?;
     let len = reader.read_u32().await? as usize;
-    let unsolicited = op == 0 || op == 11;
-    if version != 1 || op > 11 || status > 1 || len > MAX_DEVICE_PAYLOAD
-        || unsolicited != (id == 0) || (op == 11 && status != 0)
+    let unsolicited = op == 0 || op == 11 || op == 15;
+    if version != 1
+        || op > 16
+        || status > 1
+        || len > MAX_DEVICE_PAYLOAD
+        || unsolicited != (id == 0)
+        || ((op == 11 || op == 15) && status != 0)
     {
         return Err(VncError::General("Invalid device reply header".into()));
     }
@@ -73,25 +80,51 @@ mod tests {
     }
     #[tokio::test]
     async fn only_capabilities_and_lock_events_can_have_zero_request_id() {
-        for (op, status, id, valid) in [(11, 0, 0u32, true), (11, 0, 1, false),
-            (11, 1, 0, false), (7, 0, 0, false), (0, 0, 0, true)] {
+        for (op, status, id, valid) in [
+            (11, 0, 0u32, true),
+            (11, 0, 1, false),
+            (11, 1, 0, false),
+            (7, 0, 0, false),
+            (0, 0, 0, true),
+        ] {
             let mut bytes = vec![1, op, status];
             bytes.extend_from_slice(&id.to_be_bytes());
             bytes.extend_from_slice(&2u32.to_be_bytes());
             bytes.extend_from_slice(b"{}");
             assert_eq!(read_reply(&mut bytes.as_slice()).await.is_ok(), valid);
         }
-        assert!(DeviceRequest { op: 11, id: 1, payload: "{}".into() }.write(&mut vec![]).await.is_err());
+        assert!(DeviceRequest {
+            op: 11,
+            id: 1,
+            payload: "{}".into()
+        }
+        .write(&mut vec![])
+        .await
+        .is_err());
     }
 
     #[tokio::test]
     async fn lock_opcode_roundtrips_and_unknown_opcode_is_rejected() {
         let mut bytes = vec![];
-        DeviceRequest { op: 10, id: 1, payload: "{}".into() }.write(&mut bytes).await.unwrap();
+        DeviceRequest {
+            op: 10,
+            id: 1,
+            payload: "{}".into(),
+        }
+        .write(&mut bytes)
+        .await
+        .unwrap();
         let reply = read_reply(&mut bytes[1..].as_ref()).await.unwrap();
         assert_eq!(reply.op, 10);
-        assert!(DeviceRequest { op: 11, id: 1, payload: "{}".into() }.write(&mut vec![]).await.is_err());
-        bytes[2] = 12;
+        assert!(DeviceRequest {
+            op: 11,
+            id: 1,
+            payload: "{}".into()
+        }
+        .write(&mut vec![])
+        .await
+        .is_err());
+        bytes[2] = 16;
         assert!(read_reply(&mut bytes[1..].as_ref()).await.is_err());
     }
 

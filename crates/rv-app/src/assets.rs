@@ -2,7 +2,15 @@ use gpui::{AssetSource, Result, SharedString};
 use gpui_component::IconNamed;
 use std::borrow::Cow;
 
-const ICONS: [(&str, &[u8]); 5] = [
+const ICONS: [(&str, &[u8]); 7] = [
+    (
+        "rv-icons/home.svg",
+        include_bytes!("../../../assets/icons/home.svg"),
+    ),
+    (
+        "rv-icons/camera.svg",
+        include_bytes!("../../../assets/icons/camera.svg"),
+    ),
     (
         "rv-icons/lock-keyhole.svg",
         include_bytes!("../../../assets/icons/lock-keyhole.svg"),
@@ -48,6 +56,8 @@ impl AssetSource for Assets {
 }
 
 pub enum AppActionIcon {
+    Home,
+    Camera,
     Lock,
     Unlock,
     Restart,
@@ -58,6 +68,8 @@ pub enum AppActionIcon {
 impl IconNamed for AppActionIcon {
     fn path(self) -> SharedString {
         match self {
+            Self::Home => "rv-icons/home.svg",
+            Self::Camera => "rv-icons/camera.svg",
             Self::Lock => "rv-icons/lock-keyhole.svg",
             Self::Unlock => "rv-icons/lock-keyhole-open.svg",
             Self::Restart => "rv-icons/rotate-cw.svg",

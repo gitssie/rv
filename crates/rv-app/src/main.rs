@@ -2,8 +2,10 @@ mod actions;
 mod app;
 mod assets;
 mod file_transfer_window;
+mod photo_transfer;
 mod session_window;
 mod theme;
+mod work_assistant;
 
 use std::cell::RefCell;
 use std::rc::Rc;

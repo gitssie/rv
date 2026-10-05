@@ -305,25 +305,22 @@ impl SessionView {
             self.finish_unlock("", cx);
             return;
         }
-        match self.unlock.step {
-            Step::Preparing => {
-                if state.input_ready && state.input_empty {
-                    self.unlock.ready_samples += 1;
-                    if self.unlock.ready_samples >= 2 {
-                        self.unlock.step = Step::Arming;
-                        let digits = self.unlock.code.as_ref().unwrap().digits().len() as u8;
-                        self.handle
-                            .app(AppCommand::ArmUnlock(self.unlock.attempt, digits));
-                    }
-                } else {
-                    self.unlock.ready_samples = 0;
-                    if state.input_ready && !state.input_empty {
-                        self.finish_unlock("密码框已有输入，请先清空", cx);
-                        return;
-                    }
+        if self.unlock.step == Step::Preparing {
+            if state.input_ready && state.input_empty {
+                self.unlock.ready_samples += 1;
+                if self.unlock.ready_samples >= 2 {
+                    self.unlock.step = Step::Arming;
+                    let digits = self.unlock.code.as_ref().unwrap().digits().len() as u8;
+                    self.handle
+                        .app(AppCommand::ArmUnlock(self.unlock.attempt, digits));
+                }
+            } else {
+                self.unlock.ready_samples = 0;
+                if state.input_ready && !state.input_empty {
+                    self.finish_unlock("密码框已有输入，请先清空", cx);
+                    return;
                 }
             }
-            _ => {}
         }
         cx.notify();
     }
@@ -455,7 +452,7 @@ impl SessionView {
                     .hover(rgb(0x2a343f).into())
                     .active(rgb(0x35404e).into()),
             )
-            .w(px(32.))
+            .size(px(28.))
             .icon(Icon::new(icon))
             .loading(state == UnlockVisualState::Unlocking)
             .text_color(color)

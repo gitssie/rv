@@ -14,6 +14,7 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
+uuid.workspace = true
 rv-core.workspace = true
 rv-session.workspace = true
 directories.workspace = true
@@ -36,6 +37,7 @@ raw-window-handle = "0.6"
 
 [dev-dependencies]
 gpui = { git = "https://github.com/zed-industries/zed", features = ["test-support"] }
+gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit", "test-support"] }
 rv-session = { workspace = true, features = ["test-support"] }
 tempfile = "3"
 vnc.workspace = true

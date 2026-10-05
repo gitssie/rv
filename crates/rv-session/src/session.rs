@@ -21,7 +21,7 @@ use crate::compositor::{Apply, Framebuffer};
 use crate::encodings::encodings_for;
 use crate::file_transfer::{
     self, FileCommand, FileTransferClient, FileTransferSnapshot, PHOTO_PAGE_SIZE, PhotoAlbum,
-    PhotoEntry, TransferDirection, TransferRecord, TransferStatus,
+    PhotoEntry, PhotoFailure, TransferDirection, TransferRecord, TransferStatus,
 };
 use crate::vencrypt;
 
@@ -81,6 +81,7 @@ pub struct SessionHandle {
 pub struct SessionTestPeer {
     pub commands: tokio::sync::mpsc::UnboundedReceiver<SessionCommand>,
     pub events: mpsc::Sender<SessionEvent>,
+    pub file_state: Arc<Mutex<FileTransferSnapshot>>,
 }
 
 impl SessionHandle {
@@ -88,15 +89,20 @@ impl SessionHandle {
     pub fn test_pair() -> (Self, SessionTestPeer) {
         let (cmd_tx, commands) = tokio::sync::mpsc::unbounded_channel();
         let (events, event_rx) = mpsc::channel();
+        let file_state = Arc::new(Mutex::new(FileTransferSnapshot::default()));
         (
             Self {
                 framebuffer: Arc::new(Mutex::new(Framebuffer::default())),
                 cmd_tx,
                 event_rx: Mutex::new(event_rx),
-                file_state: Arc::new(Mutex::new(FileTransferSnapshot::default())),
+                file_state: file_state.clone(),
                 thread: None,
             },
-            SessionTestPeer { commands, events },
+            SessionTestPeer {
+                commands,
+                events,
+                file_state,
+            },
         )
     }
 
@@ -135,6 +141,7 @@ impl SessionHandle {
         FileTransferClient {
             state: self.file_state.clone(),
             commands: self.cmd_tx.clone(),
+            owner: None,
         }
     }
 
@@ -563,6 +570,9 @@ async fn apply_command(
         }
         SessionCommand::File(command) => {
             files.command(client, command).await;
+            file_transfer::update(&files.state, |state| {
+                state.pending_commands = state.pending_commands.saturating_sub(1)
+            });
             Ok(true)
         }
     }
@@ -772,6 +782,7 @@ impl FileRuntime {
         }
         file_transfer::update(&self.state, |state| {
             state.photo_busy = false;
+            state.photo_failure.get_or_insert(PhotoFailure::Unknown);
             state.photo_error = Some(message);
             state.photo_revision = state.photo_revision.wrapping_add(1);
         });
@@ -828,6 +839,9 @@ impl FileRuntime {
         file_transfer::update(&self.state, |state| {
             state.photo_busy = true;
             state.photo_error = None;
+            if op == 4 {
+                state.photo_failure = Some(PhotoFailure::Unknown);
+            }
             if op != 5
                 || !state.photo_status.as_deref().is_some_and(|status| {
                     status.starts_with("Imported into Photos") || status.starts_with("Deleted ")
@@ -959,6 +973,15 @@ impl FileRuntime {
             return;
         }
         if status == 1 {
+            if pending.op == 4 && message.starts_with("Photo import not committed: ") {
+                file_transfer::update(&self.state, |state| {
+                    state.photo_failure = Some(PhotoFailure::NotSubmitted)
+                });
+            } else if op == 7 && pending.op == 4 && message == "Photos job not found" {
+                file_transfer::update(&self.state, |state| {
+                    state.photo_failure = Some(PhotoFailure::TaskNotFound)
+                });
+            }
             self.photo_fail(message);
             return;
         }
@@ -1101,6 +1124,8 @@ impl FileRuntime {
                     state.photo_busy = refresh;
                     state.photos_need_refresh = true;
                     state.photo_status = Some(format!("Imported into Photos · {asset_id}"));
+                    state.photo_asset_id = Some(asset_id.to_owned());
+                    state.photo_failure = None;
                     state.photo_revision = state.photo_revision.wrapping_add(1);
                 });
                 if let Some(path) = restore_path {
@@ -1163,7 +1188,40 @@ impl FileRuntime {
 
     async fn command(&mut self, client: &vnc::VncClient, command: FileCommand) {
         let caps = self.state.lock().unwrap().caps.unwrap_or_default();
-        let refresh_after_import = !matches!(&command, FileCommand::UploadToPhotosQueued(_));
+        let task_id = match &command {
+            FileCommand::UploadToPhotosTask { task_id, .. }
+            | FileCommand::PhotoQueryTask(task_id) => Some(task_id.clone()),
+            _ => None,
+        };
+        if matches!(
+            &command,
+            FileCommand::UploadToPhotos(_)
+                | FileCommand::UploadToPhotosQueued(_)
+                | FileCommand::UploadToPhotosTask { .. }
+                | FileCommand::PhotoQueryTask(_)
+        ) {
+            file_transfer::update(&self.state, |state| {
+                state.photo_task_id = task_id.clone();
+                state.photo_asset_id = None;
+                state.photo_error = None;
+                state.photo_failure = Some(if matches!(&command, FileCommand::PhotoQueryTask(_)) {
+                    PhotoFailure::Unknown
+                } else {
+                    PhotoFailure::NotSubmitted
+                });
+            });
+        }
+        if task_id
+            .as_ref()
+            .is_some_and(|id| Uuid::parse_str(id).is_err())
+        {
+            self.photo_fail("Invalid photo task ID");
+            return;
+        }
+        let refresh_after_import = !matches!(
+            &command,
+            FileCommand::UploadToPhotosQueued(_) | FileCommand::UploadToPhotosTask { .. }
+        );
         match command {
             FileCommand::List(path) => {
                 if !caps.list || !valid_remote_path(&path) {
@@ -1469,7 +1527,49 @@ impl FileRuntime {
                 )
                 .await;
             }
-            FileCommand::UploadToPhotos(source) | FileCommand::UploadToPhotosQueued(source) => {
+            FileCommand::PhotoQueryTask(token) => {
+                if self.pending_photo.is_some()
+                    || self.active.is_some()
+                    || self.pending_upload.is_some()
+                {
+                    self.photo_fail("Wait for the current transfer to finish");
+                    return;
+                }
+                let id = self.next_management_id;
+                self.next_management_id = self.next_management_id.wrapping_add(1);
+                file_transfer::update(&self.state, |state| {
+                    state.photo_busy = true;
+                    state.photo_error = None;
+                    state.photo_asset_id = None;
+                    state.photo_task_id = Some(token.clone());
+                    state.photo_status = Some("Checking photo import result…".into());
+                });
+                self.pending_photo = Some(PendingPhoto {
+                    id,
+                    op: 4,
+                    token: Some(token.clone()),
+                    poll_due: Instant::now(),
+                    poll_delay: PHOTO_POLL_MIN,
+                    action: PhotoAction::Import {
+                        restore_path: None,
+                        refresh: false,
+                    },
+                });
+                if let Err(e) = client
+                    .input(X11Event::TightFile(TightFileCommand::Manage {
+                        op: 7,
+                        id,
+                        path: token,
+                        destination: None,
+                    }))
+                    .await
+                {
+                    self.photo_fail(e.to_string());
+                }
+            }
+            FileCommand::UploadToPhotos(source)
+            | FileCommand::UploadToPhotosQueued(source)
+            | FileCommand::UploadToPhotosTask { source, .. } => {
                 if !self.allow_upload || !self.state.lock().unwrap().can_photos {
                     self.photo_fail("Uploading to Photos is unavailable");
                     return;
@@ -1548,11 +1648,7 @@ impl FileRuntime {
                     .iter()
                     .map(|byte| format!("{byte:02x}"))
                     .collect::<String>();
-                let remote = format!(
-                    "/Media/DCIM/.MISC/Incoming/rv-upload-{}--{}",
-                    Uuid::new_v4(),
-                    original_name
-                );
+                let remote = photo_staging_path(task_id.as_deref(), original_name);
                 let restore_path = self.state.lock().unwrap().remote_path.clone();
                 self.pending_photo_upload = Some(PendingPhotoUpload {
                     refresh: refresh_after_import,
@@ -1564,6 +1660,8 @@ impl FileRuntime {
                     state.photo_busy = true;
                     state.photo_error = None;
                     state.photo_status = Some("Uploading to Photos…".into());
+                    state.photo_asset_id = None;
+                    state.photo_task_id = task_id;
                 });
                 self.followup
                     .push_back(FileCommand::List("/Media/DCIM/.MISC/Incoming".into()));
@@ -2257,6 +2355,18 @@ impl FileRuntime {
     }
 }
 
+/// A resumed UUID may leave a partial staging file from its previous attempt.
+/// Isolate each upload attempt while retaining the first UUID as the PhotoKit task.
+fn photo_staging_path(task_id: Option<&str>, name: &str) -> String {
+    let identity = task_id
+        .map(|id| {
+            let nonce = Uuid::new_v4().simple().to_string();
+            format!("{id}-{}", &nonce[..16])
+        })
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    format!("/Media/DCIM/.MISC/Incoming/rv-upload-{identity}--{name}")
+}
+
 impl Drop for FileRuntime {
     fn drop(&mut self) {
         self.stop(TransferStatus::Failed("Connection closed".into()));
@@ -2553,6 +2663,90 @@ mod transport_tests {
         );
     }
 
+    #[test]
+    fn submitted_import_failures_stay_unknown_and_missing_tasks_are_explicit() {
+        for message in [
+            "Imported photo could not be verified",
+            "Photos rejected the image",
+            "Photo import not committed: Photos rejected the image",
+            "Photos job not found",
+        ] {
+            let state = Arc::new(Mutex::new(FileTransferSnapshot {
+                photo_task_id: Some("task".into()),
+                photo_failure: Some(PhotoFailure::Unknown),
+                ..Default::default()
+            }));
+            let mut runtime = FileRuntime::new(state.clone(), true);
+            runtime.pending_photo = Some(PendingPhoto {
+                id: 1,
+                op: 4,
+                token: Some("task".into()),
+                poll_due: Instant::now(),
+                poll_delay: PHOTO_POLL_MIN,
+                action: PhotoAction::Import {
+                    restore_path: None,
+                    refresh: false,
+                },
+            });
+            runtime.photo_result(7, 1, 1, message.into());
+            let s = state.lock().unwrap();
+            assert_eq!(s.photo_task_id.as_deref(), Some("task"));
+            assert_eq!(
+                s.photo_failure,
+                Some(if message == "Photos job not found" {
+                    PhotoFailure::TaskNotFound
+                } else if message.starts_with("Photo import not committed: ") {
+                    PhotoFailure::NotSubmitted
+                } else {
+                    PhotoFailure::Unknown
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn resumed_import_isolates_staging_file_without_changing_task_uuid() {
+        let id = Uuid::new_v4().to_string();
+        let name = "x".repeat(180);
+        let old = format!("/Media/DCIM/.MISC/Incoming/rv-upload-{id}--{name}");
+        let first = photo_staging_path(Some(&id), &name);
+        let next = photo_staging_path(Some(&id), &name);
+        assert_ne!(first, old);
+        assert_ne!(first, next);
+        let basename = next.rsplit('/').next().unwrap();
+        assert_eq!(&basename[10..46], id);
+        assert_eq!(basename.split_once("--").unwrap().1, name);
+        assert!(basename.len() <= 255);
+    }
+    #[test]
+    fn committed_import_is_complete_even_when_fetch_verification_is_delayed() {
+        let state = Arc::new(Mutex::new(FileTransferSnapshot {
+            photo_failure: Some(PhotoFailure::Unknown),
+            ..Default::default()
+        }));
+        let mut runtime = FileRuntime::new(state.clone(), true);
+        runtime.pending_photo = Some(PendingPhoto {
+            id: 1,
+            op: 4,
+            token: Some("task".into()),
+            poll_due: Instant::now(),
+            poll_delay: PHOTO_POLL_MIN,
+            action: PhotoAction::Import {
+                restore_path: None,
+                refresh: false,
+            },
+        });
+        runtime.photo_result(
+            7,
+            1,
+            0,
+            r#"{"assetId":"committed","verified":false}"#.into(),
+        );
+        let s = state.lock().unwrap();
+        assert_eq!(s.photo_asset_id.as_deref(), Some("committed"));
+        assert!(s.photo_failure.is_none());
+        assert!(s.photo_error.is_none());
+    }
     #[test]
     fn photo_job_polling_backs_off_without_delaying_short_jobs() {
         let state = Arc::new(Mutex::new(FileTransferSnapshot::default()));

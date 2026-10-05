@@ -28,7 +28,7 @@ All frames use a 12-byte header followed by UTF-8 JSON:
 | 1 | 1 | Version: 1 |
 | 2 | 1 | Operation |
 | 3 | 1 | Status: request 0; reply 0 success / 1 error |
-| 4 | 4 | Request ID, big endian; zero for capabilities and passive lock events, nonzero for commands |
+| 4 | 4 | Request ID, big endian; zero for capabilities, passive lock events and notification pushes, nonzero for commands |
 | 8 | 4 | JSON byte length, big endian |
 
 Requests are at most 4 KiB, replies at most 1 MiB. Invalid header lengths are
@@ -172,3 +172,33 @@ Password readiness, six keyboard digits, confirmation polling, and timeouts rema
 in RV's existing request flow. The passive event cannot arm input or complete an
 attempt by itself. The simulation sends operation 11 at negotiation and on lock/
 unlock changes. Physical iOS notification delivery still needs device validation.
+
+## Home and phone notifications
+
+Capability `home` enables operation 12 (`{}` → `{"ok":true}`). It sends one Home HID press, requires control permission, and refuses locked or unconfirmed lock state. It does not unlock the device.
+
+Capability `notifications` enables the following read-only operations:
+
+| Operation | Request | Reply |
+| --- | --- | --- |
+| 13 subscribe | `{"enabled":true}` or `false` | `{"ok":true}` |
+| 14 snapshot | `{}` | notification snapshot |
+| 15 push | server only, ID 0, status 0 | notification snapshot |
+
+A snapshot has `revision` (epoch UUID plus counter) and `notifications` (newest first). Each item has `id`, `source` (Bundle ID/section ID), `title`, `subtitle`, `message`, and Unix-seconds `timestamp`. RV rejects more than 100 items, duplicate IDs, malformed snapshots and oversized fields. Limits in UTF-8 bytes: ID 512, source 255, title/subtitle 1024, message 4096, revision 128. No capability means no requests; no subscription means no pushes, preserving compatibility with older clients.
+
+RV subscribes automatically on connection. The bell opens a 320px panel with unread indicator, manual refresh and automatic-update toggle. A refresh fetches the adapter's received cache; it does not scrape Notification Center or retrieve notifications from before capture started. Pausing disables forwarding to that session; SpringBoard continues its bounded local capture. The latest 100 received notifications are retained in memory, without persistence, removal tracking, images or action buttons. Redacted/empty bulletin content stays as provided by iOS.
+
+The new RootHide `notification-adapter` loads only in SpringBoard and observes BBServer `publishBulletin:destinations:` after the original call. It validates the method signature before hooking and queues immutable captured data. No network operation runs on the publication callback. A protected mobile-owned 0700 cache directory contains a 0600 Unix socket (`/var/mobile/Library/Caches/com.82flex.trollvnc.notifications/relay.sock`, using the `/rootfs` view when available). The adapter accepts only root/mobile peers. The server verifies the socket peer is mobile's SpringBoard process, reads at most 768 KiB and checks revision once per second while clients subscribe. It forwards changed snapshots through the existing authenticated RFB connection; there is no separate public listener.
+
+The RootHide package includes this adapter beside the existing touch adapter. Simulator and app-only THEBOOTSTRAP builds do not include it and report notifications unavailable. Runtime support depends on SpringBoard hook availability and local peer verification. Actual app/system bulletin coverage on each supported iOS version still requires a real device; system dialogs that do not publish BBServer bulletins are outside this path.
+
+## Compact session controls
+
+The toolbar uses 28px controls, app shortcuts, a single Home action, a PNG screenshot menu, lock and notification controls. Screenshots copy/save the remote framebuffer, excluding local panels and toolbar. After a successfully established connection, transient transport failures retry at 3/5/10/20/30-second delays (30-second cap), with immediate retry and stop controls. Initial failures, authentication/TLS/protocol errors and deliberate disconnects do not retry. Reconnection never replays Home, unlock or App mutation commands.
+
+## Assistant clipboard and durable photo tasks
+
+Capability `clipboard_write` enables operation 16 with `{ "token": "UUID", "text": "UTF-8 text" }`, returning `{ "ok": true, "token": "same UUID" }`. The usual 4 KiB JSON request bound applies. Client and server read-only modes reject writes. The server dispatches UIPasteboard work to the main queue and confirms readback; timeout means unknown, never an automatic replay.
+
+Capability `photo_tasks` enables persisted idempotent PhotoKit import receipts. RV uploads under `rv-upload-{UUID}-{16-hex-attempt-nonce}--{filename}`; the server also accepts legacy `rv-upload-{UUID}--{filename}` names. The nonce isolates staging files without changing task identity. RV reuses the existing File Management import and task-query operations. Before importing, the server persists the UUID and checksum; repeated UUID/checksum requests return the existing task. Changed checksums are rejected. An unfinished receipt after restart is unknown and cannot initiate another import. A missing task requires user confirmation that the asset was not imported before resuming under the original UUID. A query that could not be sent keeps the import unknown. A definite failure before commitment is prefixed `Photo import not committed: `; other post-submission failures stay unknown. A successful commit carrying an asset ID is complete even if immediate fetch verification returns `verified: false`. See [implementation and limitations](work-assistant-implementation.md).

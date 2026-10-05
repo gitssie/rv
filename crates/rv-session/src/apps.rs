@@ -19,6 +19,10 @@ pub struct AppCapabilities {
     pub control: bool,
     pub unlock: bool,
     pub lock: bool,
+    pub home: bool,
+    pub notifications: bool,
+    pub clipboard_write: bool,
+    pub photo_tasks: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -41,6 +45,10 @@ pub enum AppCommand {
     PrepareUnlock(u32),
     ArmUnlock(u32, u8),
     LockScreen(u32),
+    Home,
+    SubscribeNotifications(bool),
+    Notifications,
+    WriteClipboard { token: String, text: String },
 }
 
 impl AppCommand {
@@ -71,6 +79,10 @@ impl AppCommand {
             Self::PrepareUnlock(_) => 8,
             Self::ArmUnlock(_, _) => 9,
             Self::LockScreen(_) => 10,
+            Self::Home => 12,
+            Self::SubscribeNotifications(_) => 13,
+            Self::Notifications => 14,
+            Self::WriteClipboard { .. } => 16,
         }
     }
     fn mutates(&self) -> bool {
@@ -82,6 +94,8 @@ impl AppCommand {
                 | Self::PrepareUnlock(_)
                 | Self::ArmUnlock(_, _)
                 | Self::LockScreen(_)
+                | Self::Home
+                | Self::WriteClipboard { .. }
         )
     }
 }
@@ -90,6 +104,7 @@ impl AppCommand {
 pub enum AppEvent {
     Capabilities(AppCapabilities),
     LockState(bool),
+    Notifications(crate::NotificationSnapshot),
     ScreenState(u32, ScreenState),
     UnlockArmed(u32, bool),
     List(Vec<RemoteApp>),
@@ -146,6 +161,11 @@ impl AppRuntime {
     fn supported(&self, cmd: &AppCommand) -> bool {
         (!cmd.mutates() || (self.allowed && self.caps.control))
             && match cmd {
+                AppCommand::Home => self.caps.home,
+                AppCommand::WriteClipboard { .. } => self.caps.clipboard_write,
+                AppCommand::SubscribeNotifications(_) | AppCommand::Notifications => {
+                    self.caps.notifications
+                }
                 AppCommand::List => self.caps.list,
                 AppCommand::Launch(_) => self.caps.launch,
                 AppCommand::Terminate(_) => self.caps.terminate,
@@ -158,12 +178,27 @@ impl AppRuntime {
             }
     }
     pub fn command(&mut self, command: AppCommand, send: &impl Fn(AppEvent)) {
+        if let AppCommand::WriteClipboard { token, text } = &command
+            && (token.len() != 36
+                || uuid::Uuid::parse_str(token).is_err()
+                || json!({"token":token,"text":text}).to_string().len() > 4096)
+        {
+            send(AppEvent::Failed {
+                command,
+                message: "剪贴板文本过长（请求最多 4 KiB）".into(),
+            });
+            return;
+        }
         if !self.supported(&command) || command.bundle_id().is_some_and(|id| !valid_bundle_id(id)) {
             send(AppEvent::Failed {
                 command,
                 message: "This App operation is unavailable on this connection".into(),
             });
             return;
+        }
+        if matches!(command, AppCommand::SubscribeNotifications(_)) {
+            self.queue
+                .retain(|queued| !matches!(queued, AppCommand::SubscribeNotifications(_)));
         }
         if self.queue.contains(&command) || self.pending.values().any(|(cmd, _)| cmd == &command) {
             return;
@@ -229,6 +264,15 @@ impl AppRuntime {
         let Some(command) = self.queue.pop_front() else {
             return;
         };
+        if matches!(command, AppCommand::SubscribeNotifications(_))
+            && self
+                .pending
+                .values()
+                .any(|(cmd, _)| matches!(cmd, AppCommand::SubscribeNotifications(_)))
+        {
+            self.queue.push_front(command);
+            return;
+        }
         // A single device has one foreground app. Serialize user mutations across requests.
         if command.mutates() && self.pending.values().any(|(cmd, _)| cmd.mutates()) {
             self.queue.push_front(command);
@@ -236,6 +280,8 @@ impl AppRuntime {
         }
         self.sequence = self.sequence.wrapping_add(1).max(1);
         let payload = match &command {
+            AppCommand::WriteClipboard { token, text } => json!({"token":token,"text":text}),
+            AppCommand::SubscribeNotifications(enabled) => json!({"enabled":enabled}),
             AppCommand::ArmUnlock(_, digits) => json!({"digits":digits}),
             _ => command
                 .bundle_id()
@@ -261,13 +307,24 @@ impl AppRuntime {
         }
     }
     pub fn reply(&mut self, reply: DeviceReply, send: &impl Fn(AppEvent)) {
+        if reply.op == 15 {
+            if self.caps.notifications
+                && reply.id == 0
+                && reply.status == 0
+                && let Ok(value) = serde_json::from_str::<Value>(&reply.payload)
+                && let Ok(snapshot) = crate::NotificationSnapshot::parse(value)
+            {
+                send(AppEvent::Notifications(snapshot));
+            }
+            return;
+        }
         if reply.op == 11 {
-            if reply.id == 0 && reply.status == 0 {
-                if let Ok(value) = serde_json::from_str::<Value>(&reply.payload) {
-                    if let Some(locked) = value["locked"].as_bool() {
-                        send(AppEvent::LockState(locked));
-                    }
-                }
+            if reply.id == 0
+                && reply.status == 0
+                && let Ok(value) = serde_json::from_str::<Value>(&reply.payload)
+                && let Some(locked) = value["locked"].as_bool()
+            {
+                send(AppEvent::LockState(locked));
             }
             return;
         }
@@ -311,6 +368,25 @@ impl AppRuntime {
         }
         let result: Result<(), String> = (|| {
             match &command {
+                AppCommand::WriteClipboard { token, .. } => {
+                    if value["token"].as_str() != Some(token.as_str())
+                        || value["ok"].as_bool() != Some(true)
+                    {
+                        return Err("Invalid clipboard acknowledgement".into());
+                    }
+                    send(AppEvent::Finished(command.clone()));
+                }
+                AppCommand::Notifications => {
+                    send(AppEvent::Notifications(crate::NotificationSnapshot::parse(
+                        value.clone(),
+                    )?));
+                }
+                AppCommand::Home | AppCommand::SubscribeNotifications(_) => {
+                    if value["ok"].as_bool() != Some(true) {
+                        return Err("Device request was not accepted".into());
+                    }
+                    send(AppEvent::Finished(command.clone()));
+                }
                 AppCommand::ScreenState(_)
                 | AppCommand::PrepareUnlock(_)
                 | AppCommand::LockScreen(_) => {
@@ -412,6 +488,59 @@ impl AppRuntime {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+    #[test]
+    fn notification_subscription_keeps_latest_intent_and_allows_read_only() {
+        let mut runtime = AppRuntime::new(false);
+        runtime.caps.notifications = true;
+        runtime.pending.insert(
+            1,
+            (AppCommand::SubscribeNotifications(true), Instant::now()),
+        );
+        runtime.command(AppCommand::SubscribeNotifications(false), &|_| {});
+        assert_eq!(
+            runtime.queue.front(),
+            Some(&AppCommand::SubscribeNotifications(false))
+        );
+        runtime.command(AppCommand::SubscribeNotifications(true), &|_| {});
+        assert!(runtime.queue.is_empty());
+        runtime.command(AppCommand::Notifications, &|_| {});
+        assert_eq!(runtime.queue.front(), Some(&AppCommand::Notifications));
+        runtime.caps.home = true;
+        runtime.caps.control = true;
+        assert!(!runtime.supported(&AppCommand::Home));
+        assert_eq!(AppCommand::Home.op(), 12);
+        assert_eq!(AppCommand::SubscribeNotifications(true).op(), 13);
+        assert_eq!(AppCommand::Notifications.op(), 14);
+    }
+
+    #[test]
+    fn notification_push_requires_capability_and_preserves_pending_requests() {
+        let events = RefCell::new(vec![]);
+        let send = |event| events.borrow_mut().push(event);
+        let mut runtime = AppRuntime::new(true);
+        runtime
+            .pending
+            .insert(9, (AppCommand::List, Instant::now()));
+        let reply = || DeviceReply {
+            op: 15,
+            id: 0,
+            status: 0,
+            payload: json!({"revision":"epoch:1", "notifications":[]}).to_string(),
+        };
+        runtime.reply(reply(), &send);
+        assert!(events.borrow().is_empty());
+        runtime.caps.notifications = true;
+        runtime.reply(reply(), &send);
+        assert!(
+            matches!(&events.borrow()[0], AppEvent::Notifications(snapshot) if snapshot.revision == "epoch:1")
+        );
+        assert!(runtime.pending.contains_key(&9));
+        let mut malformed = reply();
+        malformed.payload = "{}".into();
+        runtime.reply(malformed, &send);
+        assert_eq!(events.borrow().len(), 1);
+    }
+
     #[test]
     fn unsolicited_lock_push_does_not_consume_pending_requests_or_start_input() {
         let events = RefCell::new(vec![]);
@@ -605,5 +734,72 @@ mod tests {
         );
         runtime.reply(reply(2), &send);
         assert!(matches!(&events.borrow()[0], AppEvent::Failed { .. }));
+    }
+    #[test]
+    fn clipboard_requires_capability_control_size_and_matching_ack() {
+        let events = RefCell::new(vec![]);
+        let send = |e| events.borrow_mut().push(e);
+        let command = AppCommand::WriteClipboard {
+            token: uuid::Uuid::new_v4().to_string(),
+            text: "中文商品".into(),
+        };
+        let mut runtime = AppRuntime::new(true);
+        runtime.command(command.clone(), &send);
+        assert!(runtime.queue.is_empty());
+        runtime.caps = AppCapabilities {
+            control: true,
+            clipboard_write: true,
+            ..Default::default()
+        };
+        runtime.command(command.clone(), &send);
+        assert_eq!(runtime.queue.len(), 1);
+        runtime.queue.clear();
+        runtime
+            .pending
+            .insert(80, (command.clone(), Instant::now()));
+        runtime.reply(
+            DeviceReply {
+                op: 16,
+                id: 80,
+                status: 0,
+                payload: r#"{"ok":true,"token":"wrong"}"#.into(),
+            },
+            &send,
+        );
+        assert!(matches!(
+            events.borrow().last(),
+            Some(AppEvent::Failed { .. })
+        ));
+        let AppCommand::WriteClipboard { token, .. } = &command else {
+            unreachable!()
+        };
+        runtime
+            .pending
+            .insert(81, (command.clone(), Instant::now()));
+        runtime.reply(
+            DeviceReply {
+                op: 16,
+                id: 81,
+                status: 0,
+                payload: json!({"ok":true,"token":token}).to_string(),
+            },
+            &send,
+        );
+        assert!(matches!(
+            events.borrow().last(),
+            Some(AppEvent::Finished(_))
+        ));
+        runtime.command(
+            AppCommand::WriteClipboard {
+                token: token.clone(),
+                text: "中".repeat(2000),
+            },
+            &send,
+        );
+        assert!(runtime.queue.is_empty());
+        let mut readonly = AppRuntime::new(false);
+        readonly.caps = runtime.caps.clone();
+        readonly.command(command, &send);
+        assert!(readonly.queue.is_empty());
     }
 }

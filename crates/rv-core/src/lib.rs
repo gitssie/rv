@@ -1,6 +1,7 @@
 //! Shared models for the RV VNC viewer.
 
 mod app_shortcuts;
+pub mod assistant;
 mod connection;
 pub use app_shortcuts::{AppShortcut, default_app_shortcuts, move_app_shortcut};
 mod keyboard;

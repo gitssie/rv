@@ -552,7 +552,7 @@ fn offscreen_paste_keeps_plain_vnc_and_mac_shortcuts(cx: &mut TestAppContext) {
             .collect();
         assert_eq!(keys.len(), 4, "{shortcut}");
         assert_eq!(keys[0], (modifier, true), "{shortcut}");
-        assert_eq!(keys[1].1, true);
+        assert!(keys[1].1);
         assert_eq!(keys[2], (keys[1].0, false));
         assert_eq!(keys[3], (modifier, false));
         view.read_with(cx, |view, _| assert!(!view.command_paste_pressed));
@@ -588,5 +588,81 @@ fn offscreen_latin1_clipboard_rejects_chinese_text(cx: &mut TestAppContext) {
             view.status.as_ref(),
             "Clipboard not sent: text is not valid Latin-1"
         )
+    });
+}
+
+#[gpui::test]
+fn offscreen_notification_panel_keeps_keyboard_local(cx: &mut TestAppContext) {
+    let (view, cx, mut peer) = setup(cx, false);
+    commands(&mut peer);
+    view.update(cx, |view, cx| {
+        view.notifications.open = true;
+        cx.notify();
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.simulate_keystrokes("ctrl-a");
+    cx.simulate_event(gpui::KeyUpEvent {
+        keystroke: gpui::Keystroke::parse("a").unwrap(),
+    });
+    assert!(commands(&mut peer).is_empty());
+    cx.simulate_keystrokes("escape");
+    view.read_with(cx, |view, _| assert!(!view.notifications.open));
+}
+
+#[gpui::test]
+fn assistant_uses_fit_for_both_picture_and_pointer_then_restores_actual(cx: &mut TestAppContext) {
+    let (view, cx, _) = setup(cx, false);
+    view.update(cx, |v, cx| {
+        v.scale = ScaleMode::Actual;
+        v.assistant_open = true;
+        cx.notify();
+    });
+    cx.update(|w, cx| w.draw(cx).clear(cx));
+    let bounds = picture(&view, cx);
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.effective_scale(), ScaleMode::Fit);
+        assert_eq!(v.map_pointer(bounds.center()), Some((400, 200)));
+    });
+    view.update(cx, |v, _| v.assistant_open = false);
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.effective_scale(), ScaleMode::Actual)
+    });
+}
+
+#[gpui::test]
+fn assistant_opens_with_notifications_received_before_it_existed(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let (view, cx, peer) = setup(cx, false);
+    let snapshot = rv_session::NotificationSnapshot {
+        revision: "cached-1".into(),
+        notifications: vec![rv_session::PhoneNotification {
+            id: "n1".into(),
+            source: "vinted".into(),
+            title: "Message".into(),
+            subtitle: String::new(),
+            message: "Hello".into(),
+            timestamp: 1,
+        }],
+    };
+    peer.events
+        .send(SessionEvent::Apps(rv_session::AppEvent::Notifications(
+            snapshot.clone(),
+        )))
+        .unwrap();
+    cx.update(|w, cx| {
+        view.update(cx, |v, cx| {
+            v.pump(cx);
+            assert!(v.assistant.is_none());
+            v.thumb_path = Some(dir.path().join("thumbs/fixture.png"));
+            v.toggle_assistant(w, cx);
+            assert_eq!(
+                v.assistant
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .notification_snapshot(),
+                Some(&snapshot)
+            );
+        })
     });
 }

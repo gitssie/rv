@@ -102,6 +102,12 @@ fn password_error(message: &str) -> bool {
 }
 
 pub struct SessionView {
+    assistant: Option<Entity<crate::work_assistant::WorkAssistant>>,
+    assistant_open: bool,
+    assistant_subscription: Option<Subscription>,
+    assistant_batch: Option<crate::photo_transfer::PhotoBatch>,
+    assistant_clipboard: Option<String>,
+    assistant_progress: String,
     req: ConnectRequest,
     handle: SessionHandle,
     title: SharedString,
@@ -134,6 +140,9 @@ pub struct SessionView {
     _password_subscription: Subscription,
     apps: apps_ui::AppToolbar,
     unlock: unlock_ui::UnlockUI,
+    notifications: controls_ui::NotificationsUI,
+    recovery: reconnect::Recovery,
+    screenshot_busy: bool,
     /// Where the remote picture was last painted, in window pixels. Filled
     /// in by a probe element so pointer mapping never guesses chrome sizes.
     image_box: Rc<Cell<Bounds<Pixels>>>,
@@ -218,8 +227,17 @@ impl SessionView {
         let apps = apps_ui::AppToolbar::new(app_shortcuts, window, cx);
         let unlock = unlock_ui::UnlockUI::new(window, cx);
         Self {
+            assistant: None,
+            assistant_open: false,
+            assistant_subscription: None,
+            assistant_batch: None,
+            assistant_clipboard: None,
+            assistant_progress: String::new(),
             apps,
             unlock,
+            notifications: controls_ui::NotificationsUI::default(),
+            recovery: reconnect::Recovery::default(),
+            screenshot_busy: false,
             req,
             handle,
             title: title.into(),
@@ -383,6 +401,7 @@ impl SessionView {
                     self.fb_w = width;
                     self.fb_h = height;
                     self.phase = Phase::Connected;
+                    self.recovery.connected();
                     self.status = format!("{width}×{height}").into();
                     self.error = None;
                     if self.retried_password {
@@ -418,7 +437,18 @@ impl SessionView {
                     self.status = e.into();
                 }
                 SessionEvent::Disconnected => {
+                    let deliberate = self.phase == Phase::Disconnecting;
+                    if !deliberate {
+                        self.recovery
+                            .schedule(self.error.as_deref(), std::time::Instant::now());
+                    }
                     self.unlock.disconnected();
+                    self.assistant_clipboard = None;
+                    self.assistant_batch = None;
+                    self.assistant_feedback(
+                        "手机已断线，草稿仍保存在本地；待确认导入不会自动重试".into(),
+                        cx,
+                    );
                     self.local_cursor.set_hidden(false);
                     if self.error.is_none() {
                         self.status = "Disconnected".into();
@@ -431,7 +461,18 @@ impl SessionView {
                 }
             }
         }
+        if self.phase == Phase::Ended && self.recovery.deadline.is_some() {
+            changed = true;
+            if self
+                .recovery
+                .deadline
+                .is_some_and(|deadline| deadline <= std::time::Instant::now())
+            {
+                self.start_reconnect(cx);
+            }
+        }
         self.tick_unlock(cx);
+        self.sync_assistant(cx);
         let file_revision = self.handle.file_client().revision();
         if file_revision != self.last_file_revision {
             self.last_file_revision = file_revision;
@@ -510,6 +551,13 @@ impl SessionView {
         }
     }
 
+    fn effective_scale(&self) -> ScaleMode {
+        if self.assistant_open {
+            ScaleMode::Fit
+        } else {
+            self.scale
+        }
+    }
     fn map_pointer(&self, position: Point<Pixels>) -> Option<(u16, u16)> {
         let bounds = self.image_box.get();
         let box_w = f32::from(bounds.size.width);
@@ -517,7 +565,13 @@ impl SessionView {
         let local_x = f32::from(position.x - bounds.origin.x);
         let local_y = f32::from(position.y - bounds.origin.y);
         map_to_fb(
-            local_x, local_y, box_w, box_h, self.fb_w, self.fb_h, self.scale,
+            local_x,
+            local_y,
+            box_w,
+            box_h,
+            self.fb_w,
+            self.fb_h,
+            self.effective_scale(),
         )
     }
 
@@ -624,6 +678,7 @@ impl SessionView {
     }
 
     fn disconnect(&mut self, cx: &mut Context<Self>) {
+        self.recovery.stop();
         if matches!(self.phase, Phase::Disconnecting | Phase::Ended) {
             return;
         }
@@ -641,6 +696,19 @@ impl SessionView {
         self.apps.disconnected(cx);
         self.local_cursor.set_hidden(false);
         self.focus.focus(window, cx);
+        self.recovery.stopped = false;
+        self.recovery.attempt = 0;
+        self.start_reconnect(cx);
+    }
+
+    fn start_reconnect(&mut self, cx: &mut Context<Self>) {
+        self.recovery.deadline = None;
+        self.apps.disconnected(cx);
+        self.unlock.disconnected();
+        self.notifications.error = None;
+        if let Some(handle) = self.file_transfer_window.take() {
+            let _ = handle.update(cx, |_, window, _| window.remove_window());
+        }
         self.handle = SessionHandle::spawn(self.req.clone());
         self.phase = Phase::Connecting;
         self.error = None;
@@ -649,9 +717,7 @@ impl SessionView {
         self.last_generation = 0;
         self.keys = Keyboard::new();
         self.command_paste_pressed = false;
-        if let Some(old) = self.render_image.take() {
-            cx.drop_image(old, None);
-        }
+        // Preserve the frozen frame until the new connection produces a frame.
         cx.notify();
     }
 
@@ -683,8 +749,17 @@ impl SessionView {
     }
 
     fn handle_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.notifications.open {
+            if event.keystroke.key == "escape" {
+                self.notifications.open = false;
+                cx.notify();
+            }
+            self.consume_key(window, cx);
+            return;
+        }
         if self.phase != Phase::Connected
             || self.unlock.blocks_input()
+            || self.notifications.open
             || !self.focus.is_focused(window)
         {
             return;
@@ -753,6 +828,7 @@ impl SessionView {
     fn handle_key_up(&mut self, event: &KeyUpEvent, window: &mut Window, cx: &mut Context<Self>) {
         if self.phase != Phase::Connected
             || self.unlock.blocks_input()
+            || self.notifications.open
             || !self.focus.is_focused(window)
         {
             return;
@@ -782,6 +858,7 @@ impl SessionView {
     fn handle_modifiers(&mut self, event: &ModifiersChangedEvent, window: &Window) {
         if self.phase != Phase::Connected
             || self.unlock.blocks_input()
+            || self.notifications.open
             || !self.focus.is_focused(window)
         {
             return;
@@ -801,7 +878,7 @@ impl SessionView {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let live = self.phase == Phase::Connected && !self.view_only();
-        let compact = width < px(1000.);
+        let compact = width < px(1120.);
         h_flex()
             .h(theme::toolbar_height())
             .w_full()
@@ -848,7 +925,13 @@ impl SessionView {
                     .ghost()
                     .text_color(theme::toolbar_fg())
                     .icon(IconName::ResizeCorner)
-                    .label(self.scale.label())
+                    .small()
+                    .h(px(28.))
+                    .label(match self.scale {
+                        ScaleMode::Actual => "100%",
+                        ScaleMode::Fit => "Fit",
+                        ScaleMode::Stretch => "Stretch",
+                    })
                     .tooltip("Scaling: click to cycle")
                     .on_click(cx.listener(|this, _, _, cx| {
                         let next = this.scale.cycle();
@@ -923,6 +1006,7 @@ impl SessionView {
             .child(
                 Button::new("quick-upload")
                     .ghost()
+                    .size(px(28.))
                     .icon(IconName::ArrowUp)
                     .text_color(theme::toolbar_muted())
                     .tooltip("Upload one file to the current remote folder")
@@ -935,9 +1019,25 @@ impl SessionView {
                     )
                     .on_click(cx.listener(|this, _, _, cx| this.quick_upload(cx))),
             )
-            .child(self.render_app_toolbar(cx))
+            .child(toolbar_sep())
+            .child(self.render_home(cx))
+            .child(self.render_screenshot(cx))
             .child(self.render_unlock_button(cx))
+            .child(self.render_app_toolbar(cx))
+            .child(self.render_notification_button(cx))
             .child(div().flex_1())
+            .child(
+                Button::new("work-assistant-toggle")
+                    .debug_selector(|| "work-assistant-toggle".into())
+                    .ghost()
+                    .small()
+                    .h(px(28.))
+                    .icon(IconName::PanelRight)
+                    .label("助手")
+                    .when(self.assistant_open, |b| b.bg(rgb(0x2a3a50)))
+                    .text_color(theme::toolbar_fg())
+                    .on_click(cx.listener(|this, _, window, cx| this.toggle_assistant(window, cx))),
+            )
             .child(
                 div()
                     .text_xs()
@@ -949,11 +1049,13 @@ impl SessionView {
             .child(
                 Button::new("info")
                     .ghost()
+                    .size(px(28.))
                     .text_color(theme::toolbar_fg())
                     .icon(IconName::Info)
                     .selected(self.info_open)
                     .tooltip("Connection info")
                     .on_click(cx.listener(|this, _, _, cx| {
+                        this.notifications.open = false;
                         this.info_open = !this.info_open;
                         cx.notify();
                     })),
@@ -965,6 +1067,7 @@ impl SessionView {
                     .child(
                         Button::new("disc")
                             .ghost()
+                            .size(px(28.))
                             .icon(IconName::WindowClose)
                             .text_color(theme::danger(cx))
                             .tooltip("Disconnect")
@@ -1157,6 +1260,7 @@ impl SessionView {
                         },
                         cx.listener(|this, _, _, cx| {
                             this.show_menu = false;
+                            this.notifications.open = false;
                             this.info_open = !this.info_open;
                             cx.notify();
                         }),
@@ -1447,17 +1551,22 @@ impl SessionView {
             .absolute()
             .inset_0()
         };
-        match self.scale {
+        match self.effective_scale() {
             ScaleMode::Fit | ScaleMode::Stretch => div()
                 .relative()
                 .size_full()
-                .child(img(image).id("fb").size_full().object_fit(
-                    if self.scale == ScaleMode::Fit {
-                        ObjectFit::Contain
-                    } else {
-                        ObjectFit::Fill
-                    },
-                ))
+                .child(
+                    img(image)
+                        .id("fb")
+                        .absolute()
+                        .inset_0()
+                        .size_full()
+                        .object_fit(if self.effective_scale() == ScaleMode::Fit {
+                            ObjectFit::Contain
+                        } else {
+                            ObjectFit::Fill
+                        }),
+                )
                 .child(probe)
                 .into_any_element(),
             ScaleMode::Actual => div()
@@ -1478,7 +1587,14 @@ impl SessionView {
                                 .flex_shrink_0()
                                 .w(px(f32::from(self.fb_w)))
                                 .h(px(f32::from(self.fb_h)))
-                                .child(img(image).id("fb").size_full().object_fit(ObjectFit::Fill))
+                                .child(
+                                    img(image)
+                                        .id("fb")
+                                        .absolute()
+                                        .inset_0()
+                                        .size_full()
+                                        .object_fit(ObjectFit::Fill),
+                                )
                                 .child(probe),
                         ),
                 )
@@ -1510,6 +1626,7 @@ impl Render for SessionView {
         let show_pinned = self.pin_toolbar;
         let remote_keyboard_active = self.phase == Phase::Connected
             && !self.unlock.blocks_input()
+            && !self.notifications.open
             && self.focus.is_focused(window);
 
         v_flex()
@@ -1595,10 +1712,16 @@ impl Render for SessionView {
                     .min_h_0()
                     .relative()
                     .overflow_hidden()
+                    .flex()
                     .child(
                         div()
                             .id("vnc-canvas")
-                            .size_full()
+                            .relative()
+                            .overflow_hidden()
+                            .min_h_0()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
                             .bg(theme::desktop())
                             .cursor(CursorStyle::Arrow)
                             .on_mouse_down(
@@ -1652,6 +1775,22 @@ impl Render for SessionView {
                             }))
                             .child(self.render_picture(cx)),
                     )
+                    .when(self.assistant_open, |el| {
+                        if let Some(assistant) = &self.assistant {
+                            el.child(
+                                div()
+                                    .w(px((f32::from(width) * 0.45).clamp(280., 440.)))
+                                    .max_w(relative(0.6))
+                                    .h_full()
+                                    .flex_shrink_0()
+                                    .border_l_1()
+                                    .border_color(theme::line(cx))
+                                    .child(assistant.clone()),
+                            )
+                        } else {
+                            el
+                        }
+                    })
                     .when(!show_pinned && self.phase != Phase::Ended, |this| {
                         this.child(self.render_floating_toolbar(fullscreen, width, cx))
                     })
@@ -1659,9 +1798,18 @@ impl Render for SessionView {
                     .when(self.show_menu, |this| {
                         this.child(self.render_menu(fullscreen, cx))
                     })
-                    .when(self.phase == Phase::Ended, |this| {
-                        this.child(self.render_ended(cx))
+                    .when(self.notifications.open, |this| {
+                        this.child(self.render_notifications(cx))
                     })
+                    .when(
+                        self.recovery.deadline.is_some()
+                            || (self.phase == Phase::Connecting && self.recovery.attempt > 0),
+                        |this| this.child(self.render_recovery(cx)),
+                    )
+                    .when(
+                        self.phase == Phase::Ended && self.recovery.deadline.is_none(),
+                        |this| this.child(self.render_ended(cx)),
+                    )
                     .when(self.unlock.editing(), |this| {
                         this.child(self.render_unlock_setting(window, cx))
                     }),
@@ -1722,12 +1870,15 @@ fn toolbar_sep() -> impl IntoElement {
 
 fn tool_btn(
     id: &'static str,
-    icon: IconName,
+    icon: impl Into<Icon>,
     tip: impl Into<SharedString>,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> Button {
+    let tip = tip.into();
     Button::new(id)
         .ghost()
+        .size(px(28.))
+        .accessibility_label(tip.clone())
         .icon(icon)
         // The toolbar is always dark; the ghost variant would otherwise use
         // the theme foreground, which is near-black in light mode.
@@ -1751,7 +1902,7 @@ fn key_chip(
 
 fn menu_item(
     id: &'static str,
-    icon: IconName,
+    icon: impl Into<Icon>,
     label: impl Into<SharedString>,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> Button {
@@ -2027,4 +2178,10 @@ mod tests {
 }
 
 mod apps_ui;
+mod assistant_bridge;
+mod controls_ui;
+mod reconnect;
 mod unlock_ui;
+
+#[cfg(test)]
+mod assistant_visual_tests;

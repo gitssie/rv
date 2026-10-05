@@ -303,10 +303,22 @@ fn app_action_button(
 impl SessionView {
     pub(super) fn apply_app_event(&mut self, event: AppEvent, cx: &mut Context<Self>) {
         match event {
+            AppEvent::Notifications(snapshot) => {
+                if let Some(a) = &self.assistant {
+                    a.update(cx, |a, cx| a.receive_notifications(snapshot.clone(), cx));
+                }
+                self.notifications.receive(snapshot)
+            }
             AppEvent::LockState(locked) => self.unlock_lock_state(locked, cx),
             AppEvent::ScreenState(attempt, state) => self.unlock_screen_state(attempt, state, cx),
             AppEvent::UnlockArmed(attempt, armed) => self.unlock_armed(attempt, armed, cx),
             AppEvent::Capabilities(caps) => {
+                if caps.notifications {
+                    self.handle.app(AppCommand::SubscribeNotifications(
+                        self.notifications.enabled,
+                    ));
+                    self.handle.app(AppCommand::Notifications);
+                }
                 self.apps.loading = caps.list;
                 self.apps.caps = Some(caps);
             }
@@ -348,6 +360,13 @@ impl SessionView {
                 }
             }
             AppEvent::Finished(command) => {
+                if let AppCommand::WriteClipboard { token, .. } = &command {
+                    if self.assistant_clipboard.as_ref() == Some(token) {
+                        self.assistant_clipboard = None;
+                        self.assistant_feedback("手机剪贴板已确认，请在目标输入框粘贴".into(), cx);
+                    }
+                    return;
+                }
                 if let Some(id) = command.bundle_id() {
                     self.apps.busy.remove(id);
                 }
@@ -356,6 +375,20 @@ impl SessionView {
                 }
             }
             AppEvent::Failed { command, message } => {
+                if let AppCommand::WriteClipboard { token, .. } = &command {
+                    if self.assistant_clipboard.as_ref() == Some(token) {
+                        self.assistant_clipboard = None;
+                        self.assistant_feedback(format!("剪贴板写入未确认：{message}"), cx);
+                    }
+                    return;
+                }
+                if matches!(
+                    command,
+                    AppCommand::SubscribeNotifications(_) | AppCommand::Notifications
+                ) {
+                    self.notifications.error = Some(message);
+                    return;
+                }
                 if matches!(
                     command,
                     AppCommand::ScreenState(_)
@@ -529,6 +562,7 @@ impl SessionView {
             .trigger(
                 Button::new("keyboard-menu")
                     .ghost()
+                    .size(px(28.))
                     .icon(IconName::SquareTerminal)
                     .tooltip("键盘快捷操作")
                     .text_color(theme::toolbar_fg()),
@@ -602,15 +636,15 @@ impl SessionView {
                             .relative()
                             .flex_shrink_0()
                             .debug_selector(move || format!("shortcut-{}", shortcut.bundle_id))
-                            .w(px(34.))
-                            .h(px(36.))
+                            .w(px(30.))
+                            .h(px(32.))
                             .flex()
                             .items_center()
                             .justify_center()
                             .rounded_md()
                             .cursor_pointer()
                             .hover(|s| s.bg(rgb(0x35404e)))
-                            .child(app_icon(self.apps.icon_for(&id), 28.).opacity(if busy {
+                            .child(app_icon(self.apps.icon_for(&id), 24.).opacity(if busy {
                                 0.6
                             } else {
                                 1.

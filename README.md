@@ -217,3 +217,11 @@ macOS is the primary target. Linux and Windows should compile via GPUI.
 ## License
 
 [MIT](LICENSE) © 2026 Max Lv
+
+### 手机通知与紧凑工具栏
+
+会话工具栏新增 Home、PNG 截图复制/保存、手机通知面板，以及已建立连接断线后的自动重连。通知默认自动接收，可暂停和手动刷新；显示 SpringBoard 采集的最近 100 条记录。需要同时更新 TrollVNC RootHide 包以加载通知适配器，旧服务器会显示“不支持”。这是收到的通知缓存，不是完整通知中心历史。详见 [协议与限制](docs/app-control-protocol.md#home-and-phone-notifications)。
+
+### 手机工作助手
+
+会话工具栏右侧「助手」打开商品草稿、图片、常用文案和通知侧栏。草稿使用 SQLite 自动保存；可向手机剪贴板发送文案、将图片导入手机相册，再在 Vinted 内选择、粘贴和发布。切换手机 App 不影响本地工作内容。详见 [模块与技术实现](docs/work-assistant-implementation.md)。
