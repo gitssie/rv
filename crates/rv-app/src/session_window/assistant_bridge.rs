@@ -5,6 +5,10 @@ use rv_core::assistant::AssistantService;
 impl SessionView {
     pub(super) fn toggle_assistant(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.assistant_open = !self.assistant_open;
+        if self.assistant_open {
+            self.functions.open = false;
+            self.clear_function_text(window, cx);
+        }
         if self.assistant_open && self.assistant.is_none() {
             let root = self
                 .thumb_path
@@ -115,15 +119,7 @@ impl SessionView {
                 .app(rv_session::AppCommand::WriteClipboard { token, text });
             self.assistant_feedback("正在写入手机剪贴板…".into(), cx);
         } else {
-            if text.len() > 65536
-                || (self.req.clipboard == ClipboardMode::Latin1
-                    && text.chars().any(|c| c as u32 > 255))
-            {
-                self.assistant_feedback("当前连接不能发送此文本，请使用 UTF-8 剪贴板".into(), cx);
-                return;
-            }
-            self.handle.copy_text(text);
-            self.assistant_feedback("文本已发送，旧协议未确认；请在手机输入框粘贴".into(), cx);
+            self.assistant_feedback("ZXTouch 控制连接不可用，请检查配置并重新连接".into(), cx);
         }
     }
     pub(super) fn assistant_feedback(&mut self, message: String, cx: &mut Context<Self>) {

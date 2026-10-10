@@ -21,6 +21,8 @@ use crate::{
     codec, ExtendedClipboardEvent, PixelFormat, Rect, VncEncoding, VncError, VncEvent, X11Event,
 };
 const CHANNEL_SIZE: usize = 4096;
+const NETWORK_CHANNEL_SIZE: usize = 32;
+const DECODED_CHANNEL_SIZE: usize = 128;
 const CLIPBOARD_TEXT: u32 = 1;
 const CLIPBOARD_NOTIFY: u32 = 1 << 27;
 const CLIPBOARD_PROVIDE: u32 = 1 << 28;
@@ -93,9 +95,9 @@ impl VncInner {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        let (conn_ch_tx, conn_ch_rx) = channel(CHANNEL_SIZE);
+        let (conn_ch_tx, conn_ch_rx) = channel(NETWORK_CHANNEL_SIZE);
         let (input_ch_tx, input_ch_rx) = channel(CHANNEL_SIZE);
-        let (output_ch_tx, output_ch_rx) = channel(CHANNEL_SIZE);
+        let (output_ch_tx, output_ch_rx) = channel(DECODED_CHANNEL_SIZE);
         let (decoding_stop_tx, decoding_stop_rx) = oneshot::channel();
         let (net_conn_stop_tx, net_conn_stop_rx) = oneshot::channel();
 
@@ -558,7 +560,11 @@ where
     // main decoding loop
     while let Err(oneshot::error::TryRecvError::Empty) = stop_ch.try_recv() {
         let server_msg = ServerMsg::read(stream, tight_security).await?;
-        trace!("Server message got: {:?}", server_msg);
+        if matches!(server_msg, ServerMsg::Device(_)) {
+            trace!("Server device-control message received");
+        } else {
+            trace!("Server message got: {:?}", server_msg);
+        }
         match server_msg {
             ServerMsg::FramebufferUpdate(rect_num) => {
                 for _ in 0..rect_num {
@@ -611,6 +617,7 @@ where
                         | VncEncoding::TrollDeviceControlPseudo => {}
                     }
                 }
+                output_func(VncEvent::FramebufferUpdateFinished).await?;
             }
             // SetColorMapEntries,
             ServerMsg::Bell => {
@@ -657,6 +664,15 @@ where
 
         tokio::select! {
             _ = &mut stop_ch => break,
+            permit = conn_ch.reserve(), if pending > 0 => {
+                match permit {
+                    Ok(permit) => {
+                        permit.send(Ok(buffer[..pending].to_owned()));
+                        pending = 0;
+                    }
+                    Err(_) => break,
+                }
+            }
             result = stream.read(&mut buffer), if pending == 0 => {
                 match result {
                     Ok(nread) => {
@@ -692,4 +708,79 @@ where
         .await;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod traffic_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn decoder_capacity_wakes_network_without_outgoing_input() {
+        let (stream, mut peer) = tokio::io::duplex(1);
+        let (_input_tx, input_rx) = channel(1);
+        let (conn_tx, mut conn_rx) = channel(1);
+        conn_tx.send(Ok(vec![0])).await.unwrap();
+        let (stop_tx, stop_rx) = oneshot::channel();
+        let task = tokio::spawn(async_connection_process_loop(
+            stream, input_rx, conn_tx, stop_rx,
+        ));
+        // A one-byte transport forces the reader to consume the first byte
+        // while the decoder channel is full before this write can finish.
+        peer.write_all(&[7, 8]).await.unwrap();
+        tokio::task::yield_now().await;
+        assert_eq!(conn_rx.recv().await.unwrap().unwrap(), vec![0]);
+        let received = tokio::time::timeout(Duration::from_secs(1), async {
+            let mut bytes = Vec::new();
+            while bytes.len() < 2 {
+                bytes.extend(conn_rx.recv().await.unwrap().unwrap());
+            }
+            bytes
+        })
+        .await
+        .expect("decoder space must wake the pending network read");
+        assert_eq!(received, vec![7, 8]);
+        stop_tx.send(()).unwrap();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn update_finished_follows_all_rectangles_including_empty_updates() {
+        for count in [0u16, 2] {
+            let mut wire = vec![0, 0];
+            wire.extend_from_slice(&count.to_be_bytes());
+            for _ in 0..count {
+                wire.extend_from_slice(&[0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0]);
+                wire.extend_from_slice(&[1, 2, 3, 255]);
+            }
+            let events = std::sync::Mutex::new(Vec::new());
+            let (stop_tx, stop_rx) = oneshot::channel();
+            let stop_tx = std::sync::Mutex::new(Some(stop_tx));
+            let output = |event| {
+                if matches!(event, VncEvent::FramebufferUpdateFinished) {
+                    stop_tx.lock().unwrap().take().unwrap().send(()).unwrap();
+                }
+                events.lock().unwrap().push(event);
+                std::future::ready(Ok(()))
+            };
+            asycn_vnc_read_loop(
+                &mut wire.as_slice(),
+                &PixelFormat::bgra(),
+                &output,
+                stop_rx,
+                false,
+            )
+            .await
+            .unwrap();
+            let events = events.into_inner().unwrap();
+            assert_eq!(events.len(), count as usize + 1);
+            assert!(events[..count as usize]
+                .iter()
+                .all(|e| matches!(e, VncEvent::RawImage(..))));
+            assert!(matches!(
+                events.last(),
+                Some(VncEvent::FramebufferUpdateFinished)
+            ));
+        }
+    }
 }

@@ -1,17 +1,23 @@
 use super::*;
 use gpui::prelude::FluentBuilder;
 use gpui_component::{
-    Disableable,
+    Disableable, IconName,
     input::{Input, Textarea},
+    menu::{DropdownMenu, PopupMenuItem},
 };
-use widgets::{field, primary};
+use widgets::{field, primary, selection_menu};
 impl WorkAssistant {
-    fn template_dirty(&self, cx: &App) -> bool {
+    pub(super) fn template_dirty(&self, cx: &App) -> bool {
         self.template.name != self.template_name.read(cx).value().as_ref()
             || self.template.content != self.template_content.read(cx).value().as_ref()
             || self.template.category != self.template_category.read(cx).value().as_ref()
     }
-    fn select_template(&mut self, t: Template, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn select_template(
+        &mut self,
+        t: Template,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.template_name
             .update(cx, |v, cx| v.set_value(t.name.clone(), window, cx));
         self.template_content
@@ -95,41 +101,79 @@ impl WorkAssistant {
     }
     pub(super) fn render_templates(&self, cx: &mut Context<Self>) -> AnyElement {
         v_flex()
+            .w_full()
             .gap_3()
             .child(
-                Button::new("template-new")
-                    .outline()
-                    .small()
-                    .label("＋新增文案")
-                    .disabled(self.busy || self.template_dirty(cx))
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.select_template(Template::default(), window, cx)
-                    })),
+                h_flex()
+                    .gap_2()
+                    .child(
+                        div().flex_1().min_w_0().child(
+                            Button::new("template-picker")
+                                .debug_selector(|| "template-picker".into())
+                                .outline()
+                                .small()
+                                .h(px(28.))
+                                .w_full()
+                                .min_w_0()
+                                .child(div().flex_1().min_w_0().text_ellipsis().child(
+                                    if self.template.name.is_empty() {
+                                        "选择常用文案".to_owned()
+                                    } else {
+                                        self.template.name.clone()
+                                    },
+                                ))
+                                .child(gpui_component::Icon::new(IconName::ChevronDown).small())
+                                .disabled(
+                                    self.busy
+                                        || self.template_dirty(cx)
+                                        || self.templates.is_empty(),
+                                )
+                                .dropdown_menu({
+                                    let items = self.templates.clone();
+                                    let entity = cx.entity();
+                                    move |menu, window, _| {
+                                        items.clone().into_iter().fold(
+                                            selection_menu(menu, window),
+                                            |menu, t| {
+                                                let entity = entity.clone();
+                                                menu.item(
+                                                    PopupMenuItem::new(t.name.clone()).on_click(
+                                                        move |_, window, cx| {
+                                                            entity.update(cx, |this, cx| {
+                                                                this.select_template(
+                                                                    t.clone(),
+                                                                    window,
+                                                                    cx,
+                                                                )
+                                                            });
+                                                        },
+                                                    ),
+                                                )
+                                            },
+                                        )
+                                    }
+                                }),
+                        ),
+                    )
+                    .child(
+                        Button::new("template-new")
+                            .debug_selector(|| "template-new".into())
+                            .outline()
+                            .small()
+                            .size(px(28.))
+                            .icon(IconName::Plus)
+                            .tooltip("新增文案")
+                            .disabled(self.busy || self.template_dirty(cx))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.select_template(Template::default(), window, cx)
+                            })),
+                    ),
             )
-            .child(v_flex().gap_1().children(self.templates.iter().map(|t| {
-                let target = t.clone();
-                Button::new(SharedString::from(format!("template-{}", t.id)))
-                    .ghost()
-                    .small()
-                    .selected(t.id == self.template.id)
-                    .label(format!(
-                        "{}{}",
-                        if t.category.is_empty() {
-                            String::new()
-                        } else {
-                            format!("{} · ", t.category)
-                        },
-                        t.name
-                    ))
-                    .disabled(self.busy || self.template_dirty(cx))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.select_template(target.clone(), window, cx)
-                    }))
-            })))
             .when(self.template_dirty(cx), |el| {
                 el.child(
                     h_flex().gap_2().child("文案有未保存修改").child(
                         Button::new("template-discard")
+                            .debug_selector(|| "template-discard".into())
                             .ghost()
                             .small()
                             .label("放弃修改")
@@ -148,7 +192,9 @@ impl WorkAssistant {
             ))
             .child(field(
                 "文案内容",
-                Textarea::new(&self.template_content).h(px(140.)),
+                Textarea::new(&self.template_content)
+                    .h(px(140.))
+                    .overflow_hidden(),
                 cx,
             ))
             .child(
@@ -156,7 +202,13 @@ impl WorkAssistant {
                     .gap_2()
                     .child(
                         primary("template-save", "保存文案", cx)
-                            .disabled(self.busy)
+                            .debug_selector(|| "template-save".into())
+                            .disabled(
+                                self.busy
+                                    || !self.template_dirty(cx)
+                                    || self.template_name.read(cx).value().trim().is_empty()
+                                    || self.template_content.read(cx).value().trim().is_empty(),
+                            )
                             .on_click(cx.listener(|this, _, _, cx| this.save_template(cx))),
                     )
                     .child(
@@ -170,18 +222,42 @@ impl WorkAssistant {
                             })),
                     ),
             )
-            .when(self.template.revision > 0, |el| {
-                el.child(
-                    Button::new("template-delete")
-                        .danger()
+            .child(
+                h_flex().child(
+                    Button::new("template-apply")
+                        .debug_selector(|| "template-apply".into())
                         .outline()
                         .small()
-                        .label("删除文案…")
-                        .disabled(self.busy)
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.confirm_template_delete = true;
-                            cx.notify();
+                        .h(px(28.))
+                        .label("用作当前商品描述")
+                        .disabled(
+                            self.draft.is_none()
+                                || self.busy
+                                || self.template_content.read(cx).value().is_empty(),
+                        )
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.apply_template(
+                                this.template_content.read(cx).value().to_string(),
+                                window,
+                                cx,
+                            )
                         })),
+                ),
+            )
+            .when(self.template.revision > 0, |el| {
+                el.child(
+                    h_flex().child(
+                        Button::new("template-delete")
+                            .danger()
+                            .outline()
+                            .small()
+                            .label("删除文案…")
+                            .disabled(self.busy)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.confirm_template_delete = true;
+                                cx.notify();
+                            })),
+                    ),
                 )
             })
             .when(self.confirm_template_delete, |el| {

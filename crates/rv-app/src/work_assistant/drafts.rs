@@ -1,11 +1,4 @@
 use super::*;
-use gpui::prelude::FluentBuilder;
-use gpui_component::{
-    Disableable,
-    input::{Input, Textarea},
-    menu::{DropdownMenu, PopupMenuItem},
-};
-use widgets::{field, primary};
 impl WorkAssistant {
     pub(super) fn save(&mut self, cx: &mut Context<Self>) {
         if self.save_busy || self.save_error.is_some() {
@@ -115,7 +108,12 @@ impl WorkAssistant {
         })
         .detach();
     }
-    fn create_draft(&mut self, duplicate: bool, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn create_draft(
+        &mut self,
+        duplicate: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.busy || self.save_busy || self.dirty {
             return;
         }
@@ -152,7 +150,7 @@ impl WorkAssistant {
         })
         .detach();
     }
-    fn delete_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn delete_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.busy || self.save_busy || self.dirty || self.import_busy {
             return;
         }
@@ -189,221 +187,5 @@ impl WorkAssistant {
             });
         })
         .detach();
-    }
-    pub(super) fn render_drafts(&self, cx: &mut Context<Self>) -> AnyElement {
-        let locked = self.busy || self.save_busy || self.dirty || self.import_busy;
-        let title = self
-            .draft
-            .as_ref()
-            .map(|d| {
-                if d.title.is_empty() {
-                    "未命名商品".to_owned()
-                } else {
-                    d.title.clone()
-                }
-            })
-            .unwrap_or("选择商品草稿".into());
-        v_flex()
-            .gap_3()
-            .child(
-                h_flex()
-                    .gap_1()
-                    .child(
-                        Button::new("draft-picker")
-                            .outline()
-                            .small()
-                            .label(title)
-                            .disabled(locked)
-                            .dropdown_menu({
-                                let items = self.drafts.clone();
-                                let entity = cx.entity();
-                                move |menu, _, _| {
-                                    items.clone().into_iter().fold(menu, |menu, d| {
-                                        let label = if d.title.is_empty() {
-                                            "未命名商品".into()
-                                        } else {
-                                            d.title.clone()
-                                        };
-                                        let entity = entity.clone();
-                                        menu.item(PopupMenuItem::new(label).on_click(
-                                            move |_, window, cx| {
-                                                entity.update(cx, |this, cx| {
-                                                    this.select_draft(d.clone(), window, cx)
-                                                })
-                                            },
-                                        ))
-                                    })
-                                }
-                            }),
-                    )
-                    .child(
-                        Button::new("draft-new")
-                            .debug_selector(|| "draft-new".into())
-                            .outline()
-                            .small()
-                            .label("＋新增")
-                            .disabled(locked)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.create_draft(false, window, cx)
-                            })),
-                    )
-                    .child(
-                        Button::new("draft-copy")
-                            .ghost()
-                            .small()
-                            .label("复制")
-                            .disabled(locked || self.draft.is_none())
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.create_draft(true, window, cx)
-                            })),
-                    ),
-            )
-            .when(self.draft.is_none(), |el| {
-                el.child(
-                    div()
-                        .text_color(theme::muted(cx))
-                        .child("新增草稿，在 Mac 整理图片与文案，再传到手机使用。"),
-                )
-            })
-            .when(self.draft.is_some(), |el| {
-                el.child(self.render_images(cx))
-                    .child(
-                        h_flex()
-                            .justify_between()
-                            .child(div().text_xs().text_color(theme::muted(cx)).child("标题"))
-                            .child(
-                                Button::new("send-title")
-                                    .ghost()
-                                    .small()
-                                    .label("发送到剪贴板")
-                                    .disabled(!self.writable || !self.connected)
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.send(this.title.read(cx).value().to_string(), cx)
-                                    })),
-                            ),
-                    )
-                    .child(Input::new(&self.title).small())
-                    .child(field(
-                        "描述",
-                        Textarea::new(&self.description).h(px(110.)),
-                        cx,
-                    ))
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .child(
-                                Button::new("use-template")
-                                    .outline()
-                                    .small()
-                                    .label("使用文案")
-                                    .dropdown_menu({
-                                        let items = self.templates.clone();
-                                        let input = self.description.clone();
-                                        move |menu, _, _| {
-                                            items.clone().into_iter().fold(menu, |menu, t| {
-                                                let input = input.clone();
-                                                menu.item(PopupMenuItem::new(t.name).on_click(
-                                                    move |_, window, cx| {
-                                                        input.update(cx, |v, cx| {
-                                                            v.set_value(
-                                                                t.content.clone(),
-                                                                window,
-                                                                cx,
-                                                            )
-                                                        })
-                                                    },
-                                                ))
-                                            })
-                                        }
-                                    }),
-                            )
-                            .child(
-                                primary("send-description", "发送到剪贴板", cx)
-                                    .disabled(!self.writable || !self.connected)
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.send(this.description.read(cx).value().to_string(), cx)
-                                    })),
-                            ),
-                    )
-                    .child(
-                        h_flex()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(theme::muted(cx))
-                                    .child("价格（EUR）"),
-                            )
-                            .child(
-                                Button::new("send-price")
-                                    .ghost()
-                                    .small()
-                                    .label("发送价格")
-                                    .disabled(
-                                        !self.writable || !self.connected || self.price_invalid,
-                                    )
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        if let Some(d) = &this.draft {
-                                            this.send(format_price(d.price_minor), cx);
-                                        }
-                                    })),
-                            ),
-                    )
-                    .child(Input::new(&self.price).small())
-                    .child(field(
-                        "库存备注 · 仅本地保存",
-                        Input::new(&self.stock).small(),
-                        cx,
-                    ))
-                    .child(
-                        div()
-                            .text_xs()
-                            .whitespace_normal()
-                            .text_color(theme::muted(cx))
-                            .child("发送后请点击手机中的输入框并粘贴。发布仍在手机 App 内完成。"),
-                    )
-                    .child(
-                        Button::new("draft-delete")
-                            .danger()
-                            .outline()
-                            .small()
-                            .label("删除草稿…")
-                            .disabled(locked)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.confirm_delete = true;
-                                cx.notify();
-                            })),
-                    )
-                    .when(self.confirm_delete, |el| {
-                        el.child(
-                            v_flex()
-                                .gap_2()
-                                .child("删除本地草稿？不会删除手机相册中的照片。")
-                                .child(
-                                    h_flex()
-                                        .gap_2()
-                                        .child(
-                                            Button::new("draft-delete-cancel")
-                                                .small()
-                                                .label("取消")
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.confirm_delete = false;
-                                                    cx.notify();
-                                                })),
-                                        )
-                                        .child(
-                                            Button::new("draft-delete-confirm")
-                                                .danger()
-                                                .small()
-                                                .label("确认删除")
-                                                .on_click(cx.listener(|this, _, window, cx| {
-                                                    this.delete_draft(window, cx)
-                                                })),
-                                        ),
-                                ),
-                        )
-                    })
-            })
-            .into_any_element()
     }
 }

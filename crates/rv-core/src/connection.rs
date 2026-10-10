@@ -201,6 +201,10 @@ pub struct Connection {
     pub local_cursor: LocalCursorMode,
     #[serde(default)]
     pub view_only: bool,
+    #[serde(default)]
+    pub zxtouch_port: Option<u16>,
+    #[serde(default)]
+    pub function_favorites: Vec<String>,
     #[serde(default = "default_shared")]
     pub shared: bool,
     #[serde(default)]
@@ -211,6 +215,8 @@ pub struct Connection {
     pub transfer_folders: TransferFolders,
     #[serde(default = "crate::default_app_shortcuts")]
     pub app_shortcuts: Vec<crate::AppShortcut>,
+    #[serde(default)]
+    pub environment_apps: Vec<crate::AppShortcut>,
 }
 
 fn default_shared() -> bool {
@@ -240,11 +246,14 @@ impl Connection {
             clipboard: ClipboardMode::default(),
             local_cursor: LocalCursorMode::default(),
             view_only: false,
+            zxtouch_port: None,
+            function_favorites: Vec::new(),
             shared: true,
             labels: Vec::new(),
             last_connected: None,
             transfer_folders: TransferFolders::default(),
             app_shortcuts: crate::default_app_shortcuts(),
+            environment_apps: Vec::new(),
         }
     }
 
@@ -267,6 +276,7 @@ pub struct ConnectRequest {
     pub clipboard: ClipboardMode,
     pub local_cursor: LocalCursorMode,
     pub view_only: bool,
+    pub zxtouch_port: Option<u16>,
     pub shared: bool,
 }
 
@@ -284,6 +294,7 @@ impl ConnectRequest {
             clipboard: conn.clipboard,
             local_cursor: conn.local_cursor,
             view_only: conn.view_only,
+            zxtouch_port: conn.zxtouch_port,
             shared: conn.shared,
         }
     }

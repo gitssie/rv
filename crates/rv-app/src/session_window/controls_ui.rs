@@ -1,3 +1,4 @@
+use super::apps_ui::app_icon;
 use super::*;
 use crate::assets::AppActionIcon;
 use gpui_component::popover::Popover;
@@ -114,6 +115,7 @@ impl SessionView {
             .as_ref()
             .is_some_and(|caps| caps.home && caps.control);
         tool_btn(
+            cx,
             "home-screen",
             AppActionIcon::Home,
             "回到主屏幕",
@@ -137,10 +139,16 @@ impl SessionView {
     pub(super) fn render_screenshot(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let entity = cx.entity();
         Popover::new("screenshot-menu")
+            .bg(theme::toolbar())
+            .text_color(theme::toolbar_fg())
+            .border_color(theme::toolbar_line())
+            .p_1()
+            .rounded_md()
             .anchor(Anchor::TopLeft)
             .trigger(
                 Button::new("screenshot")
                     .ghost()
+                    .bg(theme::toolbar())
                     .size(px(28.))
                     .icon(AppActionIcon::Camera)
                     .text_color(theme::toolbar_fg())
@@ -208,6 +216,7 @@ impl SessionView {
             .relative()
             .flex_shrink_0()
             .child(tool_btn(
+                cx,
                 "phone-notifications",
                 IconName::Bell,
                 "手机通知",
@@ -285,10 +294,40 @@ impl SessionView {
                             .flex_1()
                             .text_sm()
                             .font_semibold()
-                            .child(format!("手机通知 · {count}")),
+                            .child(if count == 0 {
+                                "通知".into()
+                            } else {
+                                format!("通知 · {count}")
+                            }),
                     )
                     .child(
                         tool_btn(
+                            cx,
+                            "auto-notifications",
+                            IconName::Bell,
+                            "自动接收通知",
+                            cx.listener(|this, _, _, cx| {
+                                this.notifications.enabled = !this.notifications.enabled;
+                                this.handle.app(AppCommand::SubscribeNotifications(
+                                    this.notifications.enabled,
+                                ));
+                                cx.notify();
+                            }),
+                        )
+                        .selected(self.notifications.enabled)
+                        .when(self.notifications.enabled, |button| {
+                            button.bg(rgb(0x2a3a50))
+                        })
+                        .text_color(if self.notifications.enabled {
+                            rgb(0x79b8ff).into()
+                        } else {
+                            theme::toolbar_muted()
+                        })
+                        .disabled(!supported),
+                    )
+                    .child(
+                        tool_btn(
+                            cx,
                             "refresh-notifications",
                             AppActionIcon::Restart,
                             "刷新已接收的通知",
@@ -297,6 +336,7 @@ impl SessionView {
                         .disabled(!supported),
                     )
                     .child(tool_btn(
+                        cx,
                         "close-notifications",
                         IconName::Close,
                         "关闭通知列表",
@@ -306,20 +346,6 @@ impl SessionView {
                         }),
                     )),
             )
-            .child(
-                h_flex().px_3().pb_2().gap_2().child(
-                    Checkbox::new("auto-notifications")
-                        .checked(self.notifications.enabled)
-                        .label("自动接收")
-                        .disabled(!supported)
-                        .on_click(cx.listener(|this, enabled: &bool, _, cx| {
-                            this.notifications.enabled = *enabled;
-                            this.handle
-                                .app(AppCommand::SubscribeNotifications(*enabled));
-                            cx.notify();
-                        })),
-                ),
-            )
             .when(!supported, |el| {
                 el.child(
                     div()
@@ -328,9 +354,9 @@ impl SessionView {
                         .text_sm()
                         .text_color(theme::toolbar_muted())
                         .child(if self.phase == Phase::Connected {
-                            "此设备未提供通知监听组件"
+                            "通知不可用"
                         } else {
-                            "连接已断开，显示上次接收的通知"
+                            "已断开"
                         }),
                 )
             })
@@ -350,13 +376,13 @@ impl SessionView {
                     .overflow_y_scroll()
                     .px_3()
                     .gap_2()
-                    .when(count == 0, |el| {
+                    .when(count == 0 && supported, |el| {
                         el.child(
                             div()
                                 .py_4()
                                 .text_sm()
                                 .text_color(theme::toolbar_muted())
-                                .child("暂无已接收的通知"),
+                                .child("暂无通知"),
                         )
                     })
                     .children(
@@ -369,62 +395,92 @@ impl SessionView {
                                     chrono::DateTime::from_timestamp(notification.timestamp, 0)
                                         .map(|time| {
                                             time.with_timezone(&chrono::Local)
-                                                .format("%m-%d %H:%M")
+                                                .format("%H:%M")
                                                 .to_string()
                                         })
                                         .unwrap_or_default();
-                                v_flex()
+                                let name = self
+                                    .apps
+                                    .installed
+                                    .iter()
+                                    .find(|app| app.bundle_id == notification.source)
+                                    .map(|app| app.name.clone())
+                                    .unwrap_or_else(|| {
+                                        if rv_session::valid_bundle_id(&notification.source) {
+                                            "通知".into()
+                                        } else {
+                                            notification.source.clone()
+                                        }
+                                    });
+                                h_flex()
+                                    .items_start()
                                     .py_2()
-                                    .gap_1()
+                                    .gap_2()
                                     .border_b_1()
                                     .border_color(theme::toolbar_line())
+                                    .child(app_icon(self.apps.icon_for(&notification.source), 28.))
                                     .child(
-                                        h_flex()
-                                            .gap_2()
+                                        v_flex()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .gap_1()
                                             .child(
-                                                div()
-                                                    .flex_1()
-                                                    .min_w_0()
-                                                    .text_xs()
-                                                    .text_ellipsis()
-                                                    .text_color(theme::toolbar_muted())
-                                                    .child(notification.source.clone()),
+                                                h_flex()
+                                                    .gap_2()
+                                                    .items_center()
+                                                    .child(
+                                                        div()
+                                                            .flex_1()
+                                                            .min_w_0()
+                                                            .text_xs()
+                                                            .text_ellipsis()
+                                                            .text_color(theme::toolbar_muted())
+                                                            .child(name),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .flex_shrink_0()
+                                                            .text_size(px(10.))
+                                                            .text_color(theme::toolbar_muted())
+                                                            .child(time),
+                                                    ),
                                             )
-                                            .child(
-                                                div()
-                                                    .text_xs()
-                                                    .text_color(theme::toolbar_muted())
-                                                    .child(time),
-                                            ),
+                                            .when(!notification.title.is_empty(), |el| {
+                                                el.child(
+                                                    div()
+                                                        .text_size(px(12.))
+                                                        .font_semibold()
+                                                        .child(notification.title.clone()),
+                                                )
+                                            })
+                                            .when(!notification.subtitle.is_empty(), |el| {
+                                                el.child(
+                                                    div()
+                                                        .text_xs()
+                                                        .child(notification.subtitle.clone()),
+                                                )
+                                            })
+                                            .when(!notification.message.is_empty(), |el| {
+                                                el.child(
+                                                    div()
+                                                        .text_size(px(12.))
+                                                        .text_color(theme::toolbar_fg())
+                                                        .child(notification.message.clone()),
+                                                )
+                                            }),
                                     )
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .font_medium()
-                                            .child(notification.title.clone()),
-                                    )
-                                    .when(!notification.subtitle.is_empty(), |el| {
-                                        el.child(
-                                            div().text_xs().child(notification.subtitle.clone()),
-                                        )
-                                    })
-                                    .child(div().text_sm().child(notification.message.clone()))
                             }),
                     ),
-            )
-            .child(
-                div()
-                    .px_3()
-                    .py_2()
-                    .text_xs()
-                    .text_color(theme::toolbar_muted())
-                    .child("最近 100 条已接收通知 · 非完整通知中心历史"),
             )
     }
 
     pub(super) fn render_recovery(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let connecting = matches!(self.phase, Phase::Connecting | Phase::Disconnecting);
+        let automatic = self.recovery.deadline.is_some() || connecting;
+        let auth_failed = self.error.as_deref().is_some_and(password_error);
         div()
             .id("session-recovery")
+            .debug_selector(|| "session-recovery".into())
             .occlude()
             .absolute()
             .inset_0()
@@ -434,6 +490,7 @@ impl SessionView {
             .bg(theme::scrim())
             .child(
                 v_flex()
+                    .debug_selector(|| "recovery-dialog".into())
                     .w(px(280.))
                     .max_w_full()
                     .p_3()
@@ -447,26 +504,70 @@ impl SessionView {
                         h_flex()
                             .gap_2()
                             .items_center()
-                            .child(Icon::new(IconName::Loader).small())
-                            .child(div().text_sm().font_semibold().child(
-                                if self.phase == Phase::Connecting {
-                                    "正在重连"
+                            .child(
+                                Icon::new(if automatic {
+                                    IconName::Loader
                                 } else {
-                                    "连接中断"
-                                },
-                            )),
+                                    IconName::TriangleAlert
+                                })
+                                .small(),
+                            )
+                            .child(div().text_sm().font_semibold().child(if connecting {
+                                "正在重连"
+                            } else {
+                                "连接中断"
+                            })),
                     )
                     .child(div().text_xs().text_color(theme::toolbar_muted()).child(
-                        if self.phase == Phase::Connecting {
-                            format!("第 {} 次尝试", self.recovery.attempt)
-                        } else {
+                        if connecting {
+                            format!("第 {} 次尝试", self.recovery.attempt.max(1))
+                        } else if self.recovery.deadline.is_some() {
                             format!(
                                 "{} 秒后重试 · 第 {} 次",
                                 self.recovery.seconds(std::time::Instant::now()),
                                 self.recovery.attempt
                             )
+                        } else if auth_failed {
+                            "密码错误，请重新输入".into()
+                        } else if self.recovery.attempt >= 5 {
+                            "自动重连失败，可手动重试".into()
+                        } else {
+                            "可手动重试".into()
                         },
                     ))
+                    .when(!automatic && !auth_failed, |panel| {
+                        panel.when_some(self.error.clone(), |panel, error| {
+                            panel.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme::toolbar_muted())
+                                    .child(error),
+                            )
+                        })
+                    })
+                    .when(auth_failed, |panel| {
+                        panel
+                            .child(
+                                Input::new(&self.password_input)
+                                    .small()
+                                    .w_full()
+                                    .aria_label("Password for reconnect"),
+                            )
+                            .when_some(self.password_validation.clone(), |panel, error| {
+                                panel.child(
+                                    div().text_xs().text_color(theme::danger(cx)).child(error),
+                                )
+                            })
+                            .child(
+                                Checkbox::new("retry-remember-password")
+                                    .checked(self.remember_password)
+                                    .label("记住密码")
+                                    .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                                        this.remember_password = *checked;
+                                        cx.notify();
+                                    })),
+                            )
+                    })
                     .child(
                         h_flex()
                             .gap_2()
@@ -477,9 +578,15 @@ impl SessionView {
                                     .ghost()
                                     .text_color(rgb(0x79b8ff))
                                     .label("立即重连")
-                                    .disabled(self.phase == Phase::Connecting)
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.start_reconnect(cx);
+                                    .disabled(connecting)
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        if auth_failed {
+                                            this.retry_with_password(window, cx);
+                                        } else if this.recovery.deadline.is_some() {
+                                            this.start_reconnect(cx);
+                                        } else {
+                                            this.reconnect(window, cx);
+                                        }
                                     })),
                             )
                             .child(
@@ -487,13 +594,17 @@ impl SessionView {
                                     .small()
                                     .ghost()
                                     .text_color(theme::toolbar_fg())
-                                    .label("停止")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.recovery.stop();
-                                        if this.phase == Phase::Connecting {
-                                            this.disconnect(cx);
+                                    .label(if automatic { "停止" } else { "关闭" })
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        if automatic {
+                                            this.recovery.stop();
+                                            if this.phase == Phase::Connecting {
+                                                this.disconnect(cx);
+                                            }
+                                            cx.notify();
+                                        } else {
+                                            this.close_window(window, cx);
                                         }
-                                        cx.notify();
                                     })),
                             ),
                     ),

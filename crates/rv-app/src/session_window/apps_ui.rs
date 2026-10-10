@@ -2,14 +2,13 @@ use super::*;
 use crate::assets::AppActionIcon;
 use gpui_component::{
     button::ButtonCustomVariant,
-    menu::{ContextMenuExt, PopupMenu, PopupMenuItem},
-    popover::Popover,
+    popover::{Popover, PopoverState},
 };
 use rv_core::{AppShortcut, move_app_shortcut};
 use rv_session::{AppCapabilities, AppCommand, AppEvent, RemoteApp};
 use std::collections::{HashMap, HashSet};
 
-struct AppIconImage {
+pub(super) struct AppIconImage {
     original: Arc<RenderImage>,
     sizes: std::sync::Mutex<HashMap<u32, Arc<RenderImage>>>,
 }
@@ -88,35 +87,25 @@ fn resample_app_icon(original: &Arc<RenderImage>, pixels: u32) -> Arc<RenderImag
 
 pub(super) struct AppToolbar {
     pub(super) caps: Option<AppCapabilities>,
-    installed: Vec<RemoteApp>,
-    shortcuts: Vec<AppShortcut>,
+    pub(super) installed: Vec<RemoteApp>,
+    pub(super) shortcuts: Vec<AppShortcut>,
     icons: HashMap<String, Arc<AppIconImage>>,
     fallback_icons: HashMap<String, Arc<AppIconImage>>,
     requested: HashSet<String>,
     busy: HashSet<String>,
     foreground: Option<String>,
-    search: Entity<InputState>,
-    _search_subscription: Subscription,
     pub picker_open: bool,
-    loading: bool,
+    pub(super) loading: bool,
     page: usize,
-    error: Option<String>,
+    pub(super) error: Option<String>,
 }
 
 impl AppToolbar {
     pub fn new(
         shortcuts: Vec<AppShortcut>,
-        window: &mut Window,
-        cx: &mut Context<SessionView>,
+        _window: &mut Window,
+        _cx: &mut Context<SessionView>,
     ) -> Self {
-        let search = cx.new(|cx| InputState::new(window, cx).placeholder("搜索 App"));
-        let subscription = cx.subscribe(&search, |this, _, event: &InputEvent, cx| {
-            if matches!(event, InputEvent::Change) {
-                this.apps.page = 0;
-                this.request_app_icons(cx);
-                cx.notify();
-            }
-        });
         let mut seen = HashSet::new();
         let shortcuts = shortcuts
             .into_iter()
@@ -134,19 +123,24 @@ impl AppToolbar {
             requested: HashSet::new(),
             busy: HashSet::new(),
             foreground: None,
-            search,
-            _search_subscription: subscription,
             picker_open: false,
             loading: false,
             page: 0,
             error: None,
         }
     }
-    fn icon_for(&self, bundle_id: &str) -> Option<Arc<AppIconImage>> {
+    pub(super) fn icon_for(&self, bundle_id: &str) -> Option<Arc<AppIconImage>> {
         self.icons
             .get(bundle_id)
             .or_else(|| self.fallback_icons.get(bundle_id))
             .cloned()
+    }
+    pub(super) fn installed_shortcuts(&self) -> impl Iterator<Item = &AppShortcut> {
+        self.shortcuts.iter().filter(|shortcut| {
+            self.installed
+                .iter()
+                .any(|app| app.bundle_id == shortcut.bundle_id)
+        })
     }
     pub fn disconnected(&mut self, cx: &mut Context<SessionView>) {
         self.caps = None;
@@ -240,7 +234,7 @@ impl Render for ShortcutDrag {
     }
 }
 
-fn app_icon(image: Option<Arc<AppIconImage>>, size: f32) -> Div {
+pub(super) fn app_icon(image: Option<Arc<AppIconImage>>, size: f32) -> Div {
     div()
         .size(px(size))
         .rounded(px(size * 0.22))
@@ -265,19 +259,42 @@ fn app_icon(image: Option<Arc<AppIconImage>>, size: f32) -> Div {
         })
 }
 
+// Keep the existing launch and drag/drop target while Popover owns right-click focus.
+#[derive(IntoElement)]
+struct ShortcutTrigger(AnyElement);
+impl gpui_component::Selectable for ShortcutTrigger {
+    fn selected(self, _: bool) -> Self {
+        self
+    }
+    fn is_selected(&self) -> bool {
+        false
+    }
+}
+impl RenderOnce for ShortcutTrigger {
+    fn render(self, _: &mut Window, _: &mut App) -> impl IntoElement {
+        self.0
+    }
+}
+
 fn app_action_button(
     id: &'static str,
     icon: AppActionIcon,
     label: &'static str,
     enabled: bool,
-    menu: WeakEntity<PopupMenu>,
-    previous_focus: Option<FocusHandle>,
+    menu: WeakEntity<PopoverState>,
+    cx: &App,
     handler: impl Fn(&mut App) + 'static,
 ) -> Button {
     let handler = Rc::new(handler);
     let keyboard_handler = handler.clone();
+    let click_menu = menu.clone();
     Button::new(id)
-        .ghost()
+        .custom(
+            ButtonCustomVariant::new(cx)
+                .foreground(theme::toolbar_fg())
+                .hover(rgb(0x2a343f).into())
+                .active(rgb(0x35404e).into()),
+        )
         .size(px(28.))
         .icon(Icon::new(icon))
         .accessibility_label(label)
@@ -291,13 +308,15 @@ fn app_action_button(
             }
             keyboard_handler(cx);
             if let Some(menu) = menu.upgrade() {
-                menu.update(cx, |_, cx| cx.emit(DismissEvent));
-            }
-            if let Some(focus) = &previous_focus {
-                focus.focus(window, cx);
+                menu.update(cx, |state, cx| state.dismiss(window, cx));
             }
         })
-        .on_click(move |_, _, cx| handler(cx))
+        .on_click(move |_, window, cx| {
+            handler(cx);
+            if let Some(menu) = click_menu.upgrade() {
+                menu.update(cx, |state, cx| state.dismiss(window, cx));
+            }
+        })
 }
 
 impl SessionView {
@@ -307,19 +326,27 @@ impl SessionView {
                 if let Some(a) = &self.assistant {
                     a.update(cx, |a, cx| a.receive_notifications(snapshot.clone(), cx));
                 }
-                self.notifications.receive(snapshot)
+                self.notifications.receive(snapshot);
+                self.request_app_icons(cx);
             }
             AppEvent::LockState(locked) => self.unlock_lock_state(locked, cx),
             AppEvent::ScreenState(attempt, state) => self.unlock_screen_state(attempt, state, cx),
             AppEvent::UnlockArmed(attempt, armed) => self.unlock_armed(attempt, armed, cx),
             AppEvent::Capabilities(caps) => {
-                if caps.notifications {
+                // Capability updates after a control failure must not resubmit
+                // unrelated subscriptions or mark an existing App list as loading.
+                let initial = self.apps.caps.is_none();
+                if caps.notifications
+                    && !self.apps.caps.as_ref().is_some_and(|old| old.notifications)
+                {
                     self.handle.app(AppCommand::SubscribeNotifications(
                         self.notifications.enabled,
                     ));
                     self.handle.app(AppCommand::Notifications);
                 }
-                self.apps.loading = caps.list;
+                if initial {
+                    self.apps.loading = caps.list;
+                }
                 self.apps.caps = Some(caps);
             }
             AppEvent::List(apps) => {
@@ -361,6 +388,7 @@ impl SessionView {
             }
             AppEvent::Finished(command) => {
                 if let AppCommand::WriteClipboard { token, .. } = &command {
+                    self.status = "Clipboard written".into();
                     if self.assistant_clipboard.as_ref() == Some(token) {
                         self.assistant_clipboard = None;
                         self.assistant_feedback("手机剪贴板已确认，请在目标输入框粘贴".into(), cx);
@@ -376,6 +404,7 @@ impl SessionView {
             }
             AppEvent::Failed { command, message } => {
                 if let AppCommand::WriteClipboard { token, .. } = &command {
+                    self.status = format!("Clipboard write failed: {message}").into();
                     if self.assistant_clipboard.as_ref() == Some(token) {
                         self.assistant_clipboard = None;
                         self.assistant_feedback(format!("剪贴板写入未确认：{message}"), cx);
@@ -416,10 +445,11 @@ impl SessionView {
         cx.notify();
     }
 
-    fn app_allowed(&self, id: &str, action: u8) -> bool {
+    pub(super) fn app_allowed(&self, id: &str, action: u8) -> bool {
         if self.phase != Phase::Connected
             || self.view_only()
             || self.unlock.blocks_input()
+            || self.app_environment_busy()
             || self.apps.busy.contains(id)
         {
             return false;
@@ -438,7 +468,7 @@ impl SessionView {
                 _ => false,
             }
     }
-    fn dispatch_app(&mut self, command: AppCommand, cx: &mut Context<Self>) {
+    pub(super) fn dispatch_app(&mut self, command: AppCommand, cx: &mut Context<Self>) {
         let action = match command {
             AppCommand::Launch(_) => 2,
             AppCommand::Terminate(_) => 3,
@@ -454,8 +484,7 @@ impl SessionView {
         self.handle.app(command);
         cx.notify();
     }
-    fn wanted_app_icon_ids(&self, cx: &Context<Self>) -> Vec<String> {
-        let query = self.apps.search.read(cx).value().to_lowercase();
+    fn wanted_app_icon_ids(&self, _cx: &Context<Self>) -> Vec<String> {
         let mut ids: Vec<_> = self
             .apps
             .shortcuts
@@ -467,18 +496,22 @@ impl SessionView {
                 self.apps
                     .installed
                     .iter()
-                    .filter(|a| {
-                        a.name.to_lowercase().contains(&query)
-                            || a.bundle_id.to_lowercase().contains(&query)
-                    })
                     .skip(self.apps.page * 60)
                     .take(60)
                     .map(|a| a.bundle_id.clone()),
             );
         }
+        ids.extend(self.environment_icon_ids());
+        ids.extend(
+            self.notifications
+                .snapshot
+                .iter()
+                .flat_map(|snapshot| &snapshot.notifications)
+                .map(|notification| notification.source.clone()),
+        );
         ids
     }
-    fn refresh_apps(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn refresh_apps(&mut self, cx: &mut Context<Self>) {
         if self.apps.loading || !self.apps.caps.as_ref().is_some_and(|c| c.list) {
             return;
         }
@@ -490,7 +523,7 @@ impl SessionView {
         self.handle.app(AppCommand::List);
         cx.notify();
     }
-    fn request_app_icons(&mut self, cx: &Context<Self>) {
+    pub(super) fn request_app_icons(&mut self, cx: &Context<Self>) {
         if !self.apps.caps.as_ref().is_some_and(|c| c.icons) {
             return;
         }
@@ -558,10 +591,17 @@ impl SessionView {
     pub(super) fn render_keyboard_shortcuts(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let entity = cx.entity();
         Popover::new("keyboard-shortcuts")
+            .bg(theme::toolbar())
+            .text_color(theme::toolbar_fg())
+            .border_color(theme::toolbar_line())
+            .p_1()
+            .rounded_md()
             .anchor(Anchor::TopLeft)
             .trigger(
                 Button::new("keyboard-menu")
+                    .debug_selector(|| "keyboard-menu".into())
                     .ghost()
+                    .bg(theme::toolbar())
                     .size(px(28.))
                     .icon(IconName::SquareTerminal)
                     .tooltip("键盘快捷操作")
@@ -570,8 +610,8 @@ impl SessionView {
             .content(move |_, _, cx| {
                 entity.update(cx, |this, cx| {
                     v_flex()
-                        .w(px(170.))
-                        .gap_1()
+                        .w(px(160.))
+                        .gap_0p5()
                         .child(menu_item(
                             "compact-cad",
                             IconName::SquareTerminal,
@@ -590,8 +630,35 @@ impl SessionView {
                             .into_iter()
                             .map(|(label, key)| {
                                 Button::new(label)
+                                    .debug_selector(move || format!("keyboard-key-{label}"))
                                     .ghost()
-                                    .label(label)
+                                    .small()
+                                    .h(px(26.))
+                                    .w_full()
+                                    .px_2()
+                                    .justify_start()
+                                    .text_color(theme::toolbar_fg())
+                                    .child(
+                                        h_flex()
+                                            .gap_2()
+                                            .items_center()
+                                            .child(
+                                                div()
+                                                    .w(px(15.))
+                                                    .text_center()
+                                                    .text_size(px(14.))
+                                                    .text_color(theme::toolbar_muted())
+                                                    .child(match label {
+                                                        "Ctrl" => "⌃",
+                                                        "Alt" => "⌥",
+                                                        "Win" => "⌘",
+                                                        "Tab" => "⇥",
+                                                        "Esc" => "⎋",
+                                                        _ => "⇪",
+                                                    }),
+                                            )
+                                            .child(div().text_size(px(12.)).child(label)),
+                                    )
                                     .disabled(this.phase != Phase::Connected || this.view_only())
                                     .on_click(cx.listener(move |this, _, _, _| this.tap_key(key)))
                             }),
@@ -617,7 +684,7 @@ impl SessionView {
                     .max_w(px(360.))
                     .overflow_x_scroll()
                     .gap_1()
-                    .children(self.apps.shortcuts.iter().map(|shortcut| {
+                    .children(self.apps.installed_shortcuts().map(|shortcut| {
                         let id = shortcut.bundle_id.clone();
                         let launch_id = id.clone();
                         let drop_id = id.clone();
@@ -631,113 +698,114 @@ impl SessionView {
                             shortcut: shortcut.clone(),
                             image: self.apps.icon_for(&id),
                         };
-                        div()
-                            .id(SharedString::from(format!("app-shortcut-{id}")))
-                            .relative()
-                            .flex_shrink_0()
-                            .debug_selector(move || format!("shortcut-{}", shortcut.bundle_id))
-                            .w(px(30.))
-                            .h(px(32.))
-                            .flex()
-                            .items_center()
-                            .justify_center()
+                        Popover::new(SharedString::from(format!("app-actions-{id}")))
+                            .mouse_button(MouseButton::Right)
+                            .bg(theme::toolbar())
+                            .text_color(theme::toolbar_fg())
+                            .border_color(theme::toolbar_line())
+                            .p_1()
                             .rounded_md()
-                            .cursor_pointer()
-                            .hover(|s| s.bg(rgb(0x35404e)))
-                            .child(app_icon(self.apps.icon_for(&id), 24.).opacity(if busy {
-                                0.6
-                            } else {
-                                1.
-                            }))
-                            .when(self.apps.foreground.as_deref() == Some(&id), |d| {
-                                d.child(
-                                    div()
-                                        .absolute()
-                                        .bottom_0()
-                                        .size(px(3.))
-                                        .rounded_full()
-                                        .bg(rgb(0x8abfff)),
-                                )
-                            })
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.dispatch_app(AppCommand::Launch(launch_id.clone()), cx)
-                            }))
-                            .on_drag(drag, |drag, _, _, cx| cx.new(|_| drag.clone()))
-                            .on_drop(cx.listener(move |this, drag: &ShortcutDrag, _, cx| {
-                                this.drop_app_shortcut(drag, Some(&drop_id), cx)
-                            }))
-                            .context_menu(move |menu, window, cx| {
+                            .trigger(ShortcutTrigger(
+                                div()
+                                    .id(SharedString::from(format!("app-shortcut-{id}")))
+                                    .relative()
+                                    .flex_shrink_0()
+                                    .debug_selector(move || {
+                                        format!("shortcut-{}", shortcut.bundle_id)
+                                    })
+                                    .w(px(30.))
+                                    .h(px(32.))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(rgb(0x35404e)))
+                                    .child(
+                                        app_icon(self.apps.icon_for(&id), 24.).opacity(if busy {
+                                            0.6
+                                        } else {
+                                            1.
+                                        }),
+                                    )
+                                    .when(self.apps.foreground.as_deref() == Some(&id), |d| {
+                                        d.child(
+                                            div()
+                                                .absolute()
+                                                .bottom_0()
+                                                .size(px(3.))
+                                                .rounded_full()
+                                                .bg(rgb(0x8abfff)),
+                                        )
+                                    })
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.dispatch_app(AppCommand::Launch(launch_id.clone()), cx)
+                                    }))
+                                    .on_drag(drag, |drag, _, _, cx| cx.new(|_| drag.clone()))
+                                    .on_drop(cx.listener(
+                                        move |this, drag: &ShortcutDrag, _, cx| {
+                                            this.drop_app_shortcut(drag, Some(&drop_id), cx)
+                                        },
+                                    ))
+                                    .into_any_element(),
+                            ))
+                            .content(move |_, _, cx| {
+                                let menu_view = cx.entity().downgrade();
                                 let restart = menu_entity.clone();
                                 let terminate = menu_entity.clone();
                                 let remove = menu_entity.clone();
                                 let restart_id = menu_id.clone();
                                 let terminate_id = menu_id.clone();
                                 let remove_id = menu_id.clone();
-                                let menu_view = cx.entity().downgrade();
-                                let previous_focus = window.focused(cx);
-                                // A compact row of icon buttons. Clicks bubble to the
-                                // containing menu item, which dismisses and restores focus.
-                                menu.min_w(px(120.))
-                                    .max_w(px(120.))
-                                    .item(PopupMenuItem::element(move |_, _| {
-                                        let restart = restart.clone();
-                                        let terminate = terminate.clone();
-                                        let remove = remove.clone();
-                                        let restart_id = restart_id.clone();
-                                        let terminate_id = terminate_id.clone();
-                                        let remove_id = remove_id.clone();
-                                        h_flex()
-                                            .id("app-actions")
-                                            .debug_selector(|| "app-actions".into())
-                                            .gap_1()
-                                            .child(app_action_button(
-                                                "restart-app",
-                                                AppActionIcon::Restart,
-                                                "重启 App",
-                                                can_restart,
-                                                menu_view.clone(),
-                                                previous_focus.clone(),
-                                                move |cx| {
-                                                    restart.update(cx, |this, cx| {
-                                                        this.dispatch_app(
-                                                            AppCommand::Restart(restart_id.clone()),
-                                                            cx,
-                                                        )
-                                                    });
-                                                },
-                                            ))
-                                            .child(app_action_button(
-                                                "terminate-app",
-                                                AppActionIcon::Terminate,
-                                                "关闭 App",
-                                                can_terminate,
-                                                menu_view.clone(),
-                                                previous_focus.clone(),
-                                                move |cx| {
-                                                    terminate.update(cx, |this, cx| {
-                                                        this.dispatch_app(
-                                                            AppCommand::Terminate(
-                                                                terminate_id.clone(),
-                                                            ),
-                                                            cx,
-                                                        )
-                                                    });
-                                                },
-                                            ))
-                                            .child(app_action_button(
-                                                "remove-app-shortcut",
-                                                AppActionIcon::RemoveShortcut,
-                                                "移出快捷栏",
-                                                true,
-                                                menu_view.clone(),
-                                                previous_focus.clone(),
-                                                move |cx| {
-                                                    remove.update(cx, |this, cx| {
-                                                        this.remove_app_shortcut(&remove_id, cx)
-                                                    });
-                                                },
-                                            ))
-                                    }))
+                                h_flex()
+                                    .id("app-actions")
+                                    .debug_selector(|| "app-actions".into())
+                                    .gap_1()
+                                    .child(app_action_button(
+                                        "restart-app",
+                                        AppActionIcon::Restart,
+                                        "重启 App",
+                                        can_restart,
+                                        menu_view.clone(),
+                                        cx,
+                                        move |cx| {
+                                            restart.update(cx, |this, cx| {
+                                                this.dispatch_app(
+                                                    AppCommand::Restart(restart_id.clone()),
+                                                    cx,
+                                                )
+                                            });
+                                        },
+                                    ))
+                                    .child(app_action_button(
+                                        "terminate-app",
+                                        AppActionIcon::Terminate,
+                                        "关闭 App",
+                                        can_terminate,
+                                        menu_view.clone(),
+                                        cx,
+                                        move |cx| {
+                                            terminate.update(cx, |this, cx| {
+                                                this.dispatch_app(
+                                                    AppCommand::Terminate(terminate_id.clone()),
+                                                    cx,
+                                                )
+                                            });
+                                        },
+                                    ))
+                                    .child(app_action_button(
+                                        "remove-app-shortcut",
+                                        AppActionIcon::RemoveShortcut,
+                                        "移出快捷栏",
+                                        true,
+                                        menu_view,
+                                        cx,
+                                        move |cx| {
+                                            remove.update(cx, |this, cx| {
+                                                this.remove_app_shortcut(&remove_id, cx)
+                                            });
+                                        },
+                                    ))
                             })
                     })),
             )
@@ -772,9 +840,6 @@ impl SessionView {
                                     if *open {
                                         let keys = this.keys.release_all();
                                         this.send_keys(keys);
-                                        this.apps
-                                            .search
-                                            .update(cx, |search, cx| search.focus(window, cx));
                                         if this.apps.caps.as_ref().is_some_and(|c| c.list) {
                                             this.apps.loading = true;
                                             this.handle.app(AppCommand::List);
@@ -795,16 +860,7 @@ impl SessionView {
             )
     }
     fn render_app_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let query = self.apps.search.read(cx).value().to_lowercase();
-        let apps: Vec<_> = self
-            .apps
-            .installed
-            .iter()
-            .filter(|a| {
-                a.name.to_lowercase().contains(&query)
-                    || a.bundle_id.to_lowercase().contains(&query)
-            })
-            .collect();
+        let apps: Vec<_> = self.apps.installed.iter().collect();
         let message = if self.phase != Phase::Connected {
             Some("未连接")
         } else if self.apps.caps.is_none() {
@@ -836,21 +892,11 @@ impl SessionView {
                     .items_center()
                     .gap_1()
                     .child(
-                        div().flex_1().min_w_0().child(
-                            Input::new(&self.apps.search)
-                                .small()
-                                .appearance(false)
-                                .bg(rgb(0x29323e))
-                                .text_color(theme::toolbar_fg())
-                                .rounded_md()
-                                .border_1()
-                                .border_color(theme::toolbar_line())
-                                .prefix(
-                                    Icon::new(IconName::Search)
-                                        .small()
-                                        .text_color(theme::toolbar_muted()),
-                                ),
-                        ),
+                        div()
+                            .flex_1()
+                            .text_size(px(11.))
+                            .text_color(theme::toolbar_muted())
+                            .child("快捷启动"),
                     )
                     .when(self.apps.caps.as_ref().is_some_and(|c| c.list), |row| {
                         row.child(
@@ -1036,6 +1082,30 @@ mod tests {
         });
         cx.run_until_parked();
         cx.update(|window, cx| window.draw(cx).clear(cx));
+    }
+    #[gpui::test]
+    fn uninstalled_shortcuts_hide_in_toolbar_and_environment_grid(cx: &mut TestAppContext) {
+        let (view, cx, _) = setup(cx, false);
+        enable(&view, cx);
+        assert!(cx.debug_bounds("shortcut-com.tencent.xin").is_some());
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.apply_app_event(AppEvent::List(vec![]), cx);
+                view.open_app_environment(None, window, cx);
+                assert!(
+                    view.apps
+                        .shortcuts
+                        .iter()
+                        .any(|app| app.bundle_id == "com.tencent.xin")
+                );
+            });
+            window.draw(cx).clear(cx);
+        });
+        assert!(cx.debug_bounds("shortcut-com.tencent.xin").is_none());
+        assert!(cx.debug_bounds("environment-app-com.tencent.xin").is_none());
+        enable(&view, cx);
+        assert!(cx.debug_bounds("shortcut-com.tencent.xin").is_some());
+        assert!(cx.debug_bounds("environment-app-com.tencent.xin").is_none());
     }
     #[gpui::test]
     fn offscreen_app_action_icons_dispatch_once_and_dismiss(cx: &mut TestAppContext) {
@@ -1237,7 +1307,7 @@ mod tests {
         assert!(peer.commands.try_recv().is_err());
     }
     #[gpui::test]
-    fn offscreen_app_picker_search_does_not_send_remote_keys(cx: &mut TestAppContext) {
+    fn offscreen_app_picker_keeps_keyboard_local(cx: &mut TestAppContext) {
         let (view, cx, mut peer) = setup(cx, false);
         enable(&view, cx);
         let bounds = cx.debug_bounds("app-plus").unwrap();
@@ -1251,9 +1321,6 @@ mod tests {
                 .iter()
                 .all(|c| !matches!(c, SessionCommand::Input(_)))
         );
-        view.read_with(cx, |view, cx| {
-            assert!(!view.apps.search.read(cx).value().is_empty())
-        });
     }
     #[gpui::test]
     fn offscreen_app_refresh_retries_failed_icons(cx: &mut TestAppContext) {

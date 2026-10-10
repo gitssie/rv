@@ -1,26 +1,39 @@
 # TrollVNC App control v1
 
 RV's session toolbar launches an installed iOS App by clicking its real icon.
-Right-click provides **重启 App**, **关闭 App**, and **移出快捷栏**. The `+` panel searches
+Right-click provides **环境与备份**, **重启 App**, **关闭 App**, and **移出快捷栏**.
+The environment entry opens the selected App’s backup records and contextual actions.
+Its common App grid shares these toolbar favorites; App-state operations in progress
+or with unknown results disable launch, stop and restart controls. The `+` panel searches
 the installed App list by name or Bundle ID, and adds/removes favorites. Drag a
 shortcut before another icon to reorder it; drop on `+` to move it to the end.
 Favorites (up to 32) belong to a saved connection and survive restart. Unsaved
 connections keep changes for the current session. A dot marks the last reported
 foreground App, fetched on connection and after App actions. This is not a list of background
-processes. The installed list must load successfully before launch controls enable.
+processes. Toolbar and environment-grid shortcuts are shown only when present in the phone’s
+installed App list. Until that list loads, saved shortcuts stay hidden; uninstalling
+an App hides its shortcut without deleting the saved favorite. The installed list
+must load successfully before launch controls enable.
 
-Both RV and TrollVNC need these changes. The App extension is independent of
-Tight security and of the File Transfer setting. An older/non-TrollVNC peer can
-ignore the pseudo encoding and continue normal RFB input/frame updates. RV never
-sends App requests until it receives capabilities. The `+` panel stays minimal when support is unavailable. Client view-only and server view-only both disable mutations; favorites
-can still be edited locally. In narrow windows, keyboard shortcuts move into the
-terminal-icon popover so App shortcuts and connection controls remain available.
+RV and TrollVNC form one product with a fixed ZXTouch control protocol. App
+management, Home and clipboard writes use ZXTouch exclusively. Each operation
+opens a new TCP connection, authenticates with task 33, receives its reply and
+closes the socket. The command worker may persist; its TCP socket does not. An unavailable
+control connection disables those capabilities and reports errors; requests are
+never rerouted to VNC or replayed. VNC carries frames, ordinary keyboard/pointer
+input, file transfers and the existing lock/notification operations.
+
+The connection editor places **ZXTouch 端口** immediately after the VNC address.
+It derives the host from VNC and fills the default port **6000** automatically;
+clearing the field also uses 6000. Enter 1–65535 for a custom or forwarded port. The setting belongs to each saved connection.
+There is no control-channel enable switch. Passwords continue using the existing
+local password file. Client and server view-only both reject mutations.
 
 ## Negotiation and wire format
 
 After authentication, RV includes pseudo encoding `0xC0A1A990` in SetEncodings.
 An implementing server immediately replies with operation 0 / request ID 0.
-All frames use a 12-byte header followed by UTF-8 JSON:
+The capabilities reply and remaining VNC operations use a 12-byte header followed by UTF-8 JSON:
 
 | Offset | Size | Field |
 | --- | --- | --- |
@@ -62,12 +75,23 @@ shortcut pastes the current remote clipboard and respects view-only mode.
 
 ## Execution and limitations
 
-The server serializes App work on a queue, holds a LibVNCServer client reference
-for pending work, and locks `sendMutex` when writing each complete response.
-Each client can queue at most eight requests. Requests waiting more than eight
-seconds expire before execution. RV allows four outstanding requests, preserves
-click order among mutations, and times out after 12 seconds without automatic
-replay. A client timeout means the operation's result is unknown.
+The capabilities JSON contains `zx_control:{version:1,port:6000,token:"64 hex characters"}`.
+The server generates a fresh random token for the authenticated VNC session and
+revokes it on disconnect or extension disablement. RV does not persist or log it.
+Task 33 on ZXTouch sends `33` + Base64(JSON) + CRLF, with envelope
+`{version:1,token,op,id,payload}`. Replies are `0;;` + Base64(JSON) + CRLF with
+`{version:1,op,id,status,payload}`. Operation 0 / ID 0 authorizes the connection;
+operations 1–6, 12 and 16 use nonzero IDs. VNC rejects these migrated operations
+and ignores inbound cut-text writes. Server-to-client clipboard observation remains
+on VNC. The 4 KiB payload and 1 MiB reply limits apply on both transports.
+
+The server serializes control work and rejects stale queued requests. RV sends
+one ZXTouch command at a time, preserves order, bounds queues, and times out after
+12 seconds. Disconnect or timeout reports unknown results, fails queued requests
+and disables the migrated capabilities. A delayed clipboard write checks live
+authorization on the main thread and is cancelled if it has not started by timeout.
+ZXTouch is plaintext; RV does not transmit the session token from a TLS/VeNCrypt
+VNC connection onto this channel. Use the shared WireGuard transport when needed.
 
 App enumeration/open uses available `LSApplicationWorkspace` / `LSApplicationProxy`
 selectors. Hidden services, App Clips and unavailable placeholders are excluded.
@@ -202,3 +226,6 @@ The toolbar uses 28px controls, app shortcuts, a single Home action, a PNG scree
 Capability `clipboard_write` enables operation 16 with `{ "token": "UUID", "text": "UTF-8 text" }`, returning `{ "ok": true, "token": "same UUID" }`. The usual 4 KiB JSON request bound applies. Client and server read-only modes reject writes. The server dispatches UIPasteboard work to the main queue and confirms readback; timeout means unknown, never an automatic replay.
 
 Capability `photo_tasks` enables persisted idempotent PhotoKit import receipts. RV uploads under `rv-upload-{UUID}-{16-hex-attempt-nonce}--{filename}`; the server also accepts legacy `rv-upload-{UUID}--{filename}` names. The nonce isolates staging files without changing task identity. RV reuses the existing File Management import and task-query operations. Before importing, the server persists the UUID and checksum; repeated UUID/checksum requests return the existing task. Changed checksums are rejected. An unfinished receipt after restart is unknown and cannot initiate another import. A missing task requires user confirmation that the asset was not imported before resuming under the original UUID. A query that could not be sent keeps the import unknown. A definite failure before commitment is prefixed `Photo import not committed: `; other post-submission failures stay unknown. A successful commit carrying an asset ID is complete even if immediate fetch verification returns `verified: false`. See [implementation and limitations](work-assistant-implementation.md).
+
+
+2026-10-10: Apple tasks use independent runtime workers and scoped events/panels. Unknown outcomes retain the original operation result without disabling other tasks or tabs. Inputs stay local and are read-only only while their own request executes. Disconnect releases busy/challenge in all cached panels while preserving inputs and operation IDs. Background App State results do not apply another App's visible catalog or start a hidden automatic refresh. The App Store sign-out task targets current selected media only; queryAccountState provides local current-account preflight without profile network requests.

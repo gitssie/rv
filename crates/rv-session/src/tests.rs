@@ -276,6 +276,7 @@ fn request_for(port: u16) -> ConnectRequest {
         clipboard: ClipboardMode::Utf8,
         local_cursor: rv_core::LocalCursorMode::Automatic,
         view_only: false,
+        zxtouch_port: None,
         shared: true,
     }
 }
@@ -641,7 +642,9 @@ fn ascii_clipboard_on_real_libvncserver_matches_in_both_modes() {
         SessionEvent::Connected { .. }
     )));
     let address = "user@example.com";
-    handle.copy_text(address.into());
+    handle.send(crate::SessionCommand::Input(vnc::X11Event::CopyText(
+        address.into(),
+    )));
     let output = remote.path().join("clipboard.txt");
     let deadline = Instant::now() + Duration::from_secs(5);
     while !output.exists() {
@@ -668,7 +671,9 @@ fn ascii_clipboard_on_real_libvncserver_matches_in_both_modes() {
         Duration::from_secs(5),
         |event| matches!(event, SessionEvent::Connected { .. })
     ));
-    latin1_handle.copy_text(address.into());
+    latin1_handle.send(crate::SessionCommand::Input(vnc::X11Event::CopyText(
+        address.into(),
+    )));
     let latin1_output = remote.path().join("clipboard-latin1.txt");
     let deadline = Instant::now() + Duration::from_secs(5);
     while !latin1_output.exists() {
@@ -1236,7 +1241,9 @@ fn assert_extended_clipboard_roundtrip(accepts_notify: bool) {
     ready_rx
         .recv_timeout(Duration::from_secs(5))
         .expect("client should complete Extended Clipboard capabilities exchange");
-    handle.copy_text("中文剪贴板".into());
+    handle.send(crate::SessionCommand::Input(vnc::X11Event::CopyText(
+        "中文剪贴板".into(),
+    )));
     assert!(
         wait_for(&handle, Duration::from_secs(5), |event| {
             matches!(event, SessionEvent::Clipboard(text) if text == "远程剪贴板")
@@ -1731,19 +1738,68 @@ fn notification_push_over_rfb_preserves_frames_and_revision() {
 }
 
 #[test]
-fn app_control_roundtrip_over_plain_rfb_preserves_framebuffer() {
+fn app_control_uses_zxtouch_and_configured_port_while_rfb_keeps_streaming() {
     use crate::{AppCommand, AppEvent};
-    use base64::Engine;
-    use serde_json::json;
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use serde_json::{Value, json};
+    use std::io::{BufRead, BufReader};
+    let zx = TcpListener::bind("127.0.0.1:0").unwrap();
+    let zx_port = zx.local_addr().unwrap().port();
+    let control = thread::spawn(move || {
+        let mut operations = Vec::new();
+        // Initial authorization probe plus six operations, each on a new socket.
+        for _ in 0..7 {
+            let (sock, _) = zx.accept().unwrap();
+            sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut sock = BufReader::new(sock);
+            loop {
+                let mut line = String::new();
+                if sock.read_line(&mut line).unwrap_or(0) == 0 {
+                    break;
+                }
+                let encoded = line.strip_prefix("33").unwrap().trim_end();
+                let request: Value =
+                    serde_json::from_slice(&STANDARD.decode(encoded).unwrap()).unwrap();
+                assert_eq!(request["token"], "a".repeat(64));
+                let op = request["op"].as_u64().unwrap();
+                operations.push(op);
+                let payload = match op {
+                    0 | 12 => json!({"ok":true}),
+                    1 => {
+                        json!({"apps":[{"bundle_id":"com.example.app","name":"Example","can_launch":true,"can_terminate":true}]})
+                    }
+                    2 => {
+                        assert_eq!(request["payload"]["bundle_id"], "com.example.app");
+                        json!({"bundle_id":"com.example.app"})
+                    }
+                    5 => json!({"bundle_id":null}),
+                    6 => {
+                        let image = image::RgbaImage::from_pixel(1, 1, image::Rgba([1, 2, 3, 255]));
+                        let mut png = std::io::Cursor::new(vec![]);
+                        image.write_to(&mut png, image::ImageFormat::Png).unwrap();
+                        json!({"png":STANDARD.encode(png.into_inner())})
+                    }
+                    16 => {
+                        assert_eq!(request["payload"]["text"], "手机文本");
+                        json!({"ok":true,"token":request["payload"]["token"]})
+                    }
+                    _ => panic!("unexpected ZX operation {op}"),
+                };
+                let reply =
+                    json!({"version":1,"op":op,"id":request["id"],"status":0,"payload":payload});
+                sock.get_mut()
+                    .write_all(format!("0;;{}\r\n", STANDARD.encode(reply.to_string())).as_bytes())
+                    .unwrap();
+            }
+        }
+        operations
+    });
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let server = thread::spawn(move || {
         let (mut sock, _) = listener.accept().unwrap();
         sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        rfb_handshake(&mut sock, 1, 1, b"apps-plain");
-        let mut saw_launch = false;
-        let mut saw_icon = false;
-        let mut foreground_queries = 0;
+        rfb_handshake(&mut sock, 1, 1, b"integrated-phone");
         loop {
             let mut typ = [0];
             if sock.read_exact(&mut typ).is_err() {
@@ -1755,105 +1811,50 @@ fn app_control_roundtrip_over_plain_rfb_preserves_framebuffer() {
                 }
                 2 => {
                     read_exact(&mut sock, 1);
-                    let n = u16::from_be_bytes(read_exact(&mut sock, 2).try_into().unwrap());
-                    let bytes = read_exact(&mut sock, n as usize * 4);
-                    let encodings: Vec<_> = bytes
-                        .chunks_exact(4)
-                        .map(|b| u32::from_be_bytes(b.try_into().unwrap()))
-                        .collect();
-                    assert!(encodings.contains(&0xC0A1_A990));
-                    assert!(
-                        !encodings.contains(&(vnc::VncEncoding::TrollFileManagementPseudo as u32)),
-                        "App extension must not depend on Tight file transfer"
-                    );
+                    let count = u16::from_be_bytes(read_exact(&mut sock, 2).try_into().unwrap());
+                    read_exact(&mut sock, count as usize * 4);
                     write_app_reply(
                         &mut sock,
                         0,
                         0,
-                        json!({"list":true,"launch":true,"icons":true,"foreground":true,"control":true}),
+                        json!({"list":true,"launch":true,"icons":true,"foreground":true,"home":true,"clipboard_write":true,"control":true,
+                        "zx_control":{"version":1,"port":1,"token":"a".repeat(64)}}),
                     );
                 }
                 3 => {
                     read_exact(&mut sock, 9);
                     sock.write_all(&[0, 0]).unwrap();
                     write_u16(&mut sock, 1);
-                    for v in [0, 0, 1, 1] {
-                        write_u16(&mut sock, v);
+                    for value in [0, 0, 1, 1] {
+                        write_u16(&mut sock, value);
                     }
                     write_u32(&mut sock, 0);
                     sock.write_all(&[11, 22, 33, 255]).unwrap();
                 }
-                139 => {
-                    let head = read_exact(&mut sock, 11);
-                    assert_eq!(head[0], 1);
-                    assert_eq!(head[2], 0);
-                    let id = u32::from_be_bytes(head[3..7].try_into().unwrap());
-                    assert_ne!(id, 0);
-                    let length = u32::from_be_bytes(head[7..11].try_into().unwrap()) as usize;
-                    let request: serde_json::Value =
-                        serde_json::from_slice(&read_exact(&mut sock, length)).unwrap();
-                    match head[1] {
-                        1 => write_app_reply(
-                            &mut sock,
-                            1,
-                            id,
-                            json!({"apps":[{"bundle_id":"com.example.app","name":"Example","can_launch":true,"can_terminate":true}]}),
-                        ),
-                        2 => {
-                            assert_eq!(request["bundle_id"], "com.example.app");
-                            saw_launch = true;
-                            write_app_reply(
-                                &mut sock,
-                                2,
-                                id,
-                                json!({"bundle_id":"com.example.app"}),
-                            );
-                        }
-                        6 => {
-                            assert_eq!(request["bundle_id"], "com.example.app");
-                            saw_icon = true;
-                            let image =
-                                image::RgbaImage::from_pixel(1, 1, image::Rgba([1, 2, 3, 255]));
-                            let mut png = std::io::Cursor::new(vec![]);
-                            image.write_to(&mut png, image::ImageFormat::Png).unwrap();
-                            write_app_reply(
-                                &mut sock,
-                                6,
-                                id,
-                                json!({"png":base64::engine::general_purpose::STANDARD.encode(png.into_inner())}),
-                            );
-                        }
-                        5 => {
-                            foreground_queries += 1;
-                            write_app_reply(&mut sock, 5, id, json!({"bundle_id":null}));
-                        }
-                        op => panic!("Unexpected app operation {op}"),
-                    }
-                }
-                5 => {
-                    read_exact(&mut sock, 5);
-                }
-                typ => panic!("Unexpected RFB message {typ}"),
+                139 => panic!("Phone operations must never fall back to VNC"),
+                _ => panic!("Unexpected RFB message"),
             }
         }
-        assert!(saw_launch && saw_icon);
-        assert_eq!(
-            foreground_queries, 2,
-            "foreground queries should not poll indefinitely"
-        );
     });
-    let handle = SessionHandle::spawn(request_for(port));
+    let mut request = request_for(port);
+    request.zxtouch_port = Some(zx_port); // Override the advertised port.
+    let handle = SessionHandle::spawn(request);
     assert!(wait_for(
         &handle,
         Duration::from_secs(5),
-        |e| matches!(e, SessionEvent::Apps(AppEvent::List(apps)) if apps.len() == 1)
+        |event| matches!(event,SessionEvent::Apps(AppEvent::List(apps)) if apps.len()==1)
     ));
     handle.app(AppCommand::Icon("com.example.app".into()));
     handle.app(AppCommand::Launch("com.example.app".into()));
+    handle.app(AppCommand::Home);
+    handle.app(AppCommand::WriteClipboard {
+        token: uuid::Uuid::new_v4().to_string(),
+        text: "手机文本".into(),
+    });
     let deadline = Instant::now() + Duration::from_secs(5);
+    let mut completed = 0;
     let mut icon = false;
-    let mut launched = false;
-    while Instant::now() < deadline && !(icon && launched) {
+    while Instant::now() < deadline && (completed < 3 || !icon) {
         for event in handle.drain() {
             match event {
                 SessionEvent::Apps(AppEvent::Icon {
@@ -1866,22 +1867,28 @@ fn app_control_roundtrip_over_plain_rfb_preserves_framebuffer() {
                     assert_eq!(bgra, [3, 2, 1, 255]);
                     icon = true;
                 }
-                SessionEvent::Apps(AppEvent::Finished(AppCommand::Launch(_))) => launched = true,
+                SessionEvent::Apps(AppEvent::Finished(
+                    AppCommand::Launch(_) | AppCommand::Home | AppCommand::WriteClipboard { .. },
+                )) => completed += 1,
                 SessionEvent::Apps(AppEvent::Failed { message, .. }) => panic!("{message}"),
                 _ => {}
             }
         }
         thread::sleep(Duration::from_millis(10));
     }
-    assert!(icon && launched);
+    assert!(icon && completed == 3);
     assert_eq!(
         &handle.framebuffer.lock().unwrap().pixels[..4],
         &[11, 22, 33, 255]
     );
-    thread::sleep(Duration::from_millis(2300));
     handle.close();
     drop(handle);
     server.join().unwrap();
+    let operations = control.join().unwrap();
+    assert_eq!(operations.iter().filter(|&&op| op == 0).count(), 7);
+    for op in [1, 2, 5, 6, 12, 16] {
+        assert_eq!(operations.iter().filter(|&&seen| seen == op).count(), 1);
+    }
 }
 
 #[test]

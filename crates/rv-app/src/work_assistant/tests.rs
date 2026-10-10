@@ -1,6 +1,165 @@
 use super::{WorkAssistant, persistence};
 use gpui::{AppContext, Focusable, TestAppContext};
 use rv_core::assistant::{AssistantService, Draft};
+
+fn click(cx: &mut gpui::VisualTestContext, selector: &'static str) {
+    cx.update(|w, cx| w.draw(cx).clear(cx));
+    let bounds = cx.debug_bounds(selector).expect("control must be visible");
+    cx.simulate_mouse_move(bounds.center(), None, gpui::Modifiers::default());
+    cx.simulate_click(bounds.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+}
+
+fn settle(cx: &mut gpui::VisualTestContext, view: &gpui::Entity<WorkAssistant>) {
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        cx.run_until_parked();
+        if !view.read_with(cx, |v, _| v.busy || v.save_busy) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < until,
+            "assistant operation did not finish"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+}
+
+#[gpui::test]
+fn template_edit_save_and_apply_persist_through_visible_controls(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        crate::bind_keys(cx);
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let service = AssistantService::shared(dir.path().to_owned());
+    let d = service
+        .call(|s| {
+            s.save_draft(&Draft {
+                title: "A long listing title that must be truncated in the selector".repeat(2),
+                ..Default::default()
+            })
+        })
+        .unwrap();
+    let id = d.id.clone();
+    let mut entity = None;
+    let (_, cx) = cx.add_window_view(|w, cx| {
+        let v = cx.new(|cx| WorkAssistant::new(service.clone(), w, cx));
+        v.update(cx, |v, cx| {
+            v.select_draft(d, w, cx);
+            v.tab = super::Tab::Templates;
+        });
+        entity = Some(v.clone());
+        gpui_component::Root::new(v, w, cx)
+    });
+    let v = entity.unwrap();
+    cx.simulate_resize(gpui::size(gpui::px(360.), gpui::px(650.)));
+    cx.update(|w, cx| {
+        v.read(cx).template_name.focus_handle(cx).focus(w, cx);
+        w.draw(cx).clear(cx);
+    });
+    cx.simulate_input("Listing description");
+    cx.update(|w, cx| {
+        v.read(cx).template_content.focus_handle(cx).focus(w, cx);
+        w.draw(cx).clear(cx);
+    });
+    cx.simulate_input("Excellent condition. Measurements on request.");
+    assert!(v.read_with(cx, |v, cx| v.template_dirty(cx)));
+    click(cx, "template-save");
+    settle(cx, &v);
+    let templates = service.call(|s| s.templates()).unwrap();
+    assert_eq!(templates.len(), 1);
+    assert_eq!(
+        templates[0].content,
+        "Excellent condition. Measurements on request."
+    );
+    assert!(!v.read_with(cx, |v, cx| v.template_dirty(cx)));
+    click(cx, "template-apply");
+    v.read_with(cx, |v, _| {
+        assert!(v.tab == super::Tab::Drafts);
+        assert!(v.dirty);
+        assert_eq!(v.draft.as_ref().unwrap().description, templates[0].content);
+    });
+    cx.update(|_, cx| v.update(cx, |v, cx| v.flush(cx)));
+    settle(cx, &v);
+    assert_eq!(
+        service
+            .call(move |s| s.load_draft(&id))
+            .unwrap()
+            .description,
+        templates[0].content
+    );
+    // The compact editor keeps key fields and send controls inside the panel.
+    cx.update(|w, cx| w.draw(cx).clear(cx));
+    for selector in [
+        "draft-picker",
+        "draft-new",
+        "draft-actions",
+        "send-title",
+        "send-description",
+        "draft-price-stock",
+    ] {
+        let bounds = cx.debug_bounds(selector).unwrap();
+        assert!(bounds.right() <= gpui::px(360.));
+        assert!(bounds.bottom() <= gpui::px(650.));
+    }
+}
+
+#[gpui::test]
+fn draft_send_controls_emit_only_when_connected_and_writable(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let dir = tempfile::tempdir().unwrap();
+    let service = AssistantService::shared(dir.path().to_owned());
+    let d = service
+        .call(|s| {
+            s.save_draft(&Draft {
+                title: "Blue cardigan".into(),
+                description: "Size M".into(),
+                ..Default::default()
+            })
+        })
+        .unwrap();
+    let mut entity = None;
+    let mut subscription = None;
+    let mut observer = None;
+    let (_, cx) = cx.add_window_view(|w, cx| {
+        let v = cx.new(|cx| WorkAssistant::new(service, w, cx));
+        v.update(cx, |v, cx| v.select_draft(d, w, cx));
+        observer = Some(cx.new(|cx| {
+            subscription = Some(cx.subscribe(
+                &v,
+                |events: &mut Vec<super::AssistantEvent>, _, event, _| events.push(event.clone()),
+            ));
+            Vec::<super::AssistantEvent>::new()
+        }));
+        entity = Some(v.clone());
+        gpui_component::Root::new(v, w, cx)
+    });
+    let v = entity.unwrap();
+    let observer = observer.unwrap();
+    cx.simulate_resize(gpui::size(gpui::px(360.), gpui::px(650.)));
+    click(cx, "send-title");
+    assert!(observer.read_with(cx, |v, _| v.is_empty()));
+    cx.update(|_, cx| {
+        v.update(cx, |v, cx| {
+            v.set_connection(true, false, false, false, false, cx)
+        })
+    });
+    click(cx, "send-title");
+    assert!(observer.read_with(cx, |v, _| v.is_empty()));
+    cx.update(|_, cx| {
+        v.update(cx, |v, cx| {
+            v.set_connection(true, true, false, false, false, cx)
+        })
+    });
+    click(cx, "send-title");
+    click(cx, "send-description");
+    observer.read_with(cx, |events, _| {
+        assert_eq!(events.len(), 2);
+        assert!(matches!(&events[0], super::AssistantEvent::SendText(t) if t == "Blue cardigan"));
+        assert!(matches!(&events[1], super::AssistantEvent::SendText(t) if t == "Size M"));
+    });
+}
 #[gpui::test]
 fn typing_stays_local_and_invalid_price_does_not_clear_store_conflict(cx: &mut TestAppContext) {
     cx.update(gpui_component::init);

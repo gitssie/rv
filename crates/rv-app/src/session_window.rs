@@ -19,8 +19,8 @@ use image::{ImageBuffer, Rgba};
 use smallvec::SmallVec;
 
 use rv_core::{
-    CAD_KEYSYMS, ClipboardMode, ConnectRequest, Keyboard, LocalCursorMode, ScaleMode,
-    TransferFolders, XK_ALT_L, XK_CONTROL_L,
+    CAD_KEYSYMS, ConnectRequest, Keyboard, LocalCursorMode, ScaleMode, TransferFolders, XK_ALT_L,
+    XK_CONTROL_L,
 };
 use rv_session::{FileCommand, SessionEvent, SessionHandle, TransferStatus};
 
@@ -102,6 +102,7 @@ fn password_error(message: &str) -> bool {
 }
 
 pub struct SessionView {
+    functions: functions_ui::FunctionUi,
     assistant: Option<Entity<crate::work_assistant::WorkAssistant>>,
     assistant_open: bool,
     assistant_subscription: Option<Subscription>,
@@ -226,7 +227,18 @@ impl SessionView {
 
         let apps = apps_ui::AppToolbar::new(app_shortcuts, window, cx);
         let unlock = unlock_ui::UnlockUI::new(window, cx);
+        let environment_apps = req
+            .connection_id
+            .and_then(|id| {
+                address_book
+                    .as_ref()
+                    .and_then(WeakEntity::upgrade)
+                    .map(|book| book.read(cx).environment_apps(id))
+            })
+            .unwrap_or_default();
+        let functions = functions_ui::FunctionUi::new(environment_apps, window, cx);
         Self {
+            functions,
             assistant: None,
             assistant_open: false,
             assistant_subscription: None,
@@ -396,6 +408,7 @@ impl SessionView {
             changed = true;
             match ev {
                 SessionEvent::Apps(event) => self.apply_app_event(event, cx),
+                SessionEvent::Functions(event) => self.apply_function_event(event, cx),
                 SessionEvent::Status(s) => self.status = s.into(),
                 SessionEvent::Connected { width, height } => {
                     self.fb_w = width;
@@ -443,6 +456,7 @@ impl SessionView {
                             .schedule(self.error.as_deref(), std::time::Instant::now());
                     }
                     self.unlock.disconnected();
+                    self.functions.disconnected();
                     self.assistant_clipboard = None;
                     self.assistant_batch = None;
                     self.assistant_feedback(
@@ -656,14 +670,11 @@ impl SessionView {
         if let Some(item) = cx.read_from_clipboard()
             && let Some(text) = item.text()
         {
-            if self.req.clipboard == ClipboardMode::Latin1
-                && text.chars().any(|character| character as u32 > 0xff)
-            {
-                self.status = "Clipboard not sent: text is not valid Latin-1".into();
-                return;
-            }
-            self.handle.copy_text(text);
-            self.status = "Clipboard sent".into();
+            self.handle.app(rv_session::AppCommand::WriteClipboard {
+                token: uuid::Uuid::new_v4().to_string(),
+                text,
+            });
+            self.status = "Clipboard request sent".into();
         }
     }
 
@@ -749,6 +760,27 @@ impl SessionView {
     }
 
     fn handle_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.apps.picker_open {
+            if event.keystroke.key == "escape" {
+                self.apps.picker_open = false;
+                cx.notify();
+            }
+            self.consume_key(window, cx);
+            return;
+        }
+        if self.functions.open {
+            if event.keystroke.key == "escape" {
+                if self.function_editor_visible() {
+                    self.close_function_editor(window, cx);
+                } else {
+                    self.functions.open = false;
+                    self.clear_function_text(window, cx);
+                    self.focus.focus(window, cx);
+                    cx.notify();
+                }
+            }
+            return;
+        }
         if self.notifications.open {
             if event.keystroke.key == "escape" {
                 self.notifications.open = false;
@@ -760,6 +792,8 @@ impl SessionView {
         if self.phase != Phase::Connected
             || self.unlock.blocks_input()
             || self.notifications.open
+            || self.apps.picker_open
+            || self.functions.open
             || !self.focus.is_focused(window)
         {
             return;
@@ -829,6 +863,8 @@ impl SessionView {
         if self.phase != Phase::Connected
             || self.unlock.blocks_input()
             || self.notifications.open
+            || self.apps.picker_open
+            || self.functions.open
             || !self.focus.is_focused(window)
         {
             return;
@@ -859,6 +895,8 @@ impl SessionView {
         if self.phase != Phase::Connected
             || self.unlock.blocks_input()
             || self.notifications.open
+            || self.apps.picker_open
+            || self.functions.open
             || !self.focus.is_focused(window)
         {
             return;
@@ -888,6 +926,7 @@ impl SessionView {
             .bg(theme::toolbar())
             .text_color(theme::toolbar_fg())
             .child(tool_btn(
+                cx,
                 "pin",
                 if self.pin_toolbar {
                     IconName::Star
@@ -905,8 +944,8 @@ impl SessionView {
                     cx.notify();
                 }),
             ))
-            .child(toolbar_sep())
             .child(tool_btn(
+                cx,
                 "full",
                 if fullscreen {
                     IconName::Minimize
@@ -924,8 +963,8 @@ impl SessionView {
                 Button::new("scale")
                     .ghost()
                     .text_color(theme::toolbar_fg())
-                    .icon(IconName::ResizeCorner)
                     .small()
+                    .px_2()
                     .h(px(28.))
                     .label(match self.scale {
                         ScaleMode::Actual => "100%",
@@ -939,48 +978,11 @@ impl SessionView {
                     })),
             )
             .child(toolbar_sep())
-            .when(!compact, |bar| {
-                bar.child(
-                    tool_btn(
-                        "cad",
-                        IconName::SquareTerminal,
-                        "Send Ctrl+Alt+Del",
-                        cx.listener(|this, _, _, cx| {
-                            this.send_cad();
-                            cx.notify();
-                        }),
-                    )
-                    .disabled(!live),
-                )
-                .child(key_chip(
-                    "Ctrl",
-                    cx.listener(|this, _, _, _| this.tap_key(XK_CONTROL_L)),
-                ))
-                .child(key_chip(
-                    "Alt",
-                    cx.listener(|this, _, _, _| this.tap_key(XK_ALT_L)),
-                ))
-                .child(key_chip(
-                    "Win",
-                    cx.listener(|this, _, _, _| this.tap_key(rv_core::XK_SUPER_L)),
-                ))
-                .child(key_chip(
-                    "Tab",
-                    cx.listener(|this, _, _, _| this.tap_key(rv_core::XK_TAB)),
-                ))
-                .child(key_chip(
-                    "Esc",
-                    cx.listener(|this, _, _, _| this.tap_key(rv_core::XK_ESCAPE)),
-                ))
-                .child(key_chip(
-                    "Caps",
-                    cx.listener(|this, _, _, _| this.tap_key(rv_core::XK_CAPS_LOCK)),
-                ))
-            })
-            .when(compact, |bar| bar.child(self.render_keyboard_shortcuts(cx)))
+            .child(self.render_keyboard_shortcuts(cx))
             .child(toolbar_sep())
             .child(
                 tool_btn(
+                    cx,
                     "clip",
                     IconName::Copy,
                     "Send clipboard to remote",
@@ -994,6 +996,7 @@ impl SessionView {
             .child(toolbar_sep())
             .child(
                 tool_btn(
+                    cx,
                     "files",
                     IconName::Folder,
                     "File transfer window",
@@ -1026,18 +1029,24 @@ impl SessionView {
             .child(self.render_app_toolbar(cx))
             .child(self.render_notification_button(cx))
             .child(div().flex_1())
-            .child(
-                Button::new("work-assistant-toggle")
-                    .debug_selector(|| "work-assistant-toggle".into())
-                    .ghost()
-                    .small()
-                    .h(px(28.))
-                    .icon(IconName::PanelRight)
-                    .label("助手")
-                    .when(self.assistant_open, |b| b.bg(rgb(0x2a3a50)))
-                    .text_color(theme::toolbar_fg())
-                    .on_click(cx.listener(|this, _, window, cx| this.toggle_assistant(window, cx))),
-            )
+            .child(self.render_function_button(compact, cx))
+            // Keep the assistant implementation while its UI entry is disabled.
+            .when(false, |toolbar| {
+                toolbar.child(
+                    Button::new("work-assistant-toggle")
+                        .debug_selector(|| "work-assistant-toggle".into())
+                        .ghost()
+                        .small()
+                        .h(px(28.))
+                        .icon(IconName::PanelRight)
+                        .label("助手")
+                        .when(self.assistant_open, |b| b.bg(rgb(0x2a3a50)))
+                        .text_color(theme::toolbar_fg())
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.toggle_assistant(window, cx)),
+                        ),
+                )
+            })
             .child(
                 div()
                     .text_xs()
@@ -1365,126 +1374,6 @@ impl SessionView {
             )
     }
 
-    fn render_ended(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let failed = self.error.is_some();
-        let auth_failed = self.error.as_deref().is_some_and(password_error);
-        div()
-            .id("session-ended")
-            .occlude()
-            .absolute()
-            .inset_0()
-            .flex()
-            .items_center()
-            .justify_center()
-            .bg(theme::scrim())
-            .child(
-                v_flex()
-                    .w(px(if auth_failed { 480. } else { 380. }))
-                    .max_w_full()
-                    .gap_3()
-                    .p_5()
-                    .rounded_lg()
-                    .bg(theme::card(cx))
-                    .border_1()
-                    .border_color(theme::line(cx))
-                    .shadow_lg()
-                    .text_color(theme::ink(cx))
-                    .child(
-                        h_flex()
-                            .gap_3()
-                            .items_start()
-                            .child(
-                                Icon::new(if failed {
-                                    IconName::TriangleAlert
-                                } else {
-                                    IconName::CircleCheck
-                                })
-                                .large()
-                                .text_color(if failed {
-                                    rgb(0xE9A11B).into()
-                                } else {
-                                    theme::muted(cx)
-                                }),
-                            )
-                            .child(
-                                v_flex()
-                                    .min_w_0()
-                                    .gap_2()
-                                    .child(div().text_lg().font_semibold().child(if failed {
-                                        "Connection failed"
-                                    } else {
-                                        "Disconnected"
-                                    }))
-                                    .child(div().text_sm().text_color(theme::muted(cx)).child(
-                                        if auth_failed {
-                                            "Password rejected. Enter a new password to reconnect."
-                                                .into()
-                                        } else {
-                                            self.error.clone().unwrap_or_else(|| {
-                                                format!(
-                                                    "The session with {} has ended.",
-                                                    self.host()
-                                                )
-                                                .into()
-                                            })
-                                        },
-                                    )),
-                            ),
-                    )
-                    .when(auth_failed, |this| {
-                        this.child(
-                            v_flex()
-                                .gap_2()
-                                .child(div().text_sm().font_medium().child("Password"))
-                                .child(
-                                    Input::new(&self.password_input)
-                                        .large()
-                                        .w_full()
-                                        .aria_label("Password for reconnect"),
-                                )
-                                .when_some(self.password_validation.clone(), |this, error| {
-                                    this.child(
-                                        div().text_xs().text_color(theme::danger(cx)).child(error),
-                                    )
-                                })
-                                .child(
-                                    div().mt_1().child(
-                                        Checkbox::new("retry-remember-password")
-                                            .checked(self.remember_password)
-                                            .label("Remember password")
-                                            .on_click(cx.listener(
-                                                |this, checked: &bool, _, cx| {
-                                                    this.remember_password = *checked;
-                                                    cx.notify();
-                                                },
-                                            )),
-                                    ),
-                                ),
-                        )
-                    })
-                    .child(
-                        h_flex()
-                            .justify_end()
-                            .gap_3()
-                            .child(Button::new("ended-close").label("Close").on_click(
-                                cx.listener(|this, _, window, cx| this.close_window(window, cx)),
-                            ))
-                            .child(
-                                Button::new("ended-retry")
-                                    .primary()
-                                    .label("Reconnect")
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        if auth_failed {
-                                            this.retry_with_password(window, cx);
-                                        } else {
-                                            this.reconnect(window, cx);
-                                        }
-                                    })),
-                            ),
-                    ),
-            )
-    }
-
     fn render_picture(&self, cx: &Context<Self>) -> AnyElement {
         let Some(image) = self.render_image.clone() else {
             return v_flex()
@@ -1620,13 +1509,17 @@ impl Drop for SessionView {
 
 impl Render for SessionView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.fill_received_verification_code(window, cx);
         self.update_local_cursor(window, cx);
         let width = window.viewport_size().width;
+        let height = window.viewport_size().height;
         let fullscreen = window.is_fullscreen();
         let show_pinned = self.pin_toolbar;
         let remote_keyboard_active = self.phase == Phase::Connected
             && !self.unlock.blocks_input()
             && !self.notifications.open
+            && !self.apps.picker_open
+            && !self.functions.open
             && self.focus.is_focused(window);
 
         v_flex()
@@ -1716,6 +1609,18 @@ impl Render for SessionView {
                     .child(
                         div()
                             .id("vnc-canvas")
+                            .when(
+                                self.functions.open
+                                    && width >= px(1100.)
+                                    && self.scale == ScaleMode::Fit,
+                                |canvas| {
+                                    canvas.mr(px(if self.function_editor_visible() {
+                                        772.
+                                    } else {
+                                        408.
+                                    }))
+                                },
+                            )
                             .relative()
                             .overflow_hidden()
                             .min_h_0()
@@ -1779,7 +1684,7 @@ impl Render for SessionView {
                         if let Some(assistant) = &self.assistant {
                             el.child(
                                 div()
-                                    .w(px((f32::from(width) * 0.45).clamp(280., 440.)))
+                                    .w(px((f32::from(width) * 0.34).clamp(280., 380.)))
                                     .max_w(relative(0.6))
                                     .h_full()
                                     .flex_shrink_0()
@@ -1798,17 +1703,31 @@ impl Render for SessionView {
                     .when(self.show_menu, |this| {
                         this.child(self.render_menu(fullscreen, cx))
                     })
+                    .when(self.functions.open, |this| {
+                        this.child(self.render_functions(
+                            f32::from(width),
+                            f32::from(height)
+                                - if fullscreen {
+                                    0.
+                                } else {
+                                    f32::from(gpui_component::TITLE_BAR_HEIGHT)
+                                }
+                                - if show_pinned {
+                                    f32::from(theme::toolbar_height())
+                                } else {
+                                    0.
+                                },
+                            cx,
+                        ))
+                    })
                     .when(self.notifications.open, |this| {
                         this.child(self.render_notifications(cx))
                     })
                     .when(
-                        self.recovery.deadline.is_some()
-                            || (self.phase == Phase::Connecting && self.recovery.attempt > 0),
+                        self.phase == Phase::Ended
+                            || (self.recovery.visible
+                                && matches!(self.phase, Phase::Connecting | Phase::Disconnecting)),
                         |this| this.child(self.render_recovery(cx)),
-                    )
-                    .when(
-                        self.phase == Phase::Ended && self.recovery.deadline.is_none(),
-                        |this| this.child(self.render_ended(cx)),
                     )
                     .when(self.unlock.editing(), |this| {
                         this.child(self.render_unlock_setting(window, cx))
@@ -1865,10 +1784,15 @@ fn dest_rect(
 }
 
 fn toolbar_sep() -> impl IntoElement {
-    div().w(px(1.)).h(px(18.)).mx_1().bg(theme::toolbar_line())
+    div()
+        .w(px(1.))
+        .h(px(18.))
+        .mx_0p5()
+        .bg(theme::toolbar_line())
 }
 
 fn tool_btn(
+    cx: &App,
     id: &'static str,
     icon: impl Into<Icon>,
     tip: impl Into<SharedString>,
@@ -1876,27 +1800,19 @@ fn tool_btn(
 ) -> Button {
     let tip = tip.into();
     Button::new(id)
-        .ghost()
+        .custom(
+            gpui_component::button::ButtonCustomVariant::new(cx)
+                .foreground(theme::toolbar_fg())
+                .hover(rgb(0x2a343f).into())
+                .active(rgb(0x35404e).into()),
+        )
         .size(px(28.))
         .accessibility_label(tip.clone())
-        .icon(icon)
+        .icon(icon.into().size(px(15.)))
         // The toolbar is always dark; the ghost variant would otherwise use
         // the theme foreground, which is near-black in light mode.
         .text_color(theme::toolbar_fg())
         .tooltip(tip)
-        .on_click(on_click)
-}
-
-fn key_chip(
-    label: &'static str,
-    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-) -> impl IntoElement {
-    Button::new(label)
-        .xsmall()
-        .ghost()
-        .text_color(theme::toolbar_fg())
-        .label(label)
-        .tooltip(format!("Send {label}"))
         .on_click(on_click)
 }
 
@@ -1909,10 +1825,13 @@ fn menu_item(
     Button::new(id)
         .ghost()
         .small()
+        .h(px(26.))
+        .px_2()
+        .text_size(px(12.))
         .w_full()
         .justify_start()
         .text_color(theme::toolbar_fg())
-        .icon(icon)
+        .icon(icon.into().size(px(15.)))
         .label(label)
         .on_click(on_click)
 }
@@ -2180,8 +2099,12 @@ mod tests {
 mod apps_ui;
 mod assistant_bridge;
 mod controls_ui;
+mod functions_ui;
 mod reconnect;
 mod unlock_ui;
 
 #[cfg(test)]
 mod assistant_visual_tests;
+
+#[cfg(test)]
+mod functions_visual_tests;

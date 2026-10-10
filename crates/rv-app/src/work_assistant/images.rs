@@ -145,7 +145,8 @@ impl WorkAssistant {
             )
             .child(
                 h_flex()
-                    .gap_2()
+                    .gap_1()
+                    .items_start()
                     .flex_wrap()
                     .on_drop(cx.listener(|this, files: &ExternalPaths, _, cx| {
                         this.add_paths(files.paths().to_vec(), cx)
@@ -158,12 +159,12 @@ impl WorkAssistant {
                         let path = self.service.root.join(&image.relative_path);
                         v_flex()
                             .id(SharedString::from(format!("draft-image-{id}")))
-                            .w(px(72.))
+                            .w(px(48.))
                             .gap_1()
                             .child(
                                 div()
                                     .id(SharedString::from(format!("image-drag-{id}")))
-                                    .size(px(72.))
+                                    .size(px(48.))
                                     .relative()
                                     .rounded_md()
                                     .overflow_hidden()
@@ -205,7 +206,8 @@ impl WorkAssistant {
                                         Button::new(SharedString::from(format!("remove-{id}")))
                                             .ghost()
                                             .xsmall()
-                                            .label("×")
+                                            .icon(IconName::Close)
+                                            .tooltip("移除本地图片")
                                             .disabled(busy)
                                             .on_click(cx.listener(move |this, _, _, cx| {
                                                 this.remove_image(remove.clone(), cx)
@@ -217,29 +219,34 @@ impl WorkAssistant {
                         Button::new("add-draft-images")
                             .outline()
                             .small()
-                            .w(px(72.))
-                            .h(px(72.))
-                            .label("＋")
+                            .w(px(48.))
+                            .h(px(48.))
+                            .icon(IconName::Plus)
+                            .tooltip("添加商品图片")
                             .disabled(busy)
                             .on_click(cx.listener(|this, _, _, cx| this.pick_images(cx))),
                     ),
             )
             .child(
-                Button::new("import-draft-images")
-                    .debug_selector(|| "import-draft-images".into())
-                    .outline()
-                    .small()
-                    .label(if self.import_busy {
-                        "导入中…"
-                    } else {
-                        "导入手机相册"
-                    })
-                    .disabled(busy || !self.writable || !self.connected || self.images.is_empty())
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        if this.writable && this.connected && !this.import_busy {
-                            cx.emit(AssistantEvent::Import(this.images.clone()));
-                        }
-                    })),
+                h_flex().gap_2().child(
+                    Button::new("import-draft-images")
+                        .debug_selector(|| "import-draft-images".into())
+                        .outline()
+                        .small()
+                        .label(if self.import_busy {
+                            "导入中…"
+                        } else {
+                            "导入手机相册"
+                        })
+                        .disabled(
+                            busy || !self.writable || !self.connected || self.images.is_empty(),
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if this.writable && this.connected && !this.import_busy {
+                                cx.emit(AssistantEvent::Import(this.images.clone()));
+                            }
+                        })),
+                ),
             )
             .when(self.retry_import_available && !self.import_busy, |el| {
                 el.child(

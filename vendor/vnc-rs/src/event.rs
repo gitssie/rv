@@ -36,6 +36,9 @@ type DstRect = Rect;
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub enum VncEvent {
+    /// All rectangles in a framebuffer update have been decoded (also emitted
+    /// for an empty update). Individual rectangles are not refresh replies.
+    FramebufferUpdateFinished,
     /// Tell the client how to display the images
     ///
     /// ```no_compile

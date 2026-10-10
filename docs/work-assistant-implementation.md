@@ -10,6 +10,7 @@
 | `rv-core/src/assistant/repository.rs` | SQLite 迁移、版本冲突、素材归档、原子领取导入任务 |
 | `rv-core/src/assistant/service.rs` | 每个数据目录共享数据库工作线程，UI 不直接操作数据库 |
 | `rv-app/src/work_assistant/` | 独立 UI Entity；drafts、images、templates、notifications、widgets、persistence 分工 |
+| `rv-app/src/work_assistant/draft_form.rs` | 商品草稿表单与紧凑操作布局，和 CRUD/保存逻辑分离 |
 | `rv-app/src/session_window/assistant_bridge.rs` | 把明确的助手事件连接到当前手机会话 |
 | `rv-app/src/photo_transfer.rs` | 可复用图片批次、传输预约、进度、停止后续任务、回执恢复 |
 | `rv-session/src/apps.rs` | 能力协商、UTF-8 剪贴板请求和确认 |
@@ -25,7 +26,17 @@
 
 图片通过选择文件或拖入添加，复制为本地拥有的不可变素材，SHA-256 命名；支持拖动排序和移除。支持 JPEG/PNG/HEIC/HEIF，单文件最多 50 MiB。HEIC/HEIF 在侧栏显示文件图标，手机导入仍由 PhotoKit 解码。复制草稿共享不可变素材；目前移除后保留素材文件，不自动清理孤立文件。
 
-常用文案有名称、分类、内容和显式保存/删除。有未保存内容时禁用切换和新增，并提供放弃修改；文案可替换商品描述或直接发送手机剪贴板。
+常用文案有名称、分类、内容和显式保存/删除。输入变化会即时更新保存、切换和新增按钮状态；有未保存内容时禁用切换和新增，并提供放弃修改。文案可替换商品描述或直接发送手机剪贴板；从商品页选择文案、或从文案页点击「用作当前商品描述」，都会更新实际草稿并进入自动保存流程。
+
+## UI 对齐与实际渲染
+
+助手侧栏采用下划线页签；标题、描述与小型发送按钮并排；价格与本地库存备注同一行。选择器保留长标题省略，右侧新增和操作菜单始终可见；复制、删除在草稿操作菜单内。图片使用紧凑缩略图，导入与文案操作按钮按内容宽度显示。长描述在输入框内滚动，侧栏内容可独立滚动，不覆盖价格或底部状态。
+
+实际 GPUI 渲染截图（手机棋盘画面、衣服缩略图和数据均为测试样例）：
+
+- 商品草稿：[深色](assistant-implemented-dark.png)、[浅色](assistant-implemented-light.png)、[小窗口](assistant-implemented-compact.png)
+- 常用文案：[深色](assistant-templates-dark.png)、[浅色](assistant-templates-light.png)
+- 手机通知：[深色](assistant-notifications-dark.png)、[浅色](assistant-notifications-light.png)
 
 ## 手机操作
 
@@ -41,10 +52,10 @@
 
 ## 验证
 
-当前验证：180 项测试通过，2 项手动预览导出测试默认跳过；助手深浅色导出已单独运行通过。
+当前验证：182 项测试通过，2 项手动预览导出测试默认跳过；助手三页深浅色及小窗口导出已单独运行通过。
 
 运行 `cargo test --workspace --locked -- --test-threads=1`、`cargo clippy --workspace --all-targets --locked -- -D warnings`。回归覆盖冲突恢复、非法价格关闭恢复、素材错误与保存隔离、照片提交阶段分类、缺失任务确认恢复、查询未发送仍保留未知状态、首次通知缓存、剪贴板能力/只读/大小/确认，以及助手输入焦点和缩放坐标。
 
-`cargo test -p rv-app export_assistant_previews --locked -- --ignored --test-threads=1` 使用原生 Metal 渲染实际会话和助手到 `assistant-implemented-dark.png`、`assistant-implemented-light.png`。手机区域为合成画面，数据库为临时目录；这些预览不代表真实设备验证。
+`cargo test -p rv-app export_assistant_previews --locked -- --ignored --test-threads=1` 使用原生 Metal 渲染实际会话和助手三页的深浅色、小窗口截图。数据库为临时目录；这些预览不代表真实设备验证。可见控件点击测试覆盖文案编辑、保存、应用到草稿并落库，断线/只读发送限制，以及长标题在窄侧栏中的布局。
 
 TrollVNC 已通过 Theos 构建、App 管理策略测试和新旧照片临时文件名解析/清理的 Foundation 测试。新剪贴板、PhotoKit 持久任务及 SpringBoard 通知仍需更新真实设备服务端后联调确认。

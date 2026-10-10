@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 #[derive(Default)]
 pub(super) struct Recovery {
     pub established: bool,
+    pub visible: bool,
     pub stopped: bool,
     pub attempt: u32,
     pub deadline: Option<Instant>,
@@ -10,12 +11,14 @@ pub(super) struct Recovery {
 impl Recovery {
     pub fn connected(&mut self) {
         self.established = true;
+        self.visible = false;
         self.attempt = 0;
         self.deadline = None;
     }
     pub fn schedule(&mut self, error: Option<&str>, now: Instant) {
         self.deadline = None;
-        if !self.established || self.stopped || !retryable(error) {
+        self.visible = true;
+        if self.attempt >= 5 || !self.established || self.stopped || !retryable(error) {
             return;
         }
         self.attempt = self.attempt.saturating_add(1);
@@ -60,6 +63,23 @@ fn retryable(error: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn retry_limit_preserves_dialog_until_connected() {
+        let now = Instant::now();
+        let mut recovery = Recovery::default();
+        recovery.connected();
+        for attempt in 1..=5 {
+            recovery.schedule(Some("server closed the connection"), now);
+            assert_eq!(recovery.attempt, attempt);
+            assert!(recovery.deadline.is_some());
+        }
+        recovery.schedule(Some("server closed the connection"), now);
+        assert_eq!(recovery.attempt, 5);
+        assert!(recovery.deadline.is_none());
+        assert!(recovery.visible);
+        recovery.connected();
+        assert!(!recovery.visible);
+    }
     #[test]
     fn recovery_only_follows_established_transport_failures_and_respects_stop() {
         let now = Instant::now();

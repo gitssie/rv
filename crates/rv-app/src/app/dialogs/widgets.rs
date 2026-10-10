@@ -27,7 +27,7 @@ pub(super) fn field(label: &'static str, input: impl IntoElement, cx: &App) -> i
         .gap_3()
         .child(
             div()
-                .w(px(72.))
+                .w(px(84.))
                 .flex_shrink_0()
                 .text_xs()
                 .text_color(theme::muted(cx))

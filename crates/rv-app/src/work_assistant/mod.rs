@@ -1,4 +1,5 @@
 //! Local workspace. It emits explicit phone commands; it never owns a VNC session.
+mod draft_form;
 mod drafts;
 mod images;
 mod notifications;
@@ -9,7 +10,7 @@ use crate::theme;
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::{
-    Disableable, Selectable, Sizable, StyledExt,
+    Disableable, Sizable, StyledExt,
     button::{Button, ButtonVariants},
     h_flex,
     input::{InputEvent, InputState, TextareaState},
@@ -85,14 +86,14 @@ impl WorkAssistant {
         let stock = field("例如 A-023，仅保存在本地", window, cx);
         let description = cx.new(|cx| {
             TextareaState::new(window, cx)
-                .auto_grow(3, 6)
+                .rows(4)
                 .placeholder("商品描述")
         });
         let template_name = field("文案名称", window, cx);
         let template_category = field("分类，例如：议价回复", window, cx);
         let template_content = cx.new(|cx| {
             TextareaState::new(window, cx)
-                .auto_grow(3, 6)
+                .rows(6)
                 .placeholder("常用文案内容")
         });
         let mut subscriptions = Vec::new();
@@ -114,6 +115,26 @@ impl WorkAssistant {
             |this, _, event: &InputEvent, _, cx| {
                 if matches!(event, InputEvent::Change) {
                     this.capture(cx);
+                    cx.notify();
+                }
+            },
+        ));
+        for input in [&template_name, &template_category] {
+            subscriptions.push(cx.subscribe_in(
+                input,
+                window,
+                |_, _, event: &InputEvent, _, cx| {
+                    if matches!(event, InputEvent::Change) {
+                        cx.notify();
+                    }
+                },
+            ));
+        }
+        subscriptions.push(cx.subscribe_in(
+            &template_content,
+            window,
+            |_, _, event: &InputEvent, _, cx| {
+                if matches!(event, InputEvent::Change) {
                     cx.notify();
                 }
             },
@@ -197,6 +218,11 @@ impl WorkAssistant {
                     Ok((drafts, templates)) => {
                         this.drafts = drafts;
                         this.templates = templates;
+                        this.select_template(
+                            this.templates.first().cloned().unwrap_or_default(),
+                            window,
+                            cx,
+                        );
                         this.error = None;
                         this.save_error = None;
                         this.message = "本地资料已载入".into();
@@ -313,15 +339,37 @@ impl Render for WorkAssistant {
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .child(
                 h_flex()
-                    .p_3()
+                    .px_3()
+                    .py_2()
                     .gap_2()
                     .child(div().flex_1().font_semibold().child("工作助手"))
+                    .child(div().text_xs().text_color(theme::muted(cx)).child(
+                        if self.tab == Tab::Notifications {
+                            "手机通知"
+                        } else if self.tab == Tab::Templates {
+                            if self.template_dirty(cx) {
+                                "待保存"
+                            } else {
+                                "本地文案"
+                            }
+                        } else if self.save_error.is_some() {
+                            "保存失败"
+                        } else if self.save_busy {
+                            "保存中…"
+                        } else if self.dirty {
+                            "待保存"
+                        } else {
+                            "本地草稿"
+                        },
+                    ))
                     .child(
                         Button::new("assistant-close")
                             .debug_selector(|| "assistant-close".into())
                             .ghost()
                             .small()
-                            .label("×")
+                            .size(px(24.))
+                            .icon(gpui_component::IconName::Close)
+                            .tooltip("收起助手")
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.flush(cx);
                                 cx.emit(AssistantEvent::Close);
@@ -331,27 +379,42 @@ impl Render for WorkAssistant {
             .child(
                 h_flex()
                     .px_3()
-                    .gap_1()
+                    .gap_3()
                     .border_b_1()
                     .border_color(theme::line(cx))
                     .children(
                         [
-                            (Tab::Drafts, "商品草稿"),
-                            (Tab::Templates, "常用文案"),
-                            (Tab::Notifications, "通知"),
+                            (Tab::Drafts, "商品草稿", "assistant-tab-drafts"),
+                            (Tab::Templates, "常用文案", "assistant-tab-templates"),
+                            (Tab::Notifications, "通知", "assistant-tab-notifications"),
                         ]
-                        .map(|(tab, label)| {
-                            Button::new(label)
-                                .ghost()
-                                .small()
-                                .selected(self.tab == tab)
-                                .label(label)
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.tab = tab;
-                                    this.confirm_delete = false;
-                                    this.confirm_template_delete = false;
-                                    cx.notify();
-                                }))
+                        .map(|(tab, label, id)| {
+                            div()
+                                .border_b_2()
+                                .border_color(if self.tab == tab {
+                                    theme::accent(cx)
+                                } else {
+                                    gpui::transparent_black()
+                                })
+                                .child(
+                                    Button::new(id)
+                                        .debug_selector(move || id.into())
+                                        .ghost()
+                                        .small()
+                                        .h(px(30.))
+                                        .text_color(if self.tab == tab {
+                                            theme::accent(cx)
+                                        } else {
+                                            theme::muted(cx)
+                                        })
+                                        .label(label)
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.tab = tab;
+                                            this.confirm_delete = false;
+                                            this.confirm_template_delete = false;
+                                            cx.notify();
+                                        })),
+                                )
                         }),
                     ),
             )
@@ -434,5 +497,18 @@ mod tests;
 impl WorkAssistant {
     pub(crate) fn notification_snapshot(&self) -> Option<&rv_session::NotificationSnapshot> {
         self.snapshot.as_ref()
+    }
+    pub(crate) fn preview_tab(&mut self, tab: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.tab = match tab {
+            1 => Tab::Templates,
+            2 => Tab::Notifications,
+            _ => Tab::Drafts,
+        };
+        if self.tab == Tab::Templates
+            && let Some(template) = self.templates.first().cloned()
+        {
+            self.select_template(template, window, cx);
+        }
+        cx.notify();
     }
 }

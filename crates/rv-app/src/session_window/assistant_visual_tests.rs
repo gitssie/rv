@@ -2,7 +2,7 @@
 use super::{SessionOptions, SessionView};
 use gpui::{AppContext, HeadlessAppContext, px, size};
 use gpui_component::Root;
-use rv_core::assistant::{AssistantService, Draft};
+use rv_core::assistant::{AssistantService, Draft, Template};
 use rv_core::{ConnectRequest, Connection, ScaleMode, ThemePref};
 use rv_session::{SessionEvent, SessionHandle};
 use std::{sync::Arc, time::Duration};
@@ -22,11 +22,76 @@ fn export_assistant_previews() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("thumbs")).unwrap();
     let service = AssistantService::shared(dir.path().to_owned());
-    service.call(|s| s.save_draft(&Draft {title:"Vintage leather shoulder bag".into(), description:"Brown leather shoulder bag. Good condition, with light signs of use. Please see all photos.".into(),price_minor:Some(1850),stock_note:"A-023".into(),..Default::default()})).unwrap();
+    let draft = service.call(|s| s.save_draft(&Draft {title:"Blue knit cardigan - Size M".into(), description:"Size M. Excellent condition. Soft blue knit cardigan, worn twice. Measurements available on request.".into(),price_minor:Some(1800),stock_note:"A-023".into(),..Default::default()})).unwrap();
+    for index in 0..4 {
+        let path = dir.path().join(format!("cardigan-{index}.png"));
+        image::RgbaImage::from_fn(120, 120, |x, y| {
+            let garment = (40..80).contains(&x) && (25..106).contains(&y)
+                || (20..40).contains(&x) && (30..65).contains(&y)
+                || (80..100).contains(&x) && (30..65).contains(&y);
+            if garment {
+                image::Rgba([65 + index * 8, 116 + index * 5, 162 + index * 6, 255])
+            } else {
+                image::Rgba([225, 228, 231, 255])
+            }
+        })
+        .save(&path)
+        .unwrap();
+        let id = draft.id.clone();
+        service.call(move |s| s.add_image(&id, &path)).unwrap();
+    }
+    service.call(|s| s.save_template(&Template { name:"Item description".into(), category:"Listing".into(), content:"Excellent condition. Carefully stored in a smoke-free home. Happy to provide measurements.".into(), ..Default::default() })).unwrap();
     let output = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs");
-    for (name, appearance) in [
-        ("assistant-implemented-dark.png", ThemePref::Dark),
-        ("assistant-implemented-light.png", ThemePref::Light),
+    for (name, appearance, tab, width, height) in [
+        (
+            "assistant-implemented-dark.png",
+            ThemePref::Dark,
+            0,
+            1160.,
+            780.,
+        ),
+        (
+            "assistant-implemented-light.png",
+            ThemePref::Light,
+            0,
+            1160.,
+            780.,
+        ),
+        (
+            "assistant-templates-dark.png",
+            ThemePref::Dark,
+            1,
+            1160.,
+            780.,
+        ),
+        (
+            "assistant-templates-light.png",
+            ThemePref::Light,
+            1,
+            1160.,
+            780.,
+        ),
+        (
+            "assistant-notifications-dark.png",
+            ThemePref::Dark,
+            2,
+            1160.,
+            780.,
+        ),
+        (
+            "assistant-notifications-light.png",
+            ThemePref::Light,
+            2,
+            1160.,
+            780.,
+        ),
+        (
+            "assistant-implemented-compact.png",
+            ThemePref::Dark,
+            0,
+            840.,
+            650.,
+        ),
     ] {
         let (session, peer) = SessionHandle::test_pair();
         {
@@ -52,7 +117,7 @@ fn export_assistant_previews() {
         let request = ConnectRequest::from_connection(&connection, None);
         let mut view = None;
         let handle = cx
-            .open_window(size(px(1160.), px(900.)), |window, cx| {
+            .open_window(size(px(width), px(height)), |window, cx| {
                 crate::theme::apply(appearance, window, cx);
                 let entity = cx.new(|cx| {
                     SessionView::with_handle(
@@ -83,6 +148,36 @@ fn export_assistant_previews() {
             })
             .unwrap();
         for _ in 0..20 {
+            std::thread::sleep(Duration::from_millis(10));
+            cx.run_until_parked();
+            cx.update_window(handle.into(), |_, w, cx| w.draw(cx).clear(cx))
+                .unwrap();
+        }
+        cx.update_window(handle.into(), |_, window, cx| {
+            view.as_ref().unwrap().update(cx, |v, cx| {
+                let assistant = v.assistant.as_ref().unwrap();
+                assistant.update(cx, |a, cx| {
+                    a.set_connection(true, true, false, true, true, cx);
+                    a.receive_notifications(
+                        rv_session::NotificationSnapshot {
+                            revision: "preview".into(),
+                            notifications: vec![rv_session::PhoneNotification {
+                                id: "preview-1".into(),
+                                source: "Vinted".into(),
+                                title: "New message about your item".into(),
+                                subtitle: "Blue knit cardigan".into(),
+                                message: "Hi! Could you share the measurements?".into(),
+                                timestamp: 1791205200,
+                            }],
+                        },
+                        cx,
+                    );
+                    a.preview_tab(tab, window, cx);
+                });
+            });
+        })
+        .unwrap();
+        for _ in 0..10 {
             std::thread::sleep(Duration::from_millis(10));
             cx.run_until_parked();
             cx.update_window(handle.into(), |_, w, cx| w.draw(cx).clear(cx))

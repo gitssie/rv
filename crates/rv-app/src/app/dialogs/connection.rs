@@ -11,9 +11,34 @@ impl AddressBookApp {
     pub(super) fn render_connection_dialog(&self, cx: &mut Context<Self>) -> AnyElement {
         v_flex()
             .gap_3()
+            .when_some(self.connection_error.as_ref(), |form, error| {
+                form.child(
+                    div()
+                        .id("management-feedback")
+                        .debug_selector(|| "management-feedback".into())
+                        .w_full()
+                        .mb_2()
+                        .text_xs()
+                        .text_color(theme::danger(cx))
+                        .child(error.clone()),
+                )
+            })
             .child(field(
                 "VNC 地址",
-                Input::new(&self.server_input).small(),
+                div()
+                    .w_full()
+                    .id("vnc-address-input")
+                    .debug_selector(|| "vnc-address-input".into())
+                    .child(Input::new(&self.server_input).small()),
+                cx,
+            ))
+            .child(field(
+                "ZXTouch 端口",
+                div()
+                    .w_full()
+                    .id("zxtouch-port-input")
+                    .debug_selector(|| "zxtouch-port-input".into())
+                    .child(Input::new(&self.zxtouch_port_input).small()),
                 cx,
             ))
             .child(field("名称", Input::new(&self.name_input).small(), cx))
@@ -26,7 +51,7 @@ impl AddressBookApp {
             .when(self.editing.is_some() && self.remember_password, |this| {
                 this.child(
                     div()
-                        .pl(px(84.))
+                        .pl(px(96.))
                         .text_xs()
                         .text_color(theme::muted(cx))
                         .child("留空则保留已保存的密码。"),

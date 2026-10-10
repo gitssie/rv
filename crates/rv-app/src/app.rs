@@ -78,6 +78,8 @@ enum Modal {
     Preferences,
 }
 
+const DEFAULT_ZXTOUCH_PORT: u16 = 6000;
+
 pub struct AddressBookApp {
     book: AddressBook,
     read_only: bool,
@@ -87,6 +89,7 @@ pub struct AddressBookApp {
     username_input: Entity<InputState>,
     password_input: Entity<InputState>,
     labels_input: Entity<InputState>,
+    zxtouch_port_input: Entity<InputState>,
     collapsed: bool,
     view_mode: ViewMode,
     filter: SidebarFilter,
@@ -102,6 +105,7 @@ pub struct AddressBookApp {
     modal: Modal,
     status: SharedString,
     credential_busy: bool,
+    connection_error: Option<SharedString>,
     focus: FocusHandle,
     _subscriptions: Vec<Subscription>,
 }
@@ -162,6 +166,8 @@ impl AddressBookApp {
         });
         let labels_input = cx.new(|cx| InputState::new(window, cx).placeholder("工作, 测试, 家用"));
 
+        let zxtouch_port_input = cx.new(|cx| InputState::new(window, cx).placeholder("6000"));
+
         let mut subscriptions = Vec::new();
         for input in [
             &name_input,
@@ -169,6 +175,7 @@ impl AddressBookApp {
             &username_input,
             &password_input,
             &labels_input,
+            &zxtouch_port_input,
         ] {
             subscriptions.push(cx.subscribe_in(
                 input,
@@ -202,6 +209,7 @@ impl AddressBookApp {
             username_input,
             password_input,
             labels_input,
+            zxtouch_port_input,
             collapsed: false,
             view_mode: ViewMode::Grid,
             filter: SidebarFilter::All,
@@ -217,6 +225,7 @@ impl AddressBookApp {
             modal: Modal::None,
             status,
             credential_busy: false,
+            connection_error: None,
             focus,
             _subscriptions: subscriptions,
         }
@@ -260,6 +269,35 @@ impl AddressBookApp {
         Ok(())
     }
 
+    pub(crate) fn environment_apps(&self, id: ConnectionId) -> Vec<rv_core::AppShortcut> {
+        self.book
+            .get(id)
+            .map(|c| c.environment_apps.clone())
+            .unwrap_or_default()
+    }
+    pub(crate) fn remember_environment_apps(
+        &mut self,
+        id: ConnectionId,
+        apps: Vec<rv_core::AppShortcut>,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        if self.read_only {
+            return Err("地址簿为只读，环境 App 列表仅在本次会话有效".into());
+        }
+        let connection = self
+            .book
+            .get_mut(id)
+            .ok_or("连接已删除，环境 App 列表仅在本次会话有效")?;
+        let previous = std::mem::replace(&mut connection.environment_apps, apps);
+        if let Err(error) = self.book.save() {
+            if let Some(connection) = self.book.get_mut(id) {
+                connection.environment_apps = previous;
+            }
+            return Err(format!("环境 App 列表保存失败：{error}"));
+        }
+        cx.notify();
+        Ok(())
+    }
     pub(crate) fn remember_transfer_folders(
         &mut self,
         id: ConnectionId,
@@ -298,6 +336,7 @@ impl AddressBookApp {
                 connection.clipboard = request.clipboard;
                 connection.local_cursor = request.local_cursor;
                 connection.view_only = request.view_only;
+                connection.zxtouch_port = request.zxtouch_port;
                 connection.shared = request.shared;
                 connection.last_connected = Some(unix_now());
                 let id = connection.id;
@@ -366,12 +405,19 @@ impl AddressBookApp {
             ),
             None => Default::default(),
         };
+        self.connection_error = None;
         self.editing = conn.map(|c| c.id);
         self.encryption = conn.map_or(EncryptionMode::LetServerChoose, |c| c.encryption);
         self.quality = conn.map_or(QualityPreset::Auto, |c| c.quality);
         self.clipboard_mode = conn.map_or(ClipboardMode::Utf8, |c| c.clipboard);
         self.local_cursor_mode = conn.map_or(LocalCursorMode::Automatic, |c| c.local_cursor);
         self.view_only = conn.is_some_and(|c| c.view_only);
+        let port = conn
+            .and_then(|c| c.zxtouch_port)
+            .unwrap_or(DEFAULT_ZXTOUCH_PORT)
+            .to_string();
+        self.zxtouch_port_input
+            .update(cx, |input, cx| input.set_value(port, window, cx));
         self.shared = conn.is_none_or(|c| c.shared);
         self.remember_password = conn.is_none_or(|c| c.remember_password);
         self.name_input
@@ -425,6 +471,7 @@ impl AddressBookApp {
         if self.credential_busy {
             return;
         }
+        self.connection_error = None;
         let name = self.name_input.read(cx).value().to_string();
         let server = self.server_input.read(cx).value().to_string();
         let username = self.username_input.read(cx).value().trim().to_string();
@@ -433,8 +480,27 @@ impl AddressBookApp {
         let (host, port) = match parse_server(&server) {
             Ok(v) => v,
             Err(e) => {
-                self.set_status(e, cx);
+                self.connection_error = Some(e.into());
+                cx.notify();
                 return;
+            }
+        };
+        let port_text = self.zxtouch_port_input.read(cx).value().trim().to_string();
+        let zxtouch_port = if port_text.is_empty() {
+            self.zxtouch_port_input.update(cx, |input, cx| {
+                input.set_value(DEFAULT_ZXTOUCH_PORT.to_string(), window, cx)
+            });
+            Some(DEFAULT_ZXTOUCH_PORT)
+        } else {
+            match port_text.parse::<u16>() {
+                Ok(port) if port > 0 && port_text.bytes().all(|byte| byte.is_ascii_digit()) => {
+                    Some(port)
+                }
+                _ => {
+                    self.connection_error = Some("ZXTouch 端口须为 1–65535".into());
+                    cx.notify();
+                    return;
+                }
             }
         };
         let mut conn = self
@@ -455,6 +521,7 @@ impl AddressBookApp {
         conn.clipboard = self.clipboard_mode;
         conn.local_cursor = self.local_cursor_mode;
         conn.view_only = self.view_only;
+        conn.zxtouch_port = zxtouch_port;
         conn.shared = self.shared;
         let forget_password = conn.remember_password && !self.remember_password;
         conn.remember_password = self.remember_password;
@@ -484,7 +551,10 @@ impl AddressBookApp {
                 this.credential_busy = false;
                 match result {
                     Ok(password) => this.finish_submit(conn, password, connect, window, cx),
-                    Err(error) => this.set_status(error.to_string(), cx),
+                    Err(error) => {
+                        this.connection_error = Some(error.to_string().into());
+                        cx.notify();
+                    }
                 }
             });
         })

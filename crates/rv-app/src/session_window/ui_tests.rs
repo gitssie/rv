@@ -567,28 +567,24 @@ fn offscreen_clipboard_sends_utf8_text_to_remote(cx: &mut TestAppContext) {
     view.update(cx, |view, cx| view.send_clipboard(cx));
     assert!(matches!(
         peer.commands.try_recv(),
-        Ok(SessionCommand::Input(vnc::X11Event::CopyText(text)))
+        Ok(SessionCommand::App(rv_session::AppCommand::WriteClipboard { text, .. }))
             if text == "中文剪贴板"
     ));
     view.read_with(cx, |view, _| {
-        assert_eq!(view.status.as_ref(), "Clipboard sent")
+        assert_eq!(view.status.as_ref(), "Clipboard request sent")
     });
 }
 
 #[gpui::test]
-fn offscreen_latin1_clipboard_rejects_chinese_text(cx: &mut TestAppContext) {
+fn offscreen_zxtouch_clipboard_ignores_vnc_text_encoding(cx: &mut TestAppContext) {
     let (view, cx, mut peer) = setup(cx, false);
     commands(&mut peer);
     view.update(cx, |view, _| view.req.clipboard = ClipboardMode::Latin1);
     cx.write_to_clipboard(ClipboardItem::new_string("中文剪贴板".into()));
     view.update(cx, |view, cx| view.send_clipboard(cx));
-    assert!(peer.commands.try_recv().is_err());
-    view.read_with(cx, |view, _| {
-        assert_eq!(
-            view.status.as_ref(),
-            "Clipboard not sent: text is not valid Latin-1"
-        )
-    });
+    assert!(
+        matches!(peer.commands.try_recv(), Ok(SessionCommand::App(rv_session::AppCommand::WriteClipboard { text, .. })) if text == "中文剪贴板")
+    );
 }
 
 #[gpui::test]
@@ -665,4 +661,83 @@ fn assistant_opens_with_notifications_received_before_it_existed(cx: &mut TestAp
             );
         })
     });
+}
+
+#[gpui::test]
+fn offscreen_clipboard_displays_control_failure(cx: &mut TestAppContext) {
+    let (view, cx, _) = setup(cx, false);
+    view.update(cx, |view, cx| {
+        view.apply_app_event(
+            rv_session::AppEvent::Failed {
+                command: rv_session::AppCommand::WriteClipboard {
+                    token: uuid::Uuid::new_v4().to_string(),
+                    text: "test".into(),
+                },
+                message: "ZXTouch unavailable".into(),
+            },
+            cx,
+        )
+    });
+    view.read_with(cx, |view, _| {
+        assert!(view.status.contains("ZXTouch unavailable"))
+    });
+}
+
+#[gpui::test]
+fn retry_exhaustion_keeps_the_same_compact_dialog(cx: &mut TestAppContext) {
+    let (view, cx, _) = setup(cx, false);
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.phase = Phase::Ended;
+            view.recovery.connected();
+            view.recovery.schedule(
+                Some("server closed the connection"),
+                std::time::Instant::now(),
+            );
+            cx.notify();
+        });
+        window.draw(cx).clear(cx);
+    });
+    let before = cx.debug_bounds("recovery-dialog").unwrap();
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            for _ in 0..5 {
+                view.recovery.schedule(
+                    Some("server closed the connection"),
+                    std::time::Instant::now(),
+                );
+            }
+            assert!(view.recovery.deadline.is_none());
+            cx.notify();
+        });
+        window.draw(cx).clear(cx);
+    });
+    let after = cx.debug_bounds("recovery-dialog").unwrap();
+    assert_eq!(before.size.width, after.size.width);
+    assert!(cx.debug_bounds("session-recovery").is_some());
+}
+
+#[gpui::test]
+fn keyboard_popover_uses_compact_rows_in_light_theme(cx: &mut TestAppContext) {
+    let (_, cx, _) = setup(cx, false);
+    cx.update(|window, cx| {
+        crate::theme::apply(rv_core::ThemePref::Light, window, cx);
+        window.draw(cx).clear(cx);
+    });
+    let trigger = cx.debug_bounds("keyboard-menu").unwrap();
+    cx.simulate_click(trigger.center(), Modifiers::default());
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    for selector in [
+        "keyboard-key-Ctrl",
+        "keyboard-key-Alt",
+        "keyboard-key-Win",
+        "keyboard-key-Tab",
+        "keyboard-key-Esc",
+        "keyboard-key-Caps",
+    ] {
+        let bounds = cx.debug_bounds(selector).unwrap();
+        assert_eq!(bounds.size.height, px(26.));
+        assert!(bounds.size.width <= px(170.));
+    }
 }

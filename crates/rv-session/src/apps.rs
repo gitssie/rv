@@ -1,6 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
+use crate::zxtouch::{ControlChannel, ControlEndpoint, ControlEvent};
 use base64::Engine;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -23,6 +24,7 @@ pub struct AppCapabilities {
     pub notifications: bool,
     pub clipboard_write: bool,
     pub photo_tasks: bool,
+    pub zx_control: Option<ControlEndpoint>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -146,6 +148,10 @@ pub(crate) struct AppRuntime {
     sequence: u32,
     queue: VecDeque<AppCommand>,
     pending: HashMap<u32, (AppCommand, Instant)>,
+    control_host: Option<(String, Option<u16>)>,
+    control: Option<ControlChannel>,
+    control_ready: bool,
+    control_connecting: bool,
 }
 
 impl AppRuntime {
@@ -156,6 +162,10 @@ impl AppRuntime {
             sequence: 0,
             queue: VecDeque::new(),
             pending: HashMap::new(),
+            control_host: None,
+            control: None,
+            control_ready: false,
+            control_connecting: false,
         }
     }
     fn supported(&self, cmd: &AppCommand) -> bool {
@@ -229,6 +239,28 @@ impl AppRuntime {
         }
     }
     pub async fn advance(&mut self, client: &VncClient, send: &impl Fn(AppEvent)) {
+        let mut events = Vec::new();
+        if let Some(control) = &mut self.control {
+            while let Ok(event) = control.events.try_recv() {
+                events.push(event);
+            }
+        }
+        for event in events {
+            match event {
+                ControlEvent::Ready => {
+                    self.control_ready = true;
+                    self.control_connecting = false;
+                }
+                ControlEvent::Unavailable => {
+                    self.control_ready = false;
+                    self.control = None;
+                    self.control_connecting = false;
+                    self.disable_control_capabilities();
+                    send(AppEvent::Capabilities(self.caps.clone()));
+                }
+                ControlEvent::Reply(reply) => self.reply(reply, send),
+            }
+        }
         let expired: Vec<_> = self
             .pending
             .iter()
@@ -264,6 +296,18 @@ impl AppRuntime {
         let Some(command) = self.queue.pop_front() else {
             return;
         };
+        let independent = matches!(command.op(), 1..=6 | 12 | 16);
+        if independent
+            && (self.control_connecting
+                || (self.control_ready
+                    && self
+                        .pending
+                        .values()
+                        .any(|(cmd, _)| matches!(cmd.op(), 1..=6 | 12 | 16))))
+        {
+            self.queue.push_front(command);
+            return;
+        }
         if matches!(command, AppCommand::SubscribeNotifications(_))
             && self
                 .pending
@@ -289,20 +333,32 @@ impl AppRuntime {
         }
         .to_string();
         let id = self.sequence;
-        match client
-            .input(X11Event::Device(DeviceRequest {
-                op: command.op(),
-                id,
-                payload,
-            }))
-            .await
-        {
+        let request = DeviceRequest {
+            op: command.op(),
+            id,
+            payload,
+        };
+        let sent = if independent {
+            if let Some(control) = self.control.as_ref().filter(|_| self.control_ready) {
+                control.requests.try_send(request).map_err(|_| {
+                    "ZXTouch connection closed or busy; reconnect the session".to_string()
+                })
+            } else {
+                Err("ZXTouch control is unavailable; check the connection settings and phone service".into())
+            }
+        } else {
+            client
+                .input(X11Event::Device(request))
+                .await
+                .map_err(|error| error.to_string())
+        };
+        match sent {
             Ok(()) => {
                 self.pending.insert(id, (command, Instant::now()));
             }
             Err(error) => send(AppEvent::Failed {
                 command,
-                message: error.to_string(),
+                message: error,
             }),
         }
     }
@@ -333,8 +389,25 @@ impl AppRuntime {
                 return;
             }
             if let Ok(caps) = serde_json::from_str::<AppCapabilities>(&reply.payload) {
+                if self.control.is_none()
+                    && let Some((host, port)) = &self.control_host
+                    && let Some(mut endpoint) = caps.zx_control.clone()
+                    && endpoint.version == 1
+                    && endpoint.port > 0
+                    && endpoint.token.len() == 64
+                    && endpoint.token.bytes().all(|byte| byte.is_ascii_hexdigit())
+                {
+                    if let Some(port) = port {
+                        endpoint.port = *port;
+                    }
+                    self.control = Some(ControlChannel::start(host.clone(), endpoint));
+                    self.control_connecting = true;
+                }
                 self.caps = caps.clone();
-                send(AppEvent::Capabilities(caps));
+                if self.control.is_none() {
+                    self.disable_control_capabilities();
+                }
+                send(AppEvent::Capabilities(self.caps.clone()));
                 if self.caps.list {
                     self.command(AppCommand::List, send);
                 }
@@ -481,6 +554,21 @@ impl AppRuntime {
         if let Err(message) = result {
             send(AppEvent::Failed { command, message });
         }
+    }
+
+    pub fn set_control_host(&mut self, host: String, port: Option<u16>) {
+        self.control_host = Some((host, port));
+    }
+
+    fn disable_control_capabilities(&mut self) {
+        self.caps.list = false;
+        self.caps.launch = false;
+        self.caps.terminate = false;
+        self.caps.restart = false;
+        self.caps.foreground = false;
+        self.caps.icons = false;
+        self.caps.home = false;
+        self.caps.clipboard_write = false;
     }
 }
 

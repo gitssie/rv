@@ -142,6 +142,8 @@ at a 16 ms cadence. Uploads to Photos refresh the visible album once after the
 queue finishes, including partially successful batches; individual imports
 still refresh immediately. Photos jobs use adaptive polling from 25 to 200 ms.
 
+The network reader resumes as soon as decoder queue space becomes available, including without keyboard input. Compressed network chunks and decoded rectangles use bounded queues to limit accumulated work; refresh requests are paced using complete framebuffer-update replies.
+
 The protocol implementation currently handles uncompressed TightVNC file lists
 and data. Cancelling an in-progress download requires reconnecting before the
 next download, because TightVNC's file frames have no transfer identifier.

@@ -94,6 +94,40 @@ fn offscreen_app_shortcuts_save_per_connection_and_preserve_empty(cx: &mut TestA
 }
 
 #[gpui::test]
+fn environment_apps_persist_separately_from_launch_shortcuts(cx: &mut TestAppContext) {
+    let first = Connection::new("First", "first.test", 5900);
+    let second = Connection::new("Second", "second.test", 5900);
+    let first_id = first.id;
+    let second_id = second.id;
+    let (app, cx, dir) = setup(cx, vec![first, second]);
+    let environment = vec![rv_core::AppShortcut {
+        bundle_id: "fr.vinted".into(),
+        name: "Vinted".into(),
+    }];
+    app.update(cx, |app, cx| {
+        app.remember_environment_apps(first_id, environment.clone(), cx)
+            .unwrap()
+    });
+    let reload = || AddressBook::load(rv_core::StorePaths::in_dir(dir.path().into())).unwrap();
+    assert_eq!(
+        reload().get(first_id).unwrap().environment_apps,
+        environment
+    );
+    assert!(reload().get(second_id).unwrap().environment_apps.is_empty());
+    assert_eq!(
+        reload().get(first_id).unwrap().app_shortcuts,
+        rv_core::default_app_shortcuts()
+    );
+    app.update(cx, |app, cx| {
+        app.remember_app_shortcuts(first_id, vec![], cx).unwrap()
+    });
+    assert_eq!(
+        reload().get(first_id).unwrap().environment_apps,
+        environment
+    );
+}
+
+#[gpui::test]
 fn offscreen_save_connection_persists_form_and_clears_password(cx: &mut TestAppContext) {
     let (app, cx, dir) = setup(cx, vec![]);
     cx.simulate_keystrokes("ctrl-n");
@@ -105,6 +139,8 @@ fn offscreen_save_connection_persists_form_and_clears_password(cx: &mut TestAppC
     cx.simulate_input("example.test:2");
     cx.update(|window, cx| {
         app.update(cx, |app, cx| {
+            app.zxtouch_port_input
+                .update(cx, |input, cx| input.set_value("6008", window, cx));
             app.name_input
                 .update(cx, |input, cx| input.set_value("Office", window, cx));
             app.username_input
@@ -129,6 +165,11 @@ fn offscreen_save_connection_persists_form_and_clears_password(cx: &mut TestAppC
         (saved.name.as_str(), saved.host.as_str(), saved.port),
         ("Office", "example.test", 5902)
     );
+    assert_eq!(saved.zxtouch_port, Some(6008));
+    assert_eq!(
+        ConnectRequest::from_connection(saved, None).zxtouch_port,
+        Some(6008)
+    );
     assert_eq!(saved.username.as_deref(), Some("mac-user"));
     assert_eq!(
         ConnectRequest::from_connection(saved, None).username,
@@ -148,8 +189,11 @@ fn offscreen_invalid_server_keeps_editor_open(cx: &mut TestAppContext) {
         assert!(matches!(app.modal, Modal::Connection));
         assert!(!app.credential_busy);
         assert!(app.book.connections().is_empty());
-        assert!(!app.status.is_empty());
-        assert_ne!(app.status.as_ref(), "Ready");
+        assert!(
+            app.connection_error
+                .as_ref()
+                .is_some_and(|error| !error.is_empty())
+        );
     });
 }
 
@@ -474,4 +518,58 @@ fn offscreen_validation_feedback_survives_footer_removal(cx: &mut TestAppContext
         .expect("invalid address must stay visible in its editor");
     let modal = cx.debug_bounds("modal-card").unwrap();
     assert!(feedback.origin.y >= modal.origin.y && feedback.bottom() <= modal.bottom());
+}
+
+#[gpui::test]
+fn offscreen_invalid_zxtouch_port_keeps_editor_open(cx: &mut TestAppContext) {
+    let (app, cx, dir) = setup(cx, vec![]);
+    cx.simulate_keystrokes("ctrl-n");
+    for port in ["0", "65536", "6000x", "-1"] {
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.server_input.update(cx, |input, cx| {
+                    input.set_value("example.test:5901", window, cx)
+                });
+                app.zxtouch_port_input
+                    .update(cx, |input, cx| input.set_value(port, window, cx));
+                app.submit_connect(false, window, cx);
+                assert!(matches!(app.modal, Modal::Connection));
+            });
+        });
+    }
+    assert!(
+        AddressBook::load(rv_core::StorePaths::in_dir(dir.path().into()))
+            .unwrap()
+            .connections()
+            .is_empty()
+    );
+}
+
+#[gpui::test]
+fn offscreen_editor_derives_zxtouch_default_and_omits_connection_progress(cx: &mut TestAppContext) {
+    let mut phone = rv_core::Connection::new("iPhonX", "172.16.19.47", 5901);
+    phone.zxtouch_port = None;
+    let (app, cx, dir) = setup(cx, vec![phone.clone()]);
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            app.status = "Connecting to iPhonX…".into();
+            app.open_editor(Some(&phone), window, cx);
+            assert_eq!(app.zxtouch_port_input.read(cx).value().as_ref(), "6000");
+            assert!(app.connection_error.is_none());
+        });
+        window.draw(cx).clear(cx);
+    });
+    assert!(cx.debug_bounds("management-feedback").is_none());
+    let vnc = cx.debug_bounds("vnc-address-input").unwrap();
+    let zx = cx.debug_bounds("zxtouch-port-input").unwrap();
+    assert!(zx.top() > vnc.bottom() && zx.top() - vnc.bottom() <= px(20.));
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            app.zxtouch_port_input
+                .update(cx, |input, cx| input.set_value("", window, cx));
+        })
+    });
+    click(cx, "modal-save");
+    let book = AddressBook::load(rv_core::StorePaths::in_dir(dir.path().into())).unwrap();
+    assert_eq!(book.get(phone.id).unwrap().zxtouch_port, Some(6000));
 }

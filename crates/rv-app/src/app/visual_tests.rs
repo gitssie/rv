@@ -190,3 +190,45 @@ fn export_management_previews() {
             .unwrap();
     }
 }
+
+#[test]
+#[ignore = "manual macOS Metal screenshot export"]
+fn export_connection_port_preview() {
+    let platform = gpui_platform::current_platform(true);
+    let mut cx = HeadlessAppContext::with_platform(
+        platform.text_system(),
+        Arc::new(crate::assets::Assets),
+        gpui_platform::current_headless_renderer,
+    );
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        crate::bind_keys(cx);
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let mut book = AddressBook::load(StorePaths::in_dir(dir.path().to_owned())).unwrap();
+    book.prefs_mut().theme = ThemePref::Light;
+    let connection = Connection::new("iPhonX", "172.16.19.47", 5901);
+    book.upsert(connection.clone());
+    let handle = cx
+        .open_window(size(px(900.), px(800.)), |window, cx| {
+            let app = cx.new(|cx| {
+                AddressBookApp::with_book(book, false, "Connecting to iPhonX…".into(), window, cx)
+            });
+            app.update(cx, |app, cx| app.open_editor(Some(&connection), window, cx));
+            let shell = cx.new(|_| WindowRoot::new(app));
+            cx.new(|cx| Root::new(shell, window, cx))
+        })
+        .unwrap();
+    for _ in 0..3 {
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+    }
+    cx.capture_screenshot(handle.into())
+        .unwrap()
+        .save(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../docs/connection-editor-zxtouch-default.png"),
+        )
+        .unwrap();
+}

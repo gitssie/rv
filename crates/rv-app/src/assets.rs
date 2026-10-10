@@ -2,7 +2,7 @@ use gpui::{AssetSource, Result, SharedString};
 use gpui_component::IconNamed;
 use std::borrow::Cow;
 
-const ICONS: [(&str, &[u8]); 7] = [
+const ICONS: [(&str, &[u8]); 13] = [
     (
         "rv-icons/home.svg",
         include_bytes!("../../../assets/icons/home.svg"),
@@ -30,6 +30,30 @@ const ICONS: [(&str, &[u8]); 7] = [
     (
         "rv-icons/pin-off.svg",
         include_bytes!("../../../assets/icons/pin-off.svg"),
+    ),
+    (
+        "rv-icons/log-out.svg",
+        include_bytes!("../../../assets/icons/log-out.svg"),
+    ),
+    (
+        "rv-icons/mail.svg",
+        include_bytes!("../../../assets/icons/mail.svg"),
+    ),
+    (
+        "rv-icons/shield.svg",
+        include_bytes!("../../../assets/icons/shield.svg"),
+    ),
+    (
+        "rv-icons/monitor.svg",
+        include_bytes!("../../../assets/icons/monitor.svg"),
+    ),
+    (
+        "rv-icons/wrench.svg",
+        include_bytes!("../../../assets/icons/wrench.svg"),
+    ),
+    (
+        "rv-icons/cloud.svg",
+        include_bytes!("../../../assets/icons/cloud.svg"),
     ),
 ];
 
@@ -97,6 +121,49 @@ mod tests {
             assert!(Assets.load(&path).unwrap().unwrap().starts_with(b"<svg"));
             assert!(Assets.list("rv-icons/").unwrap().contains(&path));
         }
+        for icon in [
+            FunctionIcon::Wrench,
+            FunctionIcon::Cloud,
+            FunctionIcon::Mail,
+            FunctionIcon::LogOut,
+            FunctionIcon::Shield,
+            FunctionIcon::Monitor,
+        ] {
+            let path = icon.path();
+            assert!(Assets.load(&path).unwrap().unwrap().starts_with(b"<svg"));
+            assert!(Assets.list("rv-icons/").unwrap().contains(&path));
+        }
         assert!(Assets.load("icons/plus.svg").unwrap().is_some());
+    }
+}
+
+#[derive(Clone)]
+pub enum FunctionIcon {
+    User,
+    LogOut,
+    Mail,
+    Shield,
+    Monitor,
+    Wrench,
+    Cloud,
+    Folder,
+    Play,
+    Search,
+}
+impl IconNamed for FunctionIcon {
+    fn path(self) -> SharedString {
+        match self {
+            Self::User => "icons/user.svg",
+            Self::LogOut => "rv-icons/log-out.svg",
+            Self::Mail => "rv-icons/mail.svg",
+            Self::Shield => "rv-icons/shield.svg",
+            Self::Monitor => "rv-icons/monitor.svg",
+            Self::Wrench => "rv-icons/wrench.svg",
+            Self::Cloud => "rv-icons/cloud.svg",
+            Self::Folder => "icons/folder.svg",
+            Self::Play => "icons/play.svg",
+            Self::Search => "icons/search.svg",
+        }
+        .into()
     }
 }

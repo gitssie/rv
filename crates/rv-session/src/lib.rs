@@ -1,7 +1,10 @@
 //! Tokio-backed VNC session for RV.
 
 mod apps;
+pub mod functions;
+pub use functions::{FunctionCommand, FunctionEvent};
 mod ard;
+mod zxtouch;
 pub use apps::{AppCapabilities, AppCommand, AppEvent, RemoteApp, ScreenState, valid_bundle_id};
 mod compositor;
 mod encodings;

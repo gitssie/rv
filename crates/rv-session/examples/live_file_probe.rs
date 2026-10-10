@@ -68,6 +68,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         clipboard: ClipboardMode::Utf8,
         local_cursor: LocalCursorMode::Automatic,
         view_only: !roundtrip,
+        zxtouch_port: None,
         shared: true,
     };
     let session = SessionHandle::spawn(request);

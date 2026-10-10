@@ -142,9 +142,11 @@ impl AddressBookApp {
                             .flex_1()
                             .min_h_0()
                             .overflow_y_scroll()
-                            .when(self.status.as_ref() != "Ready", |el| {
-                                el.child(self.render_status(cx))
-                            })
+                            .when(
+                                !matches!(self.modal, Modal::Connection)
+                                    && self.status.as_ref() != "Ready",
+                                |el| el.child(self.render_status(cx)),
+                            )
                             .child(body),
                     ),
             )

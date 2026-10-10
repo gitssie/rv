@@ -30,9 +30,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// one has been answered.
 const REFRESH_EVERY: Duration = Duration::from_millis(16);
 /// Longest interval without a request. Servers hold an incremental request
-/// until the screen changes, so this only matters as a keepalive; it also
-/// nudges vnc-rs's network task, which stops reading while its decoder is
-/// backlogged until the next outgoing message.
+/// until the screen changes, so this also acts as a keepalive.
 const REFRESH_KEEPALIVE: Duration = Duration::from_millis(250);
 /// How long the loop idles waiting for input before polling decoded frames again.
 const POLL_EVERY: Duration = Duration::from_millis(4);
@@ -55,6 +53,7 @@ pub enum SessionEvent {
     FrameReady { generation: u64 },
     Clipboard(String),
     Apps(crate::AppEvent),
+    Functions(crate::FunctionEvent),
     Bell,
     Error(String),
     Disconnected,
@@ -65,6 +64,7 @@ pub enum SessionCommand {
     Input(X11Event),
     File(FileCommand),
     App(crate::AppCommand),
+    Function(crate::FunctionCommand),
     Close,
 }
 
@@ -168,6 +168,10 @@ impl SessionHandle {
         self.send(SessionCommand::App(command));
     }
 
+    pub fn function(&self, command: crate::FunctionCommand) {
+        self.send(SessionCommand::Function(command));
+    }
+
     pub fn pointer(&self, x: u16, y: u16, buttons: u8) {
         self.send(SessionCommand::Input(X11Event::PointerEvent(
             (x, y, buttons).into(),
@@ -181,7 +185,10 @@ impl SessionHandle {
     }
 
     pub fn copy_text(&self, text: String) {
-        self.send(SessionCommand::Input(X11Event::CopyText(text)));
+        self.app(crate::AppCommand::WriteClipboard {
+            token: uuid::Uuid::new_v4().to_string(),
+            text,
+        });
     }
 
     pub fn close(&self) {
@@ -280,11 +287,20 @@ async fn connect_and_loop(
     // A close request (window closed, handle dropped) must interrupt the
     // handshake too, not just the running session; otherwise a server that
     // never answers keeps the worker alive for the whole connect timeout.
-    let client = tokio::select! {
+    let (client, independent_allowed) = tokio::select! {
         result = connect(&request, send, &file_state) => result?,
         _ = wait_for_close(cmd_rx) => return Ok(()),
     };
-    session_loop(client, fb, cmd_rx, send, file_state, !request.view_only).await
+    session_loop(
+        client,
+        fb,
+        cmd_rx,
+        send,
+        file_state,
+        &request,
+        independent_allowed,
+    )
+    .await
 }
 
 /// Resolves once the UI asks to close (or drops the handle). Input queued
@@ -294,7 +310,9 @@ async fn wait_for_close(cmd_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Sessio
         match cmd_rx.recv().await {
             Some(SessionCommand::Close) | None => return,
             Some(SessionCommand::Input(_)) => {}
-            Some(SessionCommand::File(_)) | Some(SessionCommand::App(_)) => {}
+            Some(SessionCommand::File(_))
+            | Some(SessionCommand::App(_))
+            | Some(SessionCommand::Function(_)) => {}
         }
     }
 }
@@ -362,7 +380,7 @@ async fn connect(
     request: &ConnectRequest,
     send: &impl Fn(SessionEvent),
     file_state: &Arc<Mutex<FileTransferSnapshot>>,
-) -> Result<vnc::VncClient, SessionError> {
+) -> Result<(vnc::VncClient, bool), SessionError> {
     let addr = format!("{}:{}", request.host, request.port);
     let mut tcp = dial(&addr).await?;
     let types = vencrypt::read_security_types(&mut tcp).await?;
@@ -425,7 +443,10 @@ async fn connect(
     for enc in encodings_for(request.quality, request.clipboard) {
         connector = connector.add_encoding(enc);
     }
-    Ok(connector.build()?.try_start().await?.finish()?)
+    Ok((
+        connector.build()?.try_start().await?.finish()?,
+        transport != Transport::VeNCrypt,
+    ))
 }
 
 async fn session_loop(
@@ -434,7 +455,8 @@ async fn session_loop(
     cmd_rx: &mut tokio::sync::mpsc::UnboundedReceiver<SessionCommand>,
     send: &impl Fn(SessionEvent),
     file_state: Arc<Mutex<FileTransferSnapshot>>,
-    allow_upload: bool,
+    request: &ConnectRequest,
+    independent_allowed: bool,
 ) -> Result<(), SessionError> {
     use tokio::sync::mpsc::error::TryRecvError;
 
@@ -446,17 +468,36 @@ async fn session_loop(
     // One incremental request in flight at a time, like other VNC viewers.
     // Firing them unconditionally queues every key event behind a backlog of
     // requests the server has not answered yet.
-    let mut refresh_answered = true;
-    let mut files = FileRuntime::new(file_state, allow_upload);
-    let mut apps = crate::apps::AppRuntime::new(allow_upload);
+    let mut refresh_answered = false; // The connector already requested the first frame.
+    let mut files = FileRuntime::new(file_state, !request.view_only);
+    let mut apps = crate::apps::AppRuntime::new(!request.view_only);
+    if independent_allowed {
+        apps.set_control_host(request.host.clone(), request.zxtouch_port);
+    }
     let app_send = |event| send(SessionEvent::Apps(event));
+    let function_send = |event| send(SessionEvent::Functions(event));
+    let mut functions = crate::functions::FunctionRuntime::new(
+        request.host.clone(),
+        request.zxtouch_port,
+        independent_allowed && !request.view_only,
+    );
     loop {
         // Input first: a key-up queued behind frame decoding turns into
         // auto-repeat on the server, so pixels never take priority over commands.
         loop {
             match cmd_rx.try_recv() {
                 Ok(cmd) => {
-                    if !apply_command(&mut client, cmd, &mut files, &mut apps, &app_send).await? {
+                    if !apply_command(
+                        &mut client,
+                        cmd,
+                        &mut files,
+                        &mut apps,
+                        &app_send,
+                        &mut functions,
+                        &function_send,
+                    )
+                    .await?
+                    {
                         return Ok(());
                     }
                 }
@@ -472,7 +513,17 @@ async fn session_loop(
         while applied < MAX_EVENTS_PER_SLOT {
             match client.poll_event().await {
                 Ok(Some(ev)) => {
+                    if matches!(ev, VncEvent::FramebufferUpdateFinished) {
+                        refresh_answered = true;
+                    }
                     if let VncEvent::Device(reply) = ev {
+                        if reply.op == 0
+                            && reply.status == 0
+                            && let Ok(caps) =
+                                serde_json::from_str::<crate::AppCapabilities>(&reply.payload)
+                        {
+                            functions.configure(&caps);
+                        }
                         apps.reply(reply, &app_send);
                     } else if let VncEvent::TightFile(event) = ev {
                         if let TightFileEvent::Capabilities(caps) = event {
@@ -487,7 +538,6 @@ async fn session_loop(
                         handle_event(ev, &fb, send, &mut announced);
                     }
                     applied += 1;
-                    refresh_answered = true;
                 }
                 Ok(None) => break,
                 Err(e) => {
@@ -497,6 +547,7 @@ async fn session_loop(
             }
         }
         apps.advance(&client, &app_send).await;
+        functions.advance(&function_send);
         files.advance_upload(&client).await;
         if let Some((offset, album)) = files.next_photo_page.take() {
             files.send_photo_list(&client, offset, album).await;
@@ -536,7 +587,7 @@ async fn session_loop(
                         return Ok(());
                     }
                     Some(cmd) => {
-                        if !apply_command(&mut client, cmd, &mut files, &mut apps, &app_send).await? {
+                        if !apply_command(&mut client, cmd, &mut files, &mut apps, &app_send, &mut functions, &function_send).await? {
                             return Ok(());
                         }
                     }
@@ -554,6 +605,8 @@ async fn apply_command(
     files: &mut FileRuntime,
     apps: &mut crate::apps::AppRuntime,
     app_send: &impl Fn(crate::AppEvent),
+    functions: &mut crate::functions::FunctionRuntime,
+    function_send: &impl Fn(crate::FunctionEvent),
 ) -> Result<bool, SessionError> {
     match cmd {
         SessionCommand::Close => {
@@ -566,6 +619,10 @@ async fn apply_command(
         }
         SessionCommand::App(command) => {
             apps.command(command, app_send);
+            Ok(true)
+        }
+        SessionCommand::Function(command) => {
+            functions.command(command, function_send);
             Ok(true)
         }
         SessionCommand::File(command) => {
