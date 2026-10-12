@@ -1,9 +1,14 @@
 //! Tokio-backed VNC session for RV.
 
 mod apps;
+mod karing;
+pub use karing::{KaringRequest, KaringResponse, karing_component};
+mod screen_control;
+pub use screen_control::{ScreenPasscode, ScreenProgress};
 pub mod functions;
 pub use functions::{FunctionCommand, FunctionEvent};
 mod ard;
+pub mod phone_http;
 mod zxtouch;
 pub use apps::{AppCapabilities, AppCommand, AppEvent, RemoteApp, ScreenState, valid_bundle_id};
 mod compositor;

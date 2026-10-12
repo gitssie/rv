@@ -10,14 +10,9 @@ mod tests;
 pub use spec::{OPERATIONS, OperationSpec, PreparedOperation, parse_operation, valid_code};
 
 use crate::zxtouch::ControlEndpoint;
-use base64::{Engine, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
 use std::time::Duration;
-use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    net::TcpStream,
-    sync::mpsc,
-};
+use tokio::sync::mpsc;
 
 #[derive(Clone)]
 pub enum FunctionCommand {
@@ -104,6 +99,7 @@ pub(crate) struct FunctionRuntime {
     port: Option<u16>,
     allowed: bool,
     endpoint: Option<ControlEndpoint>,
+    http_client: Option<crate::phone_http::PhoneHttpClient>,
     events: mpsc::Sender<FunctionEvent>,
     rx: mpsc::Receiver<FunctionEvent>,
     workers: std::collections::HashMap<String, mpsc::Sender<FunctionCommand>>,
@@ -136,6 +132,7 @@ impl FunctionRuntime {
             port,
             allowed,
             endpoint: None,
+            http_client: None,
             events,
             rx,
             workers: Default::default(),
@@ -147,6 +144,9 @@ impl FunctionRuntime {
             account_refresh_again: false,
         }
     }
+    pub(crate) fn set_http_client(&mut self, client: Option<crate::phone_http::PhoneHttpClient>) {
+        self.http_client = client;
+    }
     pub fn configure(&mut self, caps: &crate::AppCapabilities) {
         if self.endpoint.is_some() || !self.allowed || !caps.control {
             return;
@@ -154,7 +154,7 @@ impl FunctionRuntime {
         let Some(mut endpoint) = caps.zx_control.clone() else {
             return;
         };
-        if endpoint.version != 1
+        if endpoint.version != 2
             || endpoint.port == 0
             || endpoint.token.len() != 64
             || !endpoint.token.bytes().all(|b| b.is_ascii_hexdigit())
@@ -163,6 +163,17 @@ impl FunctionRuntime {
         }
         if let Some(port) = self.port {
             endpoint.port = port;
+        }
+        if self.http_client.is_none() {
+            self.http_client = crate::phone_http::PhoneHttpClient::new(
+                &self.host,
+                endpoint.port,
+                endpoint.token.clone(),
+            )
+            .ok();
+        }
+        if self.http_client.is_none() {
+            return;
         }
         self.endpoint = Some(endpoint);
         self.announce = true;
@@ -173,19 +184,30 @@ impl FunctionRuntime {
             self.account_refresh_again = true;
             return;
         }
-        let Some(endpoint) = self.endpoint.clone() else { return; };
+        let Some(client) = self.http_client.clone() else {
+            return;
+        };
         self.account_refresh_pending = true;
         let _ = self.events.try_send(FunctionEvent::AccountStateLoading);
-        let host = self.host.clone();
         let events = self.events.clone();
         self.tasks.retain(|task| !task.is_finished());
         self.tasks.push(tokio::spawn(async move {
-            let state = tokio::time::timeout(Duration::from_secs(20), account::query_account_state(&host, &endpoint))
-                .await.unwrap_or_else(|_| Err("账户状态读取超时".into()));
+            let state = tokio::time::timeout(
+                Duration::from_secs(20),
+                account::query_account_state(&client),
+            )
+            .await
+            .unwrap_or_else(|_| Err("账户状态读取超时".into()));
             let _ = events.send(FunctionEvent::AccountState(state)).await;
         }));
     }
     pub fn command(&mut self, command: FunctionCommand, send: &impl Fn(FunctionEvent)) {
+        if !self.allowed || self.endpoint.is_none() {
+            send(FunctionEvent::Error(
+                "功能连接不可用，请检查 ZXTouch 端口并重新连接".into(),
+            ));
+            return;
+        }
         let (scope, command) = match command {
             FunctionCommand::Scoped { id, command } => (Some(id), *command),
             c => (None, c),
@@ -209,7 +231,7 @@ impl FunctionRuntime {
             _ => self.last_family.clone(),
         });
         let family = operation_family(&family).to_owned();
-        let Some(endpoint) = self.endpoint.clone() else {
+        let Some(client) = self.http_client.clone() else {
             send(FunctionEvent::Error(
                 "功能连接不可用，请检查 ZXTouch 端口并重新连接".into(),
             ));
@@ -224,7 +246,6 @@ impl FunctionRuntime {
             let (events, mut rx) = mpsc::channel(32);
             let shared = self.events.clone();
             let key = family.clone();
-            let host = self.host.clone();
             self.tasks.push(tokio::spawn(async move {
                 let forward = async move {
                     while let Some(event) = rx.recv().await {
@@ -240,7 +261,7 @@ impl FunctionRuntime {
                         }
                     }
                 };
-                tokio::join!(worker(host, endpoint, commands, events), forward);
+                tokio::join!(worker(client, commands, events), forward);
             }));
             self.workers.insert(family.clone(), tx);
         }
@@ -260,7 +281,9 @@ impl FunctionRuntime {
         while let Ok(event) = self.rx.try_recv() {
             if matches!(event, FunctionEvent::AccountState(_)) {
                 self.account_refresh_pending = false;
-                if std::mem::take(&mut self.account_refresh_again) { self.refresh_account_state(); }
+                if std::mem::take(&mut self.account_refresh_again) {
+                    self.refresh_account_state();
+                }
             }
             if let FunctionEvent::ForOperation { id, event: inner } = &event {
                 let record = match inner.as_ref() {
@@ -268,8 +291,20 @@ impl FunctionRuntime {
                     | FunctionEvent::EmailCodePending(record) => Some(record),
                     _ => None,
                 };
-                if record.is_some_and(|r| r["status"] == "completed" && matches!(r["method"].as_str(),
-                    Some("signInAppStore" | "enableICloud" | "signOutAppStore" | "signOutAppleID" | "signOutICloud" | "disableFindMy"))) {
+                if record.is_some_and(|r| {
+                    r["status"] == "completed"
+                        && matches!(
+                            r["method"].as_str(),
+                            Some(
+                                "signInAppStore"
+                                    | "enableICloud"
+                                    | "signOutAppStore"
+                                    | "signOutAppleID"
+                                    | "signOutICloud"
+                                    | "disableFindMy"
+                            )
+                        )
+                }) {
                     self.refresh_account_state();
                 }
                 if let Some(op) = record.and_then(|r| r["operation_id"].as_str()) {
@@ -325,91 +360,55 @@ fn accepted_code(response: &Value, id: &str) -> Result<(), String> {
 }
 
 struct Wire {
-    stream: BufReader<TcpStream>,
+    client: crate::phone_http::PhoneHttpClient,
 }
 impl Wire {
-    async fn connect(host: &str, endpoint: &ControlEndpoint) -> Result<Self, String> {
-        tokio::time::timeout(Duration::from_secs(5), async {
-            let stream = TcpStream::connect((host, endpoint.port))
-                .await
-                .map_err(|_| "ZXTouch 连接失败")?;
-            stream
-                .set_nodelay(true)
-                .map_err(|_| "ZXTouch 连接设置失败")?;
-            let mut wire = Self {
-                stream: BufReader::new(stream),
-            };
-            let response = wire
-                .request(
-                    33,
-                    json!({"version":1,"token":endpoint.token,"op":0,"id":0,"payload":{}}),
-                )
-                .await?;
-            if response["version"] != 1
-                || response["op"] != 0
-                || response["id"] != 0
-                || response["status"] != 0
-            {
-                return Err("ZXTouch 授权失败".into());
-            }
-            Ok(wire)
-        })
-        .await
-        .map_err(|_| "ZXTouch 连接超时")?
+    async fn connect(client: &crate::phone_http::PhoneHttpClient) -> Result<Self, String> {
+        let client = client.clone();
+        let (status, _) = client.json("/api/control/authorize", &json!({})).await?;
+        if status != 200 {
+            return Err("手机控制授权失败".into());
+        }
+        Ok(Self { client })
     }
-    async fn request(&mut self, task: u8, body: Value) -> Result<Value, String> {
-        tokio::time::timeout(Duration::from_secs(10), async {
-            let json = body.to_string();
-            if json.len() > 32768 {
-                return Err("功能请求过大".into());
-            }
-            let wire = format!("{task}{}\r\n", STANDARD.encode(json));
-            self.stream
-                .get_mut()
-                .write_all(wire.as_bytes())
-                .await
-                .map_err(|_| "ZXTouch 请求中断；结果可能未知")?;
-            let mut line = Vec::new();
-            loop {
-                let available = self
-                    .stream
-                    .fill_buf()
-                    .await
-                    .map_err(|_| "ZXTouch 回复中断；结果可能未知")?;
-                if available.is_empty() {
-                    return Err("ZXTouch 连接已关闭；结果可能未知".into());
-                }
-                let count = available
-                    .iter()
-                    .position(|b| *b == b'\n')
-                    .map_or(available.len(), |i| i + 1);
-                if line.len() + count > 950000 {
-                    return Err("功能回复超过限制".into());
-                }
-                line.extend_from_slice(&available[..count]);
-                self.stream.consume(count);
-                if line.last() == Some(&b'\n') {
-                    break;
-                }
-            }
-            let encoded = line
-                .strip_prefix(b"0;;")
-                .and_then(|l| l.strip_suffix(b"\r\n"))
-                .ok_or("功能回复格式错误")?;
-            let bytes = STANDARD.decode(encoded).map_err(|_| "功能回复编码错误")?;
-            if bytes.len() > 700000 {
-                return Err("功能回复超过限制".into());
-            }
-            let value: Value = serde_json::from_slice(&bytes).map_err(|_| "功能回复 JSON 错误")?;
-            if !value.is_object() {
-                return Err("功能回复不是对象".into());
-            }
-            Ok(value)
-        })
-        .await
-        .map_err(|_| "功能请求超时；请查询原操作结果，不要重复执行".to_string())?
+    async fn request(&mut self, module: u8, body: Value) -> Result<Value, String> {
+        let prefix = match module {
+            31 => "/api/apple",
+            32 => "/api/app-state",
+            _ => return Err("未知原生模块".into()),
+        };
+        let (action, params) = if body["action"] == "invoke" {
+            (
+                body["method"].as_str().ok_or("缺少原生方法")?.to_string(),
+                body["params"].clone(),
+            )
+        } else {
+            let action = body["action"].as_str().ok_or("缺少原生动作")?.to_string();
+            let mut params = body;
+            params
+                .as_object_mut()
+                .ok_or("无效原生请求")?
+                .remove("action");
+            (action, params)
+        };
+        if action.is_empty()
+            || !action
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        {
+            return Err("无效原生方法".into());
+        }
+        if params.to_string().len() > 32768 {
+            return Err("功能请求过大".into());
+        }
+        let (_, result) = self
+            .client
+            .json(&format!("{prefix}/{action}"), &params)
+            .await?;
+        Ok(result)
     }
 }
+
 struct Active {
     task: u8,
     started: std::time::Instant,
@@ -419,21 +418,19 @@ struct Active {
     fetched: std::collections::HashSet<String>,
 }
 async fn worker(
-    host: String,
-    endpoint: ControlEndpoint,
+    client: crate::phone_http::PhoneHttpClient,
     commands: mpsc::Receiver<FunctionCommand>,
     events: mpsc::Sender<FunctionEvent>,
 ) {
-    worker_with_provider(host, endpoint, commands, events, &mailbox::Router).await;
+    worker_with_provider(client, commands, events, &mailbox::Router).await;
 }
 async fn worker_with_provider(
-    host: String,
-    endpoint: ControlEndpoint,
+    client: crate::phone_http::PhoneHttpClient,
     mut commands: mpsc::Receiver<FunctionCommand>,
     events: mpsc::Sender<FunctionEvent>,
     mailbox_provider: &dyn mailbox::MailboxProvider,
 ) {
-    // Each invoke/query/code submission owns one short authenticated socket.
+    // Every invoke/query/code submission reuses the session HTTP/2 pool.
     let _ = events.send(FunctionEvent::Available(true)).await;
     let mut active: Option<Active> = None;
     // Native email verification is a separate call; retain its opaque target in memory.
@@ -507,14 +504,13 @@ async fn worker_with_provider(
                             .await;
                         continue;
                     }
-                    let target =
-                        match account::query_current_account(&host, &endpoint, spec.method).await {
-                            Ok(target) => target,
-                            Err(error) => {
-                                let _ = events.send(FunctionEvent::Error(error)).await;
-                                continue;
-                            }
-                        };
+                    let target = match account::query_current_account(&client, spec.method).await {
+                        Ok(target) => target,
+                        Err(error) => {
+                            let _ = events.send(FunctionEvent::Error(error)).await;
+                            continue;
+                        }
+                    };
                     if spec.method == "verifyContactEmail" {
                         let (expected, challenge) = email_pending.as_ref().unwrap();
                         if expected
@@ -547,7 +543,7 @@ async fn worker_with_provider(
                         }
                     }
                     // OAuth preparation may take time. Resolve the phone's current account again.
-                    match account::query_current_account(&host, &endpoint, spec.method).await {
+                    match account::query_current_account(&client, spec.method).await {
                         Ok(target) if Some(&target) == email_target.as_ref() => (),
                         _ => {
                             email_mailbox = None;
@@ -728,7 +724,7 @@ async fn worker_with_provider(
             }
         };
         if let Some((task, body, url, invocation)) = request {
-            let mut wire = match Wire::connect(&host, &endpoint).await {
+            let mut wire = match Wire::connect(&client).await {
                 Ok(connection) => connection,
                 Err(e) => {
                     let _ = events.send(FunctionEvent::Error(e)).await;
@@ -912,7 +908,7 @@ async fn worker_with_provider(
                         return;
                     }
                     // Code retrieval does not invoke or replay login.
-                    let mut wire = match Wire::connect(&host, &endpoint).await {
+                    let mut wire = match Wire::connect(&client).await {
                         Ok(wire) => wire,
                         Err(e) => {
                             let _ = events.send(FunctionEvent::Error(e)).await;

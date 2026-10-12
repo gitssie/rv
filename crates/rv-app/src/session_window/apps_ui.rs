@@ -331,8 +331,16 @@ impl SessionView {
             }
             AppEvent::LockState(locked) => self.unlock_lock_state(locked, cx),
             AppEvent::ScreenState(attempt, state) => self.unlock_screen_state(attempt, state, cx),
+            AppEvent::ScreenProgress(attempt, progress) => {
+                self.screen_http_progress(attempt, progress, cx)
+            }
             AppEvent::UnlockArmed(attempt, armed) => self.unlock_armed(attempt, armed, cx),
+            AppEvent::Karing(response) => self.apply_karing_response(response, cx),
             AppEvent::Capabilities(caps) => {
+                if !caps.control || caps.zx_control.is_none() {
+                    self.cancel_karing(cx);
+                    self.karing.disconnected();
+                }
                 // Capability updates after a control failure must not resubmit
                 // unrelated subscriptions or mark an existing App list as loading.
                 let initial = self.apps.caps.is_none();
@@ -403,6 +411,10 @@ impl SessionView {
                 }
             }
             AppEvent::Failed { command, message } => {
+                if let AppCommand::Karing(request) = &command {
+                    self.karing_failure(request.id, message, cx);
+                    return;
+                }
                 if let AppCommand::WriteClipboard { token, .. } = &command {
                     self.status = format!("Clipboard write failed: {message}").into();
                     if self.assistant_clipboard.as_ref() == Some(token) {
@@ -424,6 +436,8 @@ impl SessionView {
                         | AppCommand::PrepareUnlock(_)
                         | AppCommand::ArmUnlock(_, _)
                         | AppCommand::LockScreen(_)
+                        | AppCommand::HttpUnlock(_, _)
+                        | AppCommand::HttpLock(_)
                 ) {
                     self.unlock_failed(&command, message, cx);
                     return;
@@ -690,6 +704,8 @@ impl SessionView {
                         let drop_id = id.clone();
                         let menu_id = id.clone();
                         let menu_entity = entity.clone();
+                        let karing_open_entity = entity.clone();
+                        let karing = super::karing_ui::is_karing(&id, &shortcut.name);
                         let can_restart = self.app_allowed(&id, 4);
                         let can_terminate = self.app_allowed(&id, 3);
                         let busy = self.apps.busy.contains(&id);
@@ -700,6 +716,17 @@ impl SessionView {
                         };
                         Popover::new(SharedString::from(format!("app-actions-{id}")))
                             .mouse_button(MouseButton::Right)
+                            .on_open_change(move |open, _, cx| {
+                                if karing {
+                                    karing_open_entity.update(cx, |this, cx| {
+                                        if *open {
+                                            this.refresh_karing(cx);
+                                        } else {
+                                            this.cancel_karing(cx);
+                                        }
+                                    });
+                                }
+                            })
                             .bg(theme::toolbar())
                             .text_color(theme::toolbar_fg())
                             .border_color(theme::toolbar_line())
@@ -750,6 +777,10 @@ impl SessionView {
                                     .into_any_element(),
                             ))
                             .content(move |_, _, cx| {
+                                if karing {
+                                    return menu_entity
+                                        .update(cx, |this, cx| this.render_karing_panel(cx));
+                                }
                                 let menu_view = cx.entity().downgrade();
                                 let restart = menu_entity.clone();
                                 let terminate = menu_entity.clone();
@@ -806,6 +837,7 @@ impl SessionView {
                                             });
                                         },
                                     ))
+                                    .into_any_element()
                             })
                     })),
             )

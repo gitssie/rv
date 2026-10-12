@@ -19,6 +19,7 @@ pub struct AppCapabilities {
     pub icons: bool,
     pub control: bool,
     pub unlock: bool,
+    pub http_screen_control: bool,
     pub lock: bool,
     pub home: bool,
     pub notifications: bool,
@@ -38,6 +39,8 @@ pub struct RemoteApp {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppCommand {
     List,
+    Karing(crate::KaringRequest),
+    CancelKaring,
     Launch(String),
     Terminate(String),
     Restart(String),
@@ -47,6 +50,9 @@ pub enum AppCommand {
     PrepareUnlock(u32),
     ArmUnlock(u32, u8),
     LockScreen(u32),
+    HttpUnlock(u32, crate::ScreenPasscode),
+    HttpLock(u32),
+    CancelScreen(u32),
     Home,
     SubscribeNotifications(bool),
     Notifications,
@@ -65,12 +71,17 @@ impl AppCommand {
             Self::ScreenState(id)
             | Self::PrepareUnlock(id)
             | Self::ArmUnlock(id, _)
-            | Self::LockScreen(id) => Some(*id),
+            | Self::LockScreen(id)
+            | Self::HttpUnlock(id, _)
+            | Self::HttpLock(id)
+            | Self::CancelScreen(id) => Some(*id),
             _ => None,
         }
     }
     fn op(&self) -> u8 {
         match self {
+            Self::HttpUnlock(_, _) | Self::HttpLock(_) | Self::CancelScreen(_) => 0,
+            Self::Karing(_) | Self::CancelKaring => 0,
             Self::List => 1,
             Self::Launch(_) => 2,
             Self::Terminate(_) => 3,
@@ -88,6 +99,9 @@ impl AppCommand {
         }
     }
     fn mutates(&self) -> bool {
+        if let Self::Karing(request) = self {
+            return request.method != "GET" && request.method != "HEAD";
+        }
         matches!(
             self,
             Self::Launch(_)
@@ -96,6 +110,8 @@ impl AppCommand {
                 | Self::PrepareUnlock(_)
                 | Self::ArmUnlock(_, _)
                 | Self::LockScreen(_)
+                | Self::HttpUnlock(_, _)
+                | Self::HttpLock(_)
                 | Self::Home
                 | Self::WriteClipboard { .. }
         )
@@ -105,10 +121,12 @@ impl AppCommand {
 #[derive(Debug, Clone)]
 pub enum AppEvent {
     Capabilities(AppCapabilities),
+    Karing(crate::KaringResponse),
     LockState(bool),
     Notifications(crate::NotificationSnapshot),
     ScreenState(u32, ScreenState),
     UnlockArmed(u32, bool),
+    ScreenProgress(u32, crate::ScreenProgress),
     List(Vec<RemoteApp>),
     Foreground(Option<String>),
     Icon {
@@ -151,7 +169,10 @@ pub(crate) struct AppRuntime {
     control_host: Option<(String, Option<u16>)>,
     control: Option<ControlChannel>,
     control_ready: bool,
+    http_client: Option<crate::phone_http::PhoneHttpClient>,
     control_connecting: bool,
+    screen_operation: Option<crate::screen_control::ScreenOperation>,
+    karing_operations: Vec<crate::karing::KaringOperation>,
 }
 
 impl AppRuntime {
@@ -165,12 +186,20 @@ impl AppRuntime {
             control_host: None,
             control: None,
             control_ready: false,
+            http_client: None,
             control_connecting: false,
+            screen_operation: None,
+            karing_operations: Vec::new(),
         }
     }
     fn supported(&self, cmd: &AppCommand) -> bool {
         (!cmd.mutates() || (self.allowed && self.caps.control))
             && match cmd {
+                AppCommand::HttpUnlock(_, _) => self.caps.http_screen_control && self.caps.unlock,
+                AppCommand::HttpLock(_) => self.caps.http_screen_control && self.caps.lock,
+                AppCommand::CancelKaring => true,
+                AppCommand::Karing(_) => self.caps.control && self.caps.zx_control.is_some(),
+                AppCommand::CancelScreen(_) => true,
                 AppCommand::Home => self.caps.home,
                 AppCommand::WriteClipboard { .. } => self.caps.clipboard_write,
                 AppCommand::SubscribeNotifications(_) | AppCommand::Notifications => {
@@ -188,6 +217,77 @@ impl AppRuntime {
             }
     }
     pub fn command(&mut self, command: AppCommand, send: &impl Fn(AppEvent)) {
+        if matches!(command, AppCommand::CancelKaring) {
+            self.karing_operations.clear();
+            return;
+        }
+        if let AppCommand::Karing(request) = &command {
+            if !self.supported(&command)
+                || !self.control_ready
+                || self.karing_operations.len() >= 16
+            {
+                send(AppEvent::Failed {
+                    command,
+                    message: "Karing 控制不可用或请求正在执行".into(),
+                });
+                return;
+            }
+            let operation = self
+                .control_host
+                .as_ref()
+                .zip(self.caps.zx_control.as_ref())
+                .ok_or_else(|| "Karing 控制地址不可用".to_string())
+                .and_then(|_| {
+                    crate::karing::KaringOperation::start(
+                        self.http_client.clone().ok_or("HTTP/2 控制正在恢复")?,
+                        request.clone(),
+                    )
+                });
+            match operation {
+                Ok(operation) => self.karing_operations.push(operation),
+                Err(message) => send(AppEvent::Failed { command, message }),
+            }
+            return;
+        }
+        if let AppCommand::CancelScreen(attempt) = command {
+            if self
+                .screen_operation
+                .as_ref()
+                .is_some_and(|op| op.attempt == attempt)
+            {
+                self.screen_operation = None;
+            }
+            return;
+        }
+        if matches!(
+            command,
+            AppCommand::HttpUnlock(_, _) | AppCommand::HttpLock(_)
+        ) {
+            if !self.supported(&command) || !self.control_ready || self.screen_operation.is_some() {
+                send(AppEvent::Failed {
+                    command,
+                    message: "HTTP/2 屏幕控制不可用或正在执行".into(),
+                });
+                return;
+            }
+            let Some(http_client) = self.http_client.clone() else {
+                return;
+            };
+            let failure_command = match &command {
+                AppCommand::HttpUnlock(id, _) => {
+                    AppCommand::HttpUnlock(*id, crate::ScreenPasscode(String::new()))
+                }
+                _ => command.clone(),
+            };
+            match crate::screen_control::ScreenOperation::start(http_client, command) {
+                Ok(op) => self.screen_operation = Some(op),
+                Err(message) => send(AppEvent::Failed {
+                    command: failure_command,
+                    message,
+                }),
+            }
+            return;
+        }
         if let AppCommand::WriteClipboard { token, text } = &command
             && (token.len() != 36
                 || uuid::Uuid::parse_str(token).is_err()
@@ -239,6 +339,40 @@ impl AppRuntime {
         }
     }
     pub async fn advance(&mut self, client: &VncClient, send: &impl Fn(AppEvent)) {
+        self.karing_operations
+            .retain_mut(|operation| match operation.result.try_recv() {
+                Ok(Ok(response)) => {
+                    send(AppEvent::Karing(response));
+                    false
+                }
+                Ok(Err(message)) => {
+                    send(AppEvent::Failed {
+                        command: operation.command.clone(),
+                        message,
+                    });
+                    false
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => true,
+                Err(_) => {
+                    send(AppEvent::Failed {
+                        command: operation.command.clone(),
+                        message: "Karing 请求已停止".into(),
+                    });
+                    false
+                }
+            });
+        if let Some(operation) = &mut self.screen_operation {
+            let mut finished = false;
+            while let Ok(event) = operation.events.try_recv() {
+                finished |= matches!(&event, AppEvent::Failed { .. })
+                    || matches!(&event,
+                    AppEvent::ScreenProgress(_, progress) if matches!(progress.phase.as_str(), "locked" | "unlocked" | "failed"));
+                send(event);
+            }
+            if finished {
+                self.screen_operation = None;
+            }
+        }
         let mut events = Vec::new();
         if let Some(control) = &mut self.control {
             while let Ok(event) = control.events.try_recv() {
@@ -252,11 +386,9 @@ impl AppRuntime {
                     self.control_connecting = false;
                 }
                 ControlEvent::Unavailable => {
-                    self.control_ready = false;
-                    self.control = None;
-                    self.control_connecting = false;
-                    self.disable_control_capabilities();
-                    send(AppEvent::Capabilities(self.caps.clone()));
+                    // A transport failure does not revoke negotiated capabilities.
+                    // The channel restores itself; other HTTP streams own their outcome.
+                    self.control_unavailable();
                 }
                 ControlEvent::Reply(reply) => self.reply(reply, send),
             }
@@ -392,7 +524,7 @@ impl AppRuntime {
                 if self.control.is_none()
                     && let Some((host, port)) = &self.control_host
                     && let Some(mut endpoint) = caps.zx_control.clone()
-                    && endpoint.version == 1
+                    && endpoint.version == 2
                     && endpoint.port > 0
                     && endpoint.token.len() == 64
                     && endpoint.token.bytes().all(|byte| byte.is_ascii_hexdigit())
@@ -400,8 +532,17 @@ impl AppRuntime {
                     if let Some(port) = port {
                         endpoint.port = *port;
                     }
-                    self.control = Some(ControlChannel::start(host.clone(), endpoint));
-                    self.control_connecting = true;
+                    let http_client = crate::phone_http::PhoneHttpClient::new(
+                        host,
+                        endpoint.port,
+                        endpoint.token.clone(),
+                    )
+                    .ok();
+                    self.control = http_client
+                        .as_ref()
+                        .map(|client| ControlChannel::start_with_client(client.clone()));
+                    self.http_client = http_client;
+                    self.control_connecting = self.control.is_some();
                 }
                 self.caps = caps.clone();
                 if self.control.is_none() {
@@ -560,7 +701,18 @@ impl AppRuntime {
         self.control_host = Some((host, port));
     }
 
+    pub(crate) fn http_client(&self) -> Option<crate::phone_http::PhoneHttpClient> {
+        self.http_client.clone()
+    }
+    fn control_unavailable(&mut self) {
+        self.control_ready = false;
+        self.control_connecting = true;
+    }
+
     fn disable_control_capabilities(&mut self) {
+        // Invalidate HTTP discovery without disabling retained VNC screen control.
+        self.caps.zx_control = None;
+        self.caps.http_screen_control = false;
         self.caps.list = false;
         self.caps.launch = false;
         self.caps.terminate = false;
@@ -576,6 +728,49 @@ impl AppRuntime {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+    #[test]
+    fn retryable_control_failure_preserves_negotiated_capabilities() {
+        let mut runtime = AppRuntime::new(true);
+        runtime.caps.list = true;
+        runtime.caps.launch = true;
+        runtime.caps.control = true;
+        runtime.caps.http_screen_control = true;
+        runtime.caps.zx_control = Some(ControlEndpoint {
+            version: 2,
+            port: 6000,
+            token: "a".repeat(64),
+        });
+        runtime.control_ready = true;
+        runtime.control_unavailable();
+        assert!(!runtime.control_ready && runtime.control_connecting);
+        assert!(runtime.caps.list && runtime.caps.launch && runtime.caps.http_screen_control);
+        assert!(runtime.caps.zx_control.is_some());
+    }
+    #[test]
+    fn http_control_loss_disables_karing_but_preserves_legacy_vnc_screen_control() {
+        let mut runtime = AppRuntime::new(true);
+        runtime.caps.control = true;
+        runtime.caps.unlock = true;
+        runtime.caps.lock = true;
+        runtime.caps.http_screen_control = true;
+        runtime.caps.zx_control = Some(ControlEndpoint {
+            version: 2,
+            port: 6000,
+            token: "fixture-token".into(),
+        });
+        let karing = AppCommand::Karing(crate::KaringRequest {
+            id: 1,
+            method: "GET".into(),
+            path: "/proxies".into(),
+            body: vec![],
+        });
+        assert!(runtime.supported(&karing));
+        runtime.disable_control_capabilities();
+        assert!(!runtime.supported(&karing));
+        assert!(!runtime.supported(&AppCommand::HttpLock(1)));
+        assert!(runtime.supported(&AppCommand::ArmUnlock(1, 6)));
+        assert!(runtime.supported(&AppCommand::LockScreen(1)));
+    }
     #[test]
     fn notification_subscription_keeps_latest_intent_and_allows_read_only() {
         let mut runtime = AppRuntime::new(false);

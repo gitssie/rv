@@ -58,23 +58,22 @@ pub(super) fn current_account(method: &str, state: &Value) -> Result<String, Str
 }
 
 pub(super) async fn query_current_account(
-    host: &str,
-    endpoint: &ControlEndpoint,
+    client: &crate::phone_http::PhoneHttpClient,
     method: &str,
 ) -> Result<String, String> {
-    query_account_state(host, endpoint).await
+    query_account_state(client)
+        .await
         .and_then(|state| current_account(method, &state))
         .map_err(|error| format!("未提交操作：{error}"))
 }
 
 pub(super) async fn query_account_state(
-    host: &str,
-    endpoint: &ControlEndpoint,
+    client: &crate::phone_http::PhoneHttpClient,
 ) -> Result<Value, String> {
-    // Read-only preflight uses the same short authenticated sockets as all operations.
+    // Read-only preflight uses the shared session HTTP/2 pool.
     // Failures here cannot have submitted the requested mutation.
     let result = tokio::time::timeout(Duration::from_secs(600), async {
-        let mut wire = Wire::connect(host, endpoint).await?;
+        let mut wire = Wire::connect(client).await?;
         let mut record = wire
             .request(
                 31,
@@ -102,7 +101,7 @@ pub(super) async fn query_account_state(
                 _ => return Err("手机账户查询状态无效".into()),
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
-            let mut wire = Wire::connect(host, endpoint).await?;
+            let mut wire = Wire::connect(client).await?;
             record = wire
                 .request(31, json!({"action":"result","operation_id":id}))
                 .await?;

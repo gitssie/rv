@@ -517,14 +517,16 @@ async fn session_loop(
                         refresh_answered = true;
                     }
                     if let VncEvent::Device(reply) = ev {
-                        if reply.op == 0
-                            && reply.status == 0
-                            && let Ok(caps) =
-                                serde_json::from_str::<crate::AppCapabilities>(&reply.payload)
-                        {
+                        let capabilities = if reply.op == 0 && reply.status == 0 {
+                            serde_json::from_str::<crate::AppCapabilities>(&reply.payload).ok()
+                        } else {
+                            None
+                        };
+                        apps.reply(reply, &app_send);
+                        if let Some(caps) = capabilities {
+                            functions.set_http_client(apps.http_client());
                             functions.configure(&caps);
                         }
-                        apps.reply(reply, &app_send);
                     } else if let VncEvent::TightFile(event) = ev {
                         if let TightFileEvent::Capabilities(caps) = event {
                             files.event(TightFileEvent::Capabilities(caps));

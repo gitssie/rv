@@ -1,39 +1,112 @@
 use super::*;
 use tokio::net::TcpListener;
 
-async fn packet(stream: &mut BufReader<TcpStream>) -> (u8, Value) {
-    let mut line = String::new();
-    stream.read_line(&mut line).await.unwrap();
-    let task = line[..2].parse().unwrap();
-    let request = serde_json::from_slice(&STANDARD.decode(line[2..].trim()).unwrap()).unwrap();
-    (task, request)
+use http_body_util::{BodyExt, Full};
+use hyper::{Request, Response, body::Incoming, service::service_fn};
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use tokio::sync::oneshot;
+use tokio::{io::AsyncWriteExt, net::TcpStream};
+struct TestStream {
+    packets: mpsc::Receiver<(String, Value, oneshot::Sender<Value>)>,
+    pending: Option<oneshot::Sender<Value>>,
+    connection: tokio::task::JoinHandle<()>,
 }
-async fn reply(stream: &mut BufReader<TcpStream>, value: Value) {
-    stream
-        .get_mut()
-        .write_all(format!("0;;{}\r\n", STANDARD.encode(value.to_string())).as_bytes())
-        .await
-        .unwrap();
+impl Drop for TestStream {
+    fn drop(&mut self) {
+        if self.pending.is_some() {
+            self.connection.abort();
+        }
+    }
 }
-async fn reconnect(
-    listener: &TcpListener,
-    mut previous: BufReader<TcpStream>,
-) -> BufReader<TcpStream> {
-    let mut line = String::new();
-    assert_eq!(
-        previous.read_line(&mut line).await.unwrap(),
-        0,
-        "client must close after each reply"
-    );
-    drop(previous);
-    let (socket, _) = listener.accept().await.unwrap();
-    let mut socket = BufReader::new(socket);
-    let (task, auth) = packet(&mut socket).await;
-    assert_eq!(task, 33);
+impl TestStream {
+    fn new(socket: TcpStream) -> Self {
+        let (send, packets) = mpsc::channel(4);
+        let connection = tokio::spawn(async move {
+            let service = service_fn(move |request: Request<Incoming>| {
+                let send = send.clone();
+                async move {
+                    assert_eq!(request.version(), hyper::Version::HTTP_2);
+                    assert!(
+                        request.headers()["authorization"]
+                            .to_str()
+                            .unwrap()
+                            .starts_with("Bearer ")
+                    );
+                    let path = request.uri().path().to_string();
+                    let bytes = request.into_body().collect().await.unwrap().to_bytes();
+                    let value = serde_json::from_slice(&bytes).unwrap();
+                    let (reply, result) = oneshot::channel::<Value>();
+                    send.send((path, value, reply)).await.unwrap();
+                    let value = result
+                        .await
+                        .unwrap_or_else(|_| json!({"error":"disconnected"}));
+                    let status = if value["error"].is_null() { 200 } else { 400 };
+                    Ok::<_, std::convert::Infallible>(
+                        Response::builder()
+                            .status(status)
+                            .header("content-type", "application/json")
+                            .body(Full::new(hyper::body::Bytes::from(value.to_string())))
+                            .unwrap(),
+                    )
+                }
+            });
+            let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                .serve_connection(TokioIo::new(socket), service)
+                .await;
+        });
+        Self {
+            packets,
+            pending: None,
+            connection,
+        }
+    }
+    async fn read_line(&mut self, _: &mut String) -> std::io::Result<usize> {
+        let value = tokio::time::timeout(Duration::from_millis(200), self.packets.recv()).await;
+        assert!(!matches!(value, Ok(Some(_))), "unexpected HTTP request");
+        Ok(0)
+    }
+}
+async fn packet(stream: &mut TestStream) -> (u8, Value) {
+    let (path, body, reply) = stream.packets.recv().await.unwrap();
+    stream.pending = Some(reply);
+    if path == "/api/control/authorize" {
+        return (33, json!({"op":0}));
+    }
+    let (module, method) = if let Some(method) = path.strip_prefix("/api/apple/") {
+        (31, method)
+    } else {
+        (
+            32,
+            path.strip_prefix("/api/app-state/")
+                .expect("named native route"),
+        )
+    };
+    let request = if matches!(method, "result" | "submit_code" | "cancel_challenge") {
+        let mut body = body;
+        body["action"] = json!(method);
+        body
+    } else {
+        json!({"action":"invoke", "method":method, "params":body})
+    };
+    (module, request)
+}
+async fn reply(stream: &mut TestStream, value: Value) {
+    let value = if value["version"] == 1 {
+        json!({"ok":true})
+    } else {
+        value
+    };
+    stream.pending.take().unwrap().send(value).unwrap();
+}
+async fn reconnect(_listener: &TcpListener, mut socket: TestStream) -> TestStream {
+    // Reauthorize a new operation on the same multiplexed connection.
+    let (module, auth) = packet(&mut socket).await;
+    assert_eq!(module, 33);
     assert_eq!(auth["op"], 0);
-    reply(&mut socket, json!({"version":1,"op":0,"id":0,"status":0})).await;
+    reply(&mut socket, json!({"ok":true})).await;
     socket
 }
+
 async fn next(events: &mut mpsc::Receiver<FunctionEvent>) -> FunctionEvent {
     tokio::time::timeout(Duration::from_secs(5), events.recv())
         .await
@@ -69,16 +142,21 @@ async fn challenge_flow(reject: bool) {
         stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 17\r\nConnection: close\r\n\r\n{\"code\":\"012345\"}").await.unwrap();
     });
     let endpoint = ControlEndpoint {
-        version: 1,
+        version: 2,
         port: listener.local_addr().unwrap().port(),
         token: "a".repeat(64),
     };
     let (commands, rx) = mpsc::channel(8);
     let (events, mut states) = mpsc::channel(32);
-    let actor = tokio::spawn(worker("127.0.0.1".into(), endpoint, rx, events));
+    let actor = tokio::spawn(worker(
+        crate::phone_http::PhoneHttpClient::new("127.0.0.1", endpoint.port, endpoint.token)
+            .unwrap(),
+        rx,
+        events,
+    ));
     let peer = tokio::spawn(async move {
         let (socket, _) = listener.accept().await.unwrap();
-        let mut socket = BufReader::new(socket);
+        let mut socket = TestStream::new(socket);
         let (task, auth) = packet(&mut socket).await;
         assert_eq!(task, 33);
         assert_eq!(auth["op"], 0);
@@ -162,16 +240,21 @@ async fn challenge_flow(reject: bool) {
 async fn resumed_worker_requires_query_before_code_submission() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = ControlEndpoint {
-        version: 1,
+        version: 2,
         port: listener.local_addr().unwrap().port(),
         token: "b".repeat(64),
     };
     let (commands, rx) = mpsc::channel(8);
     let (events, mut states) = mpsc::channel(32);
-    let actor = tokio::spawn(worker("127.0.0.1".into(), endpoint, rx, events));
+    let actor = tokio::spawn(worker(
+        crate::phone_http::PhoneHttpClient::new("127.0.0.1", endpoint.port, endpoint.token)
+            .unwrap(),
+        rx,
+        events,
+    ));
     let peer = tokio::spawn(async move {
         let (socket, _) = listener.accept().await.unwrap();
-        let mut socket = BufReader::new(socket);
+        let mut socket = TestStream::new(socket);
         packet(&mut socket).await;
         reply(&mut socket, json!({"version":1,"op":0,"id":0,"status":0})).await;
         let (_, query) = packet(&mut socket).await;
@@ -249,20 +332,25 @@ fn native_unknown_and_partial_shapes_remain_uncertain() {
 }
 
 #[tokio::test]
-async fn next_operation_uses_a_fresh_authenticated_socket() {
+async fn next_operation_reauthorizes_on_shared_connection() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = ControlEndpoint {
-        version: 1,
+        version: 2,
         port: listener.local_addr().unwrap().port(),
         token: "a".repeat(64),
     };
     let (commands, rx) = mpsc::channel(8);
     let (events, mut states) = mpsc::channel(32);
-    let actor = tokio::spawn(worker("127.0.0.1".into(), endpoint, rx, events));
+    let actor = tokio::spawn(worker(
+        crate::phone_http::PhoneHttpClient::new("127.0.0.1", endpoint.port, endpoint.token)
+            .unwrap(),
+        rx,
+        events,
+    ));
     let peer = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut socket = TestStream::new(socket);
         for id in ["first", "second"] {
-            let (socket, _) = listener.accept().await.unwrap();
-            let mut socket = BufReader::new(socket);
             let (task, auth) = packet(&mut socket).await;
             assert_eq!(task, 33);
             assert_eq!(auth["op"], 0);
@@ -275,7 +363,7 @@ async fn next_operation_uses_a_fresh_authenticated_socket() {
                 json!({"operation_id":id,"status":"completed","result":{}}),
             )
             .await;
-            // Simulate the phone closing an idle socket after completion.
+            // The next operation reuses this connection.
         }
     });
     assert!(matches!(
@@ -303,16 +391,21 @@ async fn next_operation_uses_a_fresh_authenticated_socket() {
 async fn logout_resolves_phone_cloud_on_short_sockets_before_one_write() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = ControlEndpoint {
-        version: 1,
+        version: 2,
         port: listener.local_addr().unwrap().port(),
         token: "a".repeat(64),
     };
     let (commands, rx) = mpsc::channel(8);
     let (events, mut states) = mpsc::channel(32);
-    let actor = tokio::spawn(worker("127.0.0.1".into(), endpoint, rx, events));
+    let actor = tokio::spawn(worker(
+        crate::phone_http::PhoneHttpClient::new("127.0.0.1", endpoint.port, endpoint.token)
+            .unwrap(),
+        rx,
+        events,
+    ));
     let peer = tokio::spawn(async move {
         let (socket, _) = listener.accept().await.unwrap();
-        let mut socket = BufReader::new(socket);
+        let mut socket = TestStream::new(socket);
         assert_eq!(packet(&mut socket).await.0, 33);
         reply(&mut socket, json!({"version":1,"op":0,"id":0,"status":0})).await;
         assert_eq!(
@@ -380,16 +473,21 @@ async fn logout_resolves_phone_cloud_on_short_sockets_before_one_write() {
 async fn absent_cloud_never_submits_logout_or_falls_back_to_store() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = ControlEndpoint {
-        version: 1,
+        version: 2,
         port: listener.local_addr().unwrap().port(),
         token: "a".repeat(64),
     };
     let (commands, rx) = mpsc::channel(8);
     let (events, mut states) = mpsc::channel(32);
-    let actor = tokio::spawn(worker("127.0.0.1".into(), endpoint, rx, events));
+    let actor = tokio::spawn(worker(
+        crate::phone_http::PhoneHttpClient::new("127.0.0.1", endpoint.port, endpoint.token)
+            .unwrap(),
+        rx,
+        events,
+    ));
     let peer = tokio::spawn(async move {
         let (socket, _) = listener.accept().await.unwrap();
-        let mut socket = BufReader::new(socket);
+        let mut socket = TestStream::new(socket);
         assert_eq!(packet(&mut socket).await.0, 33);
         reply(&mut socket, json!({"version":1,"op":0,"id":0,"status":0})).await;
         assert_eq!(packet(&mut socket).await.1["method"], "queryAccountState");
@@ -440,14 +538,21 @@ async fn resumed_email_addition_restores_challenge_before_code_only_submission()
 async fn email_flow(resumed: bool) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = ControlEndpoint {
-        version: 1,
+        version: 2,
         port: listener.local_addr().unwrap().port(),
         token: "a".repeat(64),
     };
     let (commands, rx) = mpsc::channel(8);
     let (events, mut states) = mpsc::channel(32);
-    let actor = tokio::spawn(worker("127.0.0.1".into(), endpoint, rx, events));
+    let actor = tokio::spawn(worker(
+        crate::phone_http::PhoneHttpClient::new("127.0.0.1", endpoint.port, endpoint.token)
+            .unwrap(),
+        rx,
+        events,
+    ));
     let peer = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut socket = TestStream::new(socket);
         for method in [
             if resumed { "" } else { "queryAccountState" },
             "beginAddingContactEmail",
@@ -457,8 +562,6 @@ async fn email_flow(resumed: bool) {
             if method.is_empty() {
                 continue;
             }
-            let (socket, _) = listener.accept().await.unwrap();
-            let mut socket = BufReader::new(socket);
             assert_eq!(packet(&mut socket).await.0, 33);
             reply(&mut socket, json!({"version":1,"op":0,"id":0,"status":0})).await;
             let (task, request) = packet(&mut socket).await;
@@ -499,8 +602,6 @@ async fn email_flow(resumed: bool) {
                 json!({"operation_id":method,"method":method,"status":"completed","result":result}),
             )
             .await;
-            let mut line = String::new();
-            assert_eq!(socket.read_line(&mut line).await.unwrap(), 0);
         }
     });
     assert!(matches!(
@@ -577,20 +678,22 @@ async fn oauth_email_does_not_verify_after_phone_account_changes() {
 async fn automatic_email_flow(disconnect: bool, changed: bool) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = ControlEndpoint {
-        version: 1,
+        version: 2,
         port: listener.local_addr().unwrap().port(),
         token: "a".repeat(64),
     };
     let (commands, rx) = mpsc::channel(8);
     let (events, mut states) = mpsc::channel(32);
     let actor = tokio::spawn(worker_with_provider(
-        "127.0.0.1".into(),
-        endpoint,
+        crate::phone_http::PhoneHttpClient::new("127.0.0.1", endpoint.port, endpoint.token)
+            .unwrap(),
         rx,
         events,
         &MockMailboxProvider,
     ));
     let peer = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut socket = TestStream::new(socket);
         for (index, method) in [
             "queryAccountState",
             "queryAccountState",
@@ -601,8 +704,6 @@ async fn automatic_email_flow(disconnect: bool, changed: bool) {
         .into_iter()
         .enumerate()
         {
-            let (socket, _) = listener.accept().await.unwrap();
-            let mut socket = BufReader::new(socket);
             assert_eq!(packet(&mut socket).await.0, 33);
             reply(&mut socket, json!({"version":1,"op":0,"id":0,"status":0})).await;
             let (_, request) = packet(&mut socket).await;
@@ -641,8 +742,6 @@ async fn automatic_email_flow(disconnect: bool, changed: bool) {
                 json!({"operation_id":method,"method":method,"status":"completed","result":result}),
             )
             .await;
-            let mut line = String::new();
-            assert_eq!(socket.read_line(&mut line).await.unwrap(), 0);
             if changed && index == 3 {
                 break;
             }
@@ -696,10 +795,59 @@ async fn automatic_email_flow(disconnect: bool, changed: bool) {
 }
 
 #[tokio::test]
+async fn injected_shared_client_does_not_enable_unconfigured_or_view_only_functions() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = ControlEndpoint {
+        version: 2,
+        port: listener.local_addr().unwrap().port(),
+        token: "a".repeat(64),
+    };
+    for allowed in [false, true] {
+        let mut runtime = FunctionRuntime::new("127.0.0.1".into(), None, allowed);
+        runtime.set_http_client(Some(
+            crate::phone_http::PhoneHttpClient::new(
+                "127.0.0.1",
+                endpoint.port,
+                endpoint.token.clone(),
+            )
+            .unwrap(),
+        ));
+        if !allowed {
+            runtime.configure(&crate::AppCapabilities {
+                control: true,
+                zx_control: Some(endpoint.clone()),
+                ..Default::default()
+            });
+        }
+        let errors = std::cell::Cell::new(0);
+        for command in [
+            FunctionCommand::Invoke {
+                id: "store-login".into(),
+                text: "test@example.com----secret".into(),
+            },
+            FunctionCommand::RefreshAccountState,
+        ] {
+            runtime.command(command, &|event| {
+                assert!(matches!(event, FunctionEvent::Error(_)));
+                errors.set(errors.get() + 1);
+            });
+        }
+        assert_eq!(errors.get(), 2);
+        assert!(runtime.workers.is_empty());
+        assert!(runtime.tasks.is_empty());
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), listener.accept())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
 async fn independent_function_finishes_while_another_socket_waits() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = ControlEndpoint {
-        version: 1,
+        version: 2,
         port: listener.local_addr().unwrap().port(),
         token: "a".repeat(64),
     };
@@ -709,20 +857,31 @@ async fn independent_function_finishes_while_another_socket_waits() {
             let (socket, _) = listener.accept().await.unwrap();
             let entered = entered.clone();
             tokio::spawn(async move {
-                let mut socket = BufReader::new(socket);
-                let (task, _) = packet(&mut socket).await;
-                assert_eq!(task, 33);
-                reply(&mut socket, json!({"version":1,"op":0,"id":0,"status":0})).await;
-                let (_, request) = packet(&mut socket).await;
-                if request["method"] == "signInAppStore" {
-                    entered.send(()).await.unwrap();
-                    std::future::pending::<()>().await;
-                } else if request["method"] == "queryAccountState" {
-                    reply(&mut socket,json!({"operation_id":"account","method":"queryAccountState","status":"completed","result":{}})).await;
-                } else {
-                    assert_eq!(request["method"], "queryState");
-                    reply(&mut socket,json!({"operation_id":"read","method":"queryState","status":"completed","result":{}})).await;
-                }
+                let handler = service_fn(move |request: Request<Incoming>| {
+                    let entered = entered.clone();
+                    async move {
+                        let value = match request.uri().path() {
+                            "/api/control/authorize" => json!({"ok":true}),
+                            "/api/apple/signInAppStore" => {
+                                entered.send(()).await.unwrap();
+                                std::future::pending::<Value>().await
+                            }
+                            "/api/apple/queryAccountState" => {
+                                json!({"operation_id":"account","method":"queryAccountState","status":"completed","result":{}})
+                            }
+                            "/api/apple/queryState" => {
+                                json!({"operation_id":"read","method":"queryState","status":"completed","result":{}})
+                            }
+                            path => panic!("unexpected route {path}"),
+                        };
+                        Ok::<_, std::convert::Infallible>(Response::new(Full::new(
+                            hyper::body::Bytes::from(value.to_string()),
+                        )))
+                    }
+                });
+                let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                    .serve_connection(TokioIo::new(socket), handler)
+                    .await;
             });
         }
     });

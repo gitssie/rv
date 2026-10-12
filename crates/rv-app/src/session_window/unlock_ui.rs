@@ -36,6 +36,7 @@ pub(super) struct UnlockUI {
     ready_samples: u8,
     attempt: u32,
     screen_locked: Option<bool>,
+    http_active: bool,
     _subscription: Subscription,
 }
 
@@ -77,6 +78,7 @@ impl UnlockUI {
             ready_samples: 0,
             attempt: 0,
             screen_locked: None,
+            http_active: false,
             _subscription: subscription,
         }
     }
@@ -86,6 +88,7 @@ impl UnlockUI {
     pub(super) fn reset(&mut self) {
         self.code = None;
         self.step = Step::Idle;
+        self.http_active = false;
         self.ready_samples = 0;
     }
     pub(super) fn disconnected(&mut self) {
@@ -140,7 +143,17 @@ impl SessionView {
         self.unlock.deadline = Instant::now() + Duration::from_secs(6);
         self.unlock.next = Instant::now() + Duration::from_millis(500);
         self.status = "".into();
-        self.handle.app(AppCommand::LockScreen(self.unlock.attempt));
+        self.unlock.http_active = self
+            .apps
+            .caps
+            .as_ref()
+            .is_some_and(|caps| caps.http_screen_control);
+        if self.unlock.http_active {
+            self.unlock.deadline = Instant::now() + Duration::from_secs(20);
+            self.handle.app(AppCommand::HttpLock(self.unlock.attempt));
+        } else {
+            self.handle.app(AppCommand::LockScreen(self.unlock.attempt));
+        }
         cx.notify();
     }
     fn start_unlock(&mut self, code: UnlockCode, cx: &mut Context<Self>) {
@@ -150,6 +163,23 @@ impl SessionView {
         let keys = self.keys.release_all();
         self.send_keys(keys);
         self.unlock.attempt = self.unlock.attempt.wrapping_add(1).max(1);
+        if self
+            .apps
+            .caps
+            .as_ref()
+            .is_some_and(|caps| caps.http_screen_control)
+        {
+            self.unlock.step = Step::Preparing;
+            self.unlock.http_active = true;
+            self.unlock.deadline = Instant::now() + Duration::from_secs(20);
+            self.status = "".into();
+            self.handle.app(AppCommand::HttpUnlock(
+                self.unlock.attempt,
+                rv_session::ScreenPasscode(String::from_utf8(code.digits().to_vec()).unwrap()),
+            ));
+            cx.notify();
+            return;
+        }
         self.unlock.code = Some(code);
         self.unlock.step = Step::Preparing;
         self.unlock.deadline = Instant::now() + Duration::from_secs(12);
@@ -269,12 +299,43 @@ impl SessionView {
         cx.notify();
     }
     fn finish_unlock(&mut self, message: impl Into<SharedString>, cx: &mut Context<Self>) {
-        if self.unlock.step != Step::Idle && self.unlock.step != Step::Locking {
+        if self.unlock.http_active {
+            self.handle
+                .app(AppCommand::CancelScreen(self.unlock.attempt));
+        } else if self.unlock.step != Step::Idle && self.unlock.step != Step::Locking {
             self.handle
                 .app(AppCommand::ArmUnlock(self.unlock.attempt, 0));
         }
         self.unlock.reset();
         self.status = message.into();
+        cx.notify();
+    }
+    pub(super) fn screen_http_progress(
+        &mut self,
+        attempt: u32,
+        progress: rv_session::ScreenProgress,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.unlock.http_active
+            || self.unlock.step == Step::Idle
+            || attempt != self.unlock.attempt
+        {
+            return;
+        }
+        if let Some(state) = &progress.state {
+            self.unlock.screen_locked = Some(state.locked);
+        }
+        match progress.phase.as_str() {
+            "locked" | "unlocked" => self.finish_unlock("", cx),
+            "failed" => {
+                self.finish_unlock(progress.error.unwrap_or_else(|| "屏幕操作失败".into()), cx)
+            }
+            "preparing" => self.status = "正在准备解锁".into(),
+            "input_ready" | "entering" => self.status = "正在输入锁屏密码".into(),
+            "checking" => self.status = "正在确认解锁状态".into(),
+            "locking" => self.status = "正在锁定".into(),
+            _ => {}
+        }
         cx.notify();
     }
     pub(super) fn unlock_lock_state(&mut self, locked: bool, cx: &mut Context<Self>) {
@@ -289,7 +350,10 @@ impl SessionView {
         state: ScreenState,
         cx: &mut Context<Self>,
     ) {
-        if self.unlock.step == Step::Idle || attempt != self.unlock.attempt {
+        if self.unlock.http_active
+            || self.unlock.step == Step::Idle
+            || attempt != self.unlock.attempt
+        {
             return;
         }
         self.unlock.screen_locked = Some(state.locked);
@@ -325,7 +389,10 @@ impl SessionView {
         cx.notify();
     }
     pub(super) fn unlock_armed(&mut self, attempt: u32, armed: bool, cx: &mut Context<Self>) {
-        if self.unlock.step != Step::Arming || attempt != self.unlock.attempt {
+        if self.unlock.http_active
+            || self.unlock.step != Step::Arming
+            || attempt != self.unlock.attempt
+        {
             return;
         }
         if armed {
@@ -354,7 +421,10 @@ impl SessionView {
             self.unlock.ready_samples = 0;
         } else if matches!(
             command,
-            AppCommand::ArmUnlock(_, _) | AppCommand::LockScreen(_)
+            AppCommand::ArmUnlock(_, _)
+                | AppCommand::LockScreen(_)
+                | AppCommand::HttpUnlock(_, _)
+                | AppCommand::HttpLock(_)
         ) {
             self.finish_unlock(message, cx);
         }
@@ -389,6 +459,9 @@ impl SessionView {
                 },
                 cx,
             );
+            return;
+        }
+        if self.unlock.http_active {
             return;
         }
         if now < self.unlock.next {
@@ -630,6 +703,100 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[gpui::test]
+    fn http_unlock_uses_one_request_and_ignores_stale_progress_without_vnc_keys(
+        cx: &mut TestAppContext,
+    ) {
+        let (view, cx, mut peer) = setup(cx, false);
+        enable(&view, cx);
+        view.update(cx, |view, cx| {
+            view.apps.caps.as_mut().unwrap().http_screen_control = true;
+            view.start_unlock(UnlockCode::new("001234".into()).unwrap(), cx);
+            assert!(view.unlock.code.is_none());
+            view.unlock_screen_state(view.unlock.attempt, ready(true), cx);
+            view.unlock_screen_state(view.unlock.attempt, ready(true), cx);
+            view.unlock_armed(view.unlock.attempt, true, cx);
+            for _ in 0..20 {
+                view.unlock.next = Instant::now();
+                view.tick_unlock(cx);
+            }
+            view.screen_http_progress(
+                view.unlock.attempt + 1,
+                rv_session::ScreenProgress {
+                    phase: "unlocked".into(),
+                    state: Some(ready(false)),
+                    error: None,
+                },
+                cx,
+            );
+            assert!(view.unlock.blocks_input());
+            view.screen_http_progress(
+                view.unlock.attempt,
+                rv_session::ScreenProgress {
+                    phase: "unlocked".into(),
+                    state: Some(ready(false)),
+                    error: None,
+                },
+                cx,
+            );
+            assert!(!view.unlock.blocks_input());
+            assert!(view.status.is_empty());
+        });
+        let sent = commands(&mut peer);
+        assert_eq!(sent.len(), 2);
+        assert!(
+            matches!(&sent[0], SessionCommand::App(AppCommand::HttpUnlock(_, code)) if code.0 == "001234")
+        );
+        assert!(matches!(
+            &sent[1],
+            SessionCommand::App(AppCommand::CancelScreen(_))
+        ));
+        assert!(key_events(&sent).is_empty());
+    }
+    #[gpui::test]
+    fn http_lock_and_failed_unlock_do_not_poll_or_replay(cx: &mut TestAppContext) {
+        let (view, cx, mut peer) = setup(cx, false);
+        enable(&view, cx);
+        view.update(cx, |view, cx| {
+            view.apps.caps.as_mut().unwrap().http_screen_control = true;
+            view.unlock_lock_state(false, cx);
+            view.click_unlock(cx);
+            view.unlock.next = Instant::now();
+            view.tick_unlock(cx);
+            view.screen_http_progress(
+                view.unlock.attempt,
+                rv_session::ScreenProgress {
+                    phase: "locked".into(),
+                    state: Some(ready(true)),
+                    error: None,
+                },
+                cx,
+            );
+            view.start_unlock(UnlockCode::new("001234".into()).unwrap(), cx);
+            let command = AppCommand::HttpUnlock(
+                view.unlock.attempt,
+                rv_session::ScreenPasscode(String::new()),
+            );
+            view.unlock_failed(&command, "结果未知".into(), cx);
+            for _ in 0..20 {
+                view.tick_unlock(cx);
+            }
+            assert!(!view.unlock.blocks_input());
+            assert!(view.status.contains("结果未知"));
+        });
+        let sent = commands(&mut peer);
+        assert_eq!(sent.len(), 4);
+        assert!(matches!(
+            &sent[0],
+            SessionCommand::App(AppCommand::HttpLock(_))
+        ));
+        assert!(matches!(
+            &sent[2],
+            SessionCommand::App(AppCommand::HttpUnlock(_, _))
+        ));
+        assert!(key_events(&sent).is_empty());
     }
 
     #[gpui::test]

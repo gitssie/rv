@@ -140,6 +140,7 @@ pub struct SessionView {
     address_book: Option<WeakEntity<AddressBookApp>>,
     _password_subscription: Subscription,
     apps: apps_ui::AppToolbar,
+    karing: karing_ui::KaringUI,
     unlock: unlock_ui::UnlockUI,
     notifications: controls_ui::NotificationsUI,
     recovery: reconnect::Recovery,
@@ -246,6 +247,7 @@ impl SessionView {
             assistant_clipboard: None,
             assistant_progress: String::new(),
             apps,
+            karing: karing_ui::KaringUI::default(),
             unlock,
             notifications: controls_ui::NotificationsUI::default(),
             recovery: reconnect::Recovery::default(),
@@ -468,6 +470,7 @@ impl SessionView {
                         self.status = "Disconnected".into();
                     }
                     self.apps.disconnected(cx);
+                    self.karing.disconnected();
                     self.command_paste_pressed = false;
                     self.phase = Phase::Ended;
                     self.buttons = 0;
@@ -705,6 +708,7 @@ impl SessionView {
 
     fn reconnect(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.apps.disconnected(cx);
+        self.karing.disconnected();
         self.local_cursor.set_hidden(false);
         self.focus.focus(window, cx);
         self.recovery.stopped = false;
@@ -715,6 +719,7 @@ impl SessionView {
     fn start_reconnect(&mut self, cx: &mut Context<Self>) {
         self.recovery.deadline = None;
         self.apps.disconnected(cx);
+        self.karing.disconnected();
         self.unlock.disconnected();
         self.notifications.error = None;
         if let Some(handle) = self.file_transfer_window.take() {
@@ -2100,6 +2105,7 @@ mod apps_ui;
 mod assistant_bridge;
 mod controls_ui;
 mod functions_ui;
+mod karing_ui;
 mod reconnect;
 mod unlock_ui;
 

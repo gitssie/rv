@@ -33,10 +33,20 @@ serde_json.workspace = true
 serde.workspace = true
 base64 = "0.22"
 uuid.workspace = true
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "stream"] }
 
 [dev-dependencies]
+h2 = "0.4"
 flate2 = "1"
 tempfile = "3"
 openssl.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-util", "time"] }
+
+[dev-dependencies.hyper]
+version = "1"
+features = ["server", "http2"]
+[dev-dependencies.hyper-util]
+version = "0.1"
+features = ["tokio"]
+[dev-dependencies.http-body-util]
+version = "0.1"

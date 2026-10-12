@@ -1742,57 +1742,59 @@ fn app_control_uses_zxtouch_and_configured_port_while_rfb_keeps_streaming() {
     use crate::{AppCommand, AppEvent};
     use base64::{Engine, engine::general_purpose::STANDARD};
     use serde_json::{Value, json};
-    use std::io::{BufRead, BufReader};
     let zx = TcpListener::bind("127.0.0.1:0").unwrap();
     let zx_port = zx.local_addr().unwrap().port();
+    zx.set_nonblocking(true).unwrap();
+    let stop_control = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let control_stop = stop_control.clone();
     let control = thread::spawn(move || {
-        let mut operations = Vec::new();
-        // Initial authorization probe plus six operations, each on a new socket.
-        for _ in 0..7 {
-            let (sock, _) = zx.accept().unwrap();
-            sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-            let mut sock = BufReader::new(sock);
-            loop {
-                let mut line = String::new();
-                if sock.read_line(&mut line).unwrap_or(0) == 0 {
-                    break;
-                }
-                let encoded = line.strip_prefix("33").unwrap().trim_end();
-                let request: Value =
-                    serde_json::from_slice(&STANDARD.decode(encoded).unwrap()).unwrap();
-                assert_eq!(request["token"], "a".repeat(64));
-                let op = request["op"].as_u64().unwrap();
-                operations.push(op);
-                let payload = match op {
-                    0 | 12 => json!({"ok":true}),
-                    1 => {
-                        json!({"apps":[{"bundle_id":"com.example.app","name":"Example","can_launch":true,"can_terminate":true}]})
-                    }
-                    2 => {
-                        assert_eq!(request["payload"]["bundle_id"], "com.example.app");
-                        json!({"bundle_id":"com.example.app"})
-                    }
-                    5 => json!({"bundle_id":null}),
-                    6 => {
-                        let image = image::RgbaImage::from_pixel(1, 1, image::Rgba([1, 2, 3, 255]));
-                        let mut png = std::io::Cursor::new(vec![]);
-                        image.write_to(&mut png, image::ImageFormat::Png).unwrap();
-                        json!({"png":STANDARD.encode(png.into_inner())})
-                    }
-                    16 => {
-                        assert_eq!(request["payload"]["text"], "手机文本");
-                        json!({"ok":true,"token":request["payload"]["token"]})
-                    }
-                    _ => panic!("unexpected ZX operation {op}"),
+        tokio::runtime::Runtime::new().unwrap().block_on(async move {
+            let listener = tokio::net::TcpListener::from_std(zx).unwrap();
+            let mut connections = 0;
+            let operations = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            while !control_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let socket = tokio::select! {
+                    accepted = listener.accept() => accepted.unwrap().0,
+                    _ = tokio::time::sleep(Duration::from_millis(10)) => continue,
                 };
-                let reply =
-                    json!({"version":1,"op":op,"id":request["id"],"status":0,"payload":payload});
-                sock.get_mut()
-                    .write_all(format!("0;;{}\r\n", STANDARD.encode(reply.to_string())).as_bytes())
-                    .unwrap();
+                connections += 1;
+                let operations = operations.clone();
+                tokio::spawn(async move {
+                let service = hyper::service::service_fn(move |request: hyper::Request<hyper::body::Incoming>| {
+                    let operations = operations.clone();
+                    async move {
+                        use http_body_util::BodyExt;
+                        assert_eq!(request.version(), hyper::Version::HTTP_2);
+                        assert_eq!(request.headers()["authorization"], format!("Bearer {}", "a".repeat(64)));
+                        if request.uri().path() == "/api/apple/queryAccountState" {
+                            return Ok::<_, std::convert::Infallible>(hyper::Response::new(http_body_util::Full::new(hyper::body::Bytes::from(r#"{"operation_id":"account","method":"queryAccountState","status":"completed","result":{}}"#))));
+                        }
+                        let op = (0..=16).find(|op| crate::phone_http::app_route(*op) == Some(request.uri().path())).unwrap_or_else(|| panic!("unexpected HTTP path {}", request.uri()));
+                        let bytes = request.into_body().collect().await.unwrap().to_bytes();
+                        let request: Value = serde_json::from_slice(&bytes).unwrap();
+                        operations.lock().unwrap().push(op as u64);
+                        let payload = match op {
+                            0 | 12 => json!({"ok":true}),
+                            1 => json!({"apps":[{"bundle_id":"com.example.app","name":"Example","can_launch":true,"can_terminate":true}]}),
+                            2 => { assert_eq!(request["bundle_id"], "com.example.app"); json!({"bundle_id":"com.example.app"}) },
+                            5 => json!({"bundle_id":null}),
+                            6 => {
+                                let image = image::RgbaImage::from_pixel(1, 1, image::Rgba([1, 2, 3, 255]));
+                                let mut png = std::io::Cursor::new(vec![]); image.write_to(&mut png, image::ImageFormat::Png).unwrap();
+                                json!({"png":STANDARD.encode(png.into_inner())})
+                            },
+                            16 => { assert_eq!(request["text"], "手机文本"); json!({"ok":true,"token":request["token"]}) },
+                            _ => panic!("unexpected HTTP operation {op}"),
+                        };
+                        Ok::<_, std::convert::Infallible>(hyper::Response::new(http_body_util::Full::new(hyper::body::Bytes::from(payload.to_string()))))
+                    }
+                });
+                hyper::server::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new()).serve_connection(hyper_util::rt::TokioIo::new(socket), service).await.unwrap();
+                });
             }
-        }
-        operations
+            let recorded = operations.lock().unwrap().clone();
+            (recorded, connections)
+        })
     });
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -1818,7 +1820,7 @@ fn app_control_uses_zxtouch_and_configured_port_while_rfb_keeps_streaming() {
                         0,
                         0,
                         json!({"list":true,"launch":true,"icons":true,"foreground":true,"home":true,"clipboard_write":true,"control":true,
-                        "zx_control":{"version":1,"port":1,"token":"a".repeat(64)}}),
+                        "zx_control":{"version":2,"port":1,"token":"a".repeat(64)}}),
                     );
                 }
                 3 => {
@@ -1884,10 +1886,19 @@ fn app_control_uses_zxtouch_and_configured_port_while_rfb_keeps_streaming() {
     handle.close();
     drop(handle);
     server.join().unwrap();
-    let operations = control.join().unwrap();
-    assert_eq!(operations.iter().filter(|&&op| op == 0).count(), 7);
-    for op in [1, 2, 5, 6, 12, 16] {
-        assert_eq!(operations.iter().filter(|&&seen| seen == op).count(), 1);
+    stop_control.store(true, std::sync::atomic::Ordering::Relaxed);
+    let (operations, connections) = control.join().unwrap();
+    assert_eq!(connections, 1, "Apps and native functions must share a session HTTP/2 pool");
+    assert!(operations.iter().any(|&op| op == 0), "shared control must authorize before use");
+    for op in [2, 12, 16] {
+        assert_eq!(
+            operations.iter().filter(|&&seen| seen == op).count(),
+            1,
+            "mutations must not be repeated"
+        );
+    }
+    for op in [1, 5, 6] {
+        assert!(operations.iter().any(|&seen| seen == op));
     }
 }
 
