@@ -127,6 +127,12 @@ async fn exchange(
         .json(path, &payload)
         .await
         .map_err(std::io::Error::other)?;
+    if status == 401 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Control authorization expired",
+        ));
+    }
     Ok(DeviceReply {
         op: request.op,
         id: request.id,
@@ -229,6 +235,140 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+    #[tokio::test]
+    async fn expired_jwt_discards_queued_mutations_before_renewal() {
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, Ordering},
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let renewed = Arc::new(AtomicBool::new(false));
+        let paths = Arc::new(Mutex::new(Vec::new()));
+        let server_paths = paths.clone();
+        let server_renewed = renewed.clone();
+        let server = tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                let (paths, renewed) = (server_paths.clone(), server_renewed.clone());
+                tokio::spawn(async move {
+                    let service = hyper::service::service_fn(
+                        move |request: hyper::Request<hyper::body::Incoming>| {
+                            let (paths, renewed) = (paths.clone(), renewed.clone());
+                            async move {
+                                let path = request.uri().path();
+                                paths.lock().unwrap().push(path.to_owned());
+                                let (status, value) = match path {
+                                    "/api/control/connect" => {
+                                        renewed.store(true, Ordering::SeqCst);
+                                        (
+                                            200,
+                                            json!({"access_token":"header.payload.new","token_type":"Bearer","expires_in":3600,
+                                        "capabilities":{"zx_control":{"version":3,"port":port,"token":"header.payload.new"}}}),
+                                        )
+                                    }
+                                    "/api/control/authorize" => (200, json!({"ok":true})),
+                                    "/api/apps/launch" => (401, json!({"error":"expired"})),
+                                    "/api/apps/foreground" => {
+                                        assert!(renewed.load(Ordering::SeqCst));
+                                        assert_eq!(
+                                            request.headers()["authorization"],
+                                            "Bearer header.payload.new"
+                                        );
+                                        (200, json!({"bundle_id":null}))
+                                    }
+                                    _ => panic!("stale mutation must not reach server: {path}"),
+                                };
+                                Ok::<_, std::convert::Infallible>(
+                                    hyper::Response::builder()
+                                        .status(status)
+                                        .body(http_body_util::Full::new(hyper::body::Bytes::from(
+                                            value.to_string(),
+                                        )))
+                                        .unwrap(),
+                                )
+                            }
+                        },
+                    );
+                    let _ = hyper::server::conn::http2::Builder::new(
+                        hyper_util::rt::TokioExecutor::new(),
+                    )
+                    .serve_connection(hyper_util::rt::TokioIo::new(socket), service)
+                    .await;
+                });
+            }
+        });
+        let client =
+            crate::phone_http::PhoneHttpClient::new("127.0.0.1", port, "header.payload.old".into())
+                .unwrap();
+        let mut channel = ControlChannel::start_with_client(client.clone());
+        async fn next(channel: &mut ControlChannel) -> ControlEvent {
+            tokio::time::timeout(Duration::from_secs(3), channel.events.recv())
+                .await
+                .unwrap()
+                .unwrap()
+        }
+        assert!(matches!(next(&mut channel).await, ControlEvent::Ready));
+        channel
+            .requests
+            .send(DeviceRequest {
+                op: 2,
+                id: 1,
+                payload: json!({"bundle_id":"fr.vinted"}).to_string(),
+            })
+            .await
+            .unwrap();
+        channel
+            .requests
+            .send(DeviceRequest {
+                op: 4,
+                id: 2,
+                payload: json!({"bundle_id":"fr.vinted"}).to_string(),
+            })
+            .await
+            .unwrap();
+        assert!(
+            matches!(next(&mut channel).await, ControlEvent::Reply(reply) if reply.id==1 && reply.status==1)
+        );
+        assert!(
+            matches!(next(&mut channel).await, ControlEvent::Reply(reply) if reply.id==2 && reply.status==1)
+        );
+        assert!(matches!(
+            next(&mut channel).await,
+            ControlEvent::Unavailable
+        ));
+        client.connect("fixture").await.unwrap();
+        assert!(matches!(next(&mut channel).await, ControlEvent::Ready));
+        channel
+            .requests
+            .send(DeviceRequest {
+                op: 5,
+                id: 3,
+                payload: "{}".into(),
+            })
+            .await
+            .unwrap();
+        assert!(
+            matches!(next(&mut channel).await, ControlEvent::Reply(reply) if reply.id==3 && reply.status==0)
+        );
+        assert_eq!(
+            paths
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|p| *p == "/api/apps/launch")
+                .count(),
+            1
+        );
+        assert!(
+            !paths
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|p| p == "/api/apps/restart")
+        );
+        drop(channel);
+        server.abort();
     }
     #[tokio::test]
     async fn initial_control_failure_recovers_and_operations_reuse_connection() {

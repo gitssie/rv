@@ -1,6 +1,6 @@
 use super::super::apps_ui::app_icon;
 use super::*;
-use gpui_component::{button::ButtonCustomVariant, popover::Popover};
+use gpui_component::menu::{DropdownMenu, PopupMenuItem};
 use rv_session::AppCommand;
 
 // Same system exclusions as native AppState; native entitlement checks still apply.
@@ -18,43 +18,261 @@ pub(super) struct Backup {
     note: String,
     date: String,
     snapshot: bool,
+    version: String,
+    build: String,
+}
+#[derive(Clone, Copy, PartialEq)]
+enum EnvironmentRunStatus {
+    Running,
+    Succeeded,
+    Failed,
+    Unknown,
+}
+#[derive(Clone)]
+pub(super) struct EnvironmentRun {
+    status: EnvironmentRunStatus,
+    operation: Option<String>,
+    progress: serde_json::Value,
+    message: String,
 }
 #[derive(Clone)]
 pub(super) struct EnvironmentUi {
     pub open: bool,
+    run: Option<EnvironmentRun>,
     apps: Vec<rv_core::AppShortcut>,
     catalog_open: bool,
     records: Vec<Backup>,
+    baselines: Vec<Backup>,
+    pending_backup: Option<String>,
     current: Option<String>,
     loaded: bool,
+    running: Option<bool>,
+    status_failed: bool,
     restore_pending: bool,
     pub backup: Option<Backup>,
 }
 impl EnvironmentUi {
+    pub(super) fn mark_disconnected(&mut self) {
+        if let Some(run) = &mut self.run {
+            if run.status == EnvironmentRunStatus::Running {
+                run.status = EnvironmentRunStatus::Unknown;
+                run.message = "连接已中断，结果未确认".into();
+            }
+        }
+    }
+    pub(super) fn mark_status_failed(&mut self) {
+        self.running = None;
+        self.status_failed = true;
+    }
     pub fn new(apps: Vec<rv_core::AppShortcut>) -> Self {
         Self {
             open: false,
+            run: None,
             apps: apps
                 .into_iter()
                 .filter(|app| backup_candidate(&app.bundle_id))
                 .collect(),
             catalog_open: false,
             records: vec![],
+            baselines: vec![],
+            pending_backup: None,
             current: None,
             loaded: false,
+            running: None,
+            status_failed: false,
             restore_pending: false,
             backup: None,
         }
     }
     pub fn clear_records(&mut self) {
         self.records.clear();
+        self.baselines.clear();
+        self.pending_backup = None;
         self.current = None;
         self.loaded = false;
+        self.running = None;
+        self.status_failed = false;
         self.restore_pending = false;
         self.backup = None;
     }
 }
 impl SessionView {
+    pub(crate) fn read_home_profile(
+        &mut self,
+        id: rv_core::workspace::AppId,
+        bundle: String,
+        backup: String,
+        cx: &mut Context<Self>,
+    ) {
+        if self.phase != Phase::Connected
+            || self.view_only()
+            || self.functions.app_state_unsettled()
+        {
+            self.functions.message = "请先连接手机并完成当前备份操作".into();
+            cx.notify();
+            return;
+        }
+        self.handle.app(AppCommand::ReadProfile {
+            app_id: id,
+            bundle,
+            backup,
+        });
+    }
+    pub(crate) fn home_connected(&self) -> bool {
+        self.phase == Phase::Connected
+    }
+    pub(crate) fn notify_home(&self, cx: &mut Context<Self>) {
+        if !self.control_only {
+            return;
+        }
+        if let Some(id) = self.req.connection_id
+            && let Some(book) = self.address_book.as_ref().and_then(WeakEntity::upgrade)
+        {
+            let foreground = if self.phase == Phase::Connected {
+                self.apps.home_foreground()
+            } else {
+                None
+            };
+            book.update(cx, |book, cx| book.phone_changed(id, foreground, cx));
+        }
+    }
+    pub(in crate::session_window) fn close_function_panel(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.functions.open = false;
+        if self.functions.environment.open
+            && !self.functions.busy
+            && self.functions.operation.is_none()
+        {
+            self.clear_function_text(window, cx);
+        }
+        if self.control_only {
+            if let Some(id) = self.req.connection_id
+                && let Some(book) = self.address_book.as_ref().and_then(WeakEntity::upgrade)
+            {
+                book.update(cx, |book, cx| book.dismiss_phone_control(id, cx));
+            }
+        } else {
+            self.focus.focus(window, cx);
+        }
+        cx.notify();
+    }
+    pub(crate) fn delete_home_backup(
+        &mut self,
+        app: rv_core::workspace::AppId,
+        bundle: &str,
+        backup: &str,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        if !self.home_connected() || self.view_only() {
+            return Err("手机控制未连接或仅查看".into());
+        }
+        if self.pending_home_delete.is_some()
+            || self.functions.app_state_unsettled()
+            || self.functions.busy
+        {
+            return Err("请先完成手机上的当前操作".into());
+        }
+        if !backup.starts_with("snapshot:")
+            || bundle.contains(['\n', '\r'])
+            || backup.contains(['\n', '\r'])
+        {
+            return Err("备份标识无效".into());
+        }
+        self.pending_home_delete = Some(app);
+        self.handle.function(FunctionCommand::Invoke {
+            id: "app-delete".into(),
+            text: format!("App={bundle}\n备份={backup}"),
+        });
+        cx.notify();
+        Ok(())
+    }
+    pub(in crate::session_window) fn receive_home_delete(
+        &mut self,
+        event: &FunctionEvent,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.pending_home_delete.is_none() {
+            return false;
+        }
+        let event = match event {
+            FunctionEvent::ForOperation { id, event } if id == "app-delete" => event.as_ref(),
+            FunctionEvent::Error(_) | FunctionEvent::Uncertain(_) => event,
+            _ => return false,
+        };
+        let result = match event {
+            FunctionEvent::State { task: 32, record } if record["status"] == "completed" => {
+                Some(if rv_session::functions::uncertain_result(32, record) {
+                    Err("手机删除结果未知，请先核对手机备份；本地卡片已保留".into())
+                } else if record.get("error").is_some() {
+                    Err(super::functions_ui::function_error_message(record).to_string())
+                } else {
+                    Ok(())
+                })
+            }
+            FunctionEvent::Error(message) | FunctionEvent::Uncertain(message) => {
+                Some(Err(message.clone()))
+            }
+            _ => None,
+        };
+        if let Some(result) = result {
+            let app = self.pending_home_delete.take().unwrap();
+            if let Some(book) = self.address_book.as_ref().and_then(WeakEntity::upgrade) {
+                book.update(cx, |book, cx| book.home_backup_deleted(app, result, cx));
+            }
+        }
+        true
+    }
+    pub(crate) fn show_home_environment(
+        &mut self,
+        bundle: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.functions.app_state_unsettled() {
+            self.functions.message = "备份操作正在进行或结果待确认，请先处理当前操作".into();
+            cx.notify();
+            return;
+        }
+        self.open_app_environment(None, window, cx);
+        self.requested_environment = bundle;
+        self.tick_home_environment(cx);
+    }
+    pub(in crate::session_window) fn tick_home_environment(&mut self, cx: &mut Context<Self>) {
+        if !self.functions.environment.open {
+            self.requested_environment = None;
+            return;
+        }
+        if self.functions.app_state_unsettled() {
+            return;
+        }
+        if self.phase != Phase::Connected
+            || !self.functions.available
+            || self.apps.loading
+            || self.apps.installed.is_empty()
+        {
+            return;
+        }
+        let Some(bundle) = self.requested_environment.take() else {
+            return;
+        };
+        if let Some(app) = self
+            .apps
+            .installed
+            .iter()
+            .find(|a| a.bundle_id == bundle)
+            .cloned()
+        {
+            self.functions.target_app = Some((app.bundle_id, app.name));
+            self.functions.environment.clear_records();
+            self.refresh_environment(cx);
+        } else {
+            self.functions.message = "此 App 未安装在选中设备上".into();
+            cx.notify();
+        }
+    }
     pub(in crate::session_window) fn environment_icon_ids(&self) -> Vec<String> {
         let mut ids: Vec<_> = self
             .functions
@@ -132,9 +350,10 @@ impl SessionView {
         cx.notify();
     }
     pub(in crate::session_window) fn function_editor_visible(&self) -> bool {
-        self.functions
-            .selected
-            .is_some_and(|spec| !(self.functions.environment.open && spec.id == "app-list"))
+        !self.functions.editor_hidden
+            && self.functions.selected.is_some_and(|spec| {
+                !(self.functions.environment.open && matches!(spec.id, "app-list" | "app-status"))
+            })
     }
     pub(in crate::session_window) fn app_environment_busy(&self) -> bool {
         self.functions.selected.is_some_and(|spec| spec.task == 32) && self.environment_locked()
@@ -153,6 +372,7 @@ impl SessionView {
         self.functions.restore(fresh);
         self.functions.open = true;
         self.functions.environment.open = true;
+        self.functions.category = "App 环境";
         self.functions.environment.catalog_open = false;
         self.functions.selected = None;
         self.functions.target_app = None;
@@ -198,7 +418,9 @@ impl SessionView {
         {
             return;
         }
+        self.requested_environment = None;
         self.functions.target_app = Some((id.into(), name.into()));
+        self.functions.environment.run = None;
         self.functions.environment.clear_records();
         self.refresh_environment(cx);
     }
@@ -230,12 +452,32 @@ impl SessionView {
         record: &serde_json::Value,
         cx: &mut Context<Self>,
     ) {
-        if self.functions.uncertain || record.get("error").is_some() {
-            return;
-        }
         let Some(spec) = self.functions.selected else {
             return;
         };
+        if spec.id == "app-status" {
+            let result = &record["result"];
+            let matches_app = self
+                .functions
+                .target_app
+                .as_ref()
+                .is_some_and(|(id, _)| result["bundle_id"].as_str() == Some(id));
+            let running = result["running"].as_bool().filter(|_| {
+                matches_app && !self.functions.uncertain && record.get("error").is_none()
+            });
+            self.functions.environment.running = running;
+            self.functions.environment.status_failed = running.is_none();
+            self.functions.selected = None;
+            if running.is_some() {
+                self.functions.message = "".into();
+            } else if record.get("error").is_none() && !self.functions.uncertain {
+                self.functions.message = "运行状态返回无效".into();
+            }
+            return;
+        }
+        if self.functions.uncertain || record.get("error").is_some() {
+            return;
+        }
         if spec.id == "app-list" {
             let result = &record["result"];
             let Some((id, _)) = &self.functions.target_app else {
@@ -247,15 +489,18 @@ impl SessionView {
                 return;
             }
             let app_id = id.clone();
-            self.functions.environment.records = result["backups"]
+            let archives: Vec<Backup> = result["backups"]
                 .as_array()
                 .unwrap()
                 .iter()
+                .filter(|row| row["kind"] == "snapshot" || row["kind"] == "baseline")
                 .filter_map(|row| {
                     let id = row["backup_id"].as_str()?.to_string();
                     Some(Backup {
                         app: app_id.clone(),
                         snapshot: row["kind"] == "snapshot",
+                        version: row["version"].as_str().unwrap_or("").into(),
+                        build: row["build"].as_str().unwrap_or("").into(),
                         name: row["display_name"]
                             .as_str()
                             .filter(|name| !name.is_empty())
@@ -267,10 +512,22 @@ impl SessionView {
                     })
                 })
                 .collect();
+            let (snapshots, baselines) = archives.into_iter().partition(|backup| backup.snapshot);
+            self.functions.environment.records = snapshots;
+            self.functions.environment.baselines = baselines;
+            self.functions.environment.pending_backup =
+                result["pending_backup_id"].as_str().map(str::to_owned);
             self.functions.environment.current =
                 result["current_backup_id"].as_str().map(str::to_owned);
             self.functions.environment.restore_pending =
                 result["restore_pending"].as_bool().unwrap_or(false);
+            if let Some(device) = self.req.connection_id
+                && let Some(book) = self.address_book.as_ref().and_then(WeakEntity::upgrade)
+            {
+                book.update(cx, |book, cx| {
+                    book.sync_phone_backups(device, &app_id, result, cx)
+                });
+            }
             self.functions.environment.loaded = true;
             self.functions.selected = None;
             self.functions.message = "".into();
@@ -282,6 +539,357 @@ impl SessionView {
             self.functions.environment.backup = None;
             self.refresh_environment(cx);
         }
+    }
+    pub(super) fn update_environment_run(&mut self, record: &serde_json::Value) {
+        if !self
+            .functions
+            .selected
+            .is_some_and(|spec| spec.id == "app-switch")
+        {
+            return;
+        }
+        let Some(run) = &mut self.functions.environment.run else {
+            return;
+        };
+        let Some(id) = record["operation_id"].as_str() else {
+            return;
+        };
+        if run
+            .operation
+            .as_deref()
+            .is_some_and(|current| current != id)
+        {
+            return;
+        }
+        if run.status == EnvironmentRunStatus::Succeeded {
+            return;
+        }
+        run.operation = Some(id.into());
+        run.progress = record["progress"].clone();
+        if record["status"] == "completed" {
+            run.status = if rv_session::functions::uncertain_result(32, record) {
+                EnvironmentRunStatus::Unknown
+            } else if record.get("error").is_some() {
+                EnvironmentRunStatus::Failed
+            } else {
+                EnvironmentRunStatus::Succeeded
+            };
+            run.message = match run.status {
+                EnvironmentRunStatus::Succeeded => "切换完成".into(),
+                EnvironmentRunStatus::Unknown => "操作已中断，结果未确认".into(),
+                _ => super::function_error_message(record).into(),
+            };
+        }
+    }
+    pub(super) fn environment_run_error(&mut self, message: &str, uncertain: bool) {
+        if self
+            .functions
+            .selected
+            .is_some_and(|spec| spec.id == "app-switch")
+        {
+            if let Some(run) = &mut self.functions.environment.run {
+                if run.status == EnvironmentRunStatus::Succeeded {
+                    return;
+                }
+                // A read/transport error cannot decide the original mutation's outcome.
+                run.status = if uncertain || run.operation.is_some() {
+                    EnvironmentRunStatus::Unknown
+                } else {
+                    EnvironmentRunStatus::Failed
+                };
+                run.message = message.into();
+            }
+        }
+    }
+    fn configure_environment_run_dialog(
+        dialog: gpui_component::dialog::Dialog,
+        run: EnvironmentRun,
+        owner: WeakEntity<Self>,
+        window: &mut Window,
+        cx: &App,
+    ) -> gpui_component::dialog::Dialog {
+        let running = run.status == EnvironmentRunStatus::Running;
+        let success = run.status == EnvironmentRunStatus::Succeeded;
+        let stage = environment_progress_label(&run.progress);
+        let files = run.progress["files"].as_u64();
+        let bytes = run.progress["bytes"].as_u64();
+        let can_query = owner.upgrade().is_some_and(|owner| {
+            let view = owner.read(cx);
+            view.phase == Phase::Connected && view.functions.available && !view.functions.busy
+        });
+        let mut footer = gpui_component::dialog::DialogFooter::new();
+        if run.status == EnvironmentRunStatus::Unknown && run.operation.is_some() {
+            let operation = run.operation.clone().unwrap();
+            footer = footer.child(
+                Button::new("environment-operation-query")
+                    .label("查询结果")
+                    .disabled(!can_query)
+                    .on_click(move |_, window, cx| {
+                        let _ = owner.update(cx, |this, cx| {
+                            if let Some(run) = &mut this.functions.environment.run {
+                                run.status = EnvironmentRunStatus::Running;
+                                run.message = "正在查询".into();
+                            }
+                            this.functions.busy = true;
+                            this.send_function_command(FunctionCommand::Resume {
+                                task: 32,
+                                operation_id: operation.clone(),
+                            });
+                            cx.notify();
+                        });
+                        window.refresh();
+                    }),
+            );
+        }
+        footer = footer.child(
+            Button::new("environment-operation-close")
+                .label("关闭")
+                .disabled(running)
+                .on_click(|_, window, cx| window.close_dialog(cx)),
+        );
+        crate::ui::compact_dialog(dialog, window, 190.)
+            .close_button(false)
+            .keyboard(!running)
+            .overlay_closable(false)
+            .on_ok(move |_, _, _| !running)
+            .on_cancel(move |_, _, _| !running)
+            .title("切换环境")
+            .child(
+                v_flex()
+                    .gap_3()
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .when(running, |row| {
+                                row.child(gpui_component::spinner::Spinner::new())
+                            })
+                            .when(!running, |row| {
+                                row.child(
+                                    Icon::new(if success {
+                                        IconName::CircleCheck
+                                    } else {
+                                        IconName::TriangleAlert
+                                    })
+                                    .text_color(if success {
+                                        theme::success(cx)
+                                    } else if run.status == EnvironmentRunStatus::Unknown {
+                                        theme::warning(cx)
+                                    } else {
+                                        theme::danger(cx)
+                                    }),
+                                )
+                            })
+                            .child(div().text_sm().child(if running && !stage.is_empty() {
+                                stage
+                            } else {
+                                run.message.clone()
+                            })),
+                    )
+                    .when(running || success, |body| {
+                        body.child(
+                            crate::ui::operation_progress(
+                                "environment-operation-progress",
+                                Some(&run.progress),
+                            )
+                            .when(success, |progress| progress.loading(false).value(100.)),
+                        )
+                    })
+                    .when(running && (files.is_some() || bytes.is_some()), |body| {
+                        body.child(div().text_xs().text_color(theme::muted(cx)).child(format!(
+                            "{} 个文件 · {:.1} MB",
+                            files.unwrap_or(0),
+                            bytes.unwrap_or(0) as f64 / 1_048_576.
+                        )))
+                    })
+                    .when(!running && !success && !run.progress.is_null(), |body| {
+                        body.child(
+                            div()
+                                .text_xs()
+                                .text_color(theme::muted(cx))
+                                .child(environment_progress_label(&run.progress)),
+                        )
+                    }),
+            )
+            .footer(footer)
+    }
+    fn confirm_environment_switch(
+        &mut self,
+        backup: Backup,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.phase != Phase::Connected
+            || self.view_only()
+            || !self.functions.available
+            || self.functions.app_state_unsettled()
+            || window.has_active_dialog(cx)
+        {
+            return;
+        }
+        let owner = cx.entity().downgrade();
+        let save_current = Rc::new(Cell::new(true));
+        let submitted = Rc::new(Cell::new(false));
+        let error = Rc::new(RefCell::new(None::<String>));
+        let current = self.functions.environment.current.clone();
+        window.open_dialog(cx, move |dialog, window, cx| {
+            let checked = save_current.clone();
+            let confirm_save = save_current.clone();
+            let submitted = submitted.clone();
+            let owner = owner.clone();
+            let backup = backup.clone();
+            let current = current.clone();
+            let failure = error.clone();
+            let checkbox_error = error.clone();
+            if submitted.get() {
+                if let Some(run) = owner
+                    .upgrade()
+                    .and_then(|owner| owner.read(cx).functions.environment.run.clone())
+                {
+                    return Self::configure_environment_run_dialog(dialog, run, owner, window, cx);
+                }
+            }
+            let title = if backup.snapshot {
+                "切换环境"
+            } else {
+                "启用基线"
+            };
+            let name = backup.name.clone();
+            let on_confirm: Rc<dyn Fn(&ClickEvent, &mut Window, &mut App) -> bool> =
+                Rc::new(move |_, window, cx| {
+                    if submitted.get() {
+                        return false;
+                    }
+                    let result = owner.update(cx, |this, cx| {
+                        if this.phase != Phase::Connected
+                            || this.view_only()
+                            || !this.functions.available
+                            || this.functions.app_state_unsettled()
+                            || this
+                                .functions
+                                .target_app
+                                .as_ref()
+                                .is_none_or(|(id, _)| id != &backup.app)
+                            || this.functions.environment.current != current
+                            || !this
+                                .apps
+                                .installed
+                                .iter()
+                                .any(|app| app.bundle_id == backup.app)
+                            || !this
+                                .functions
+                                .environment
+                                .records
+                                .iter()
+                                .chain(this.functions.environment.baselines.iter())
+                                .any(|row| row.id == backup.id && row.app == backup.app)
+                        {
+                            return Err("环境状态已变化，请重新选择".to_owned());
+                        }
+                        let save = confirm_save.get();
+                        if save && this.functions.environment.restore_pending {
+                            return Err("当前环境恢复未完成，请先完成恢复或取消备份".to_owned());
+                        }
+                        let spec = OPERATIONS
+                            .iter()
+                            .find(|spec| spec.id == "app-switch")
+                            .unwrap();
+                        let mut text = format!(
+                            "App={}\n备份={}\n放弃当前环境={}",
+                            backup.app,
+                            backup.id,
+                            if save { "否" } else { "是" }
+                        );
+                        if save && current.is_none() {
+                            text.push_str(&format!(
+                                "\n名称=自动备份 {}",
+                                chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
+                            ));
+                        }
+                        parse_operation(spec, &text)?;
+                        this.functions.selected = Some(spec);
+                        this.functions.environment.run = Some(EnvironmentRun {
+                            status: EnvironmentRunStatus::Running,
+                            operation: None,
+                            progress: serde_json::Value::Null,
+                            message: "正在准备".into(),
+                        });
+                        this.functions.environment.backup = Some(backup.clone());
+                        this.functions.operation = None;
+                        this.functions.result = None;
+                        this.functions.result_open = false;
+                        this.functions.editor_hidden = true;
+                        this.functions.message = "".into();
+                        this.functions.busy = true;
+                        this.send_function_command(FunctionCommand::Invoke {
+                            id: spec.id.into(),
+                            text,
+                        });
+                        cx.notify();
+                        Ok(())
+                    });
+                    match result {
+                        Ok(Ok(())) => {
+                            submitted.set(true);
+                            window.refresh();
+                            false
+                        }
+                        Ok(Err(message)) => {
+                            *failure.borrow_mut() = Some(message);
+                            window.refresh();
+                            false
+                        }
+                        Err(_) => true,
+                    }
+                });
+            let confirm_click = on_confirm.clone();
+            // Keep the component's modal/keyboard behavior while configuring compact placement.
+            let content_height = if error.borrow().is_some() { 196. } else { 156. };
+            crate::ui::compact_dialog(dialog, window, content_height)
+                .close_button(false)
+                .overlay_closable(false)
+                .child(
+                    gpui_component::dialog::DialogHeader::new()
+                        .child(gpui_component::dialog::DialogTitle::new().child(title))
+                        .child(gpui_component::dialog::DialogDescription::new().child(name)),
+                )
+                .footer(
+                    gpui_component::dialog::DialogFooter::new()
+                        .child(
+                            Button::new("switch-cancel")
+                                .label("取消")
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        )
+                        .child(
+                            Button::new("switch-confirm")
+                                .primary()
+                                .label("切换")
+                                .on_click(move |event, window, cx| {
+                                    if confirm_click(event, window, cx) {
+                                        window.close_dialog(cx);
+                                    }
+                                }),
+                        ),
+                )
+                .child(
+                    Checkbox::new("switch-backup-current")
+                        .debug_selector(|| "switch-backup-current".into())
+                        .label("备份当前环境")
+                        .checked(save_current.get())
+                        .on_click(move |value: &bool, window, _| {
+                            checked.set(*value);
+                            *checkbox_error.borrow_mut() = None;
+                            window.refresh();
+                        }),
+                )
+                .children(error.borrow().as_ref().map(|message| {
+                    div()
+                        .text_sm()
+                        .text_color(theme::danger(cx))
+                        .child(message.clone())
+                }))
+                .on_ok(move |event, window, cx| on_confirm(event, window, cx))
+        });
     }
     fn environment_action(
         &mut self,
@@ -307,14 +915,42 @@ impl SessionView {
                     .environment
                     .records
                     .iter()
+                    .chain(self.functions.environment.baselines.iter())
                     .any(|row| row.id == backup.id && row.app == backup.app))
+        {
+            return;
+        }
+        if action == "app-delete"
+            && backup.as_ref().is_some_and(|backup| {
+                self.functions.environment.restore_pending
+                    && (self.functions.environment.pending_backup.as_ref() == Some(&backup.id)
+                        || (!backup.snapshot
+                            && self.functions.environment.pending_backup.is_none()))
+            })
         {
             return;
         }
         let Some(spec) = OPERATIONS.iter().find(|spec| spec.id == action) else {
             return;
         };
+        if action == "app-switch" {
+            if let Some(backup) = backup {
+                self.confirm_environment_switch(backup, window, cx);
+            }
+            return;
+        }
         self.functions.environment.backup = backup.clone();
+        if action == "app-status" {
+            self.functions.environment.running = None;
+            self.functions.environment.status_failed = false;
+            // A status refresh is a new read, including after a failed request.
+            self.functions.panels.remove("app-status");
+            self.functions.selected = None;
+            self.functions.operation = None;
+            self.functions.challenge = None;
+            self.functions.result = None;
+            self.functions.uncertain = false;
+        }
         self.select_function(spec, window, cx);
         if action == "app-edit"
             && let Some(backup) = backup
@@ -339,20 +975,20 @@ impl SessionView {
             > usize::from(needs_app(spec))
                 + usize::from(contextual_backup && spec.fields.contains(&"backup_id"))
     }
-    pub(super) fn render_environment_context(&self, _cx: &Context<Self>) -> impl IntoElement {
+    pub(super) fn render_environment_context(&self, cx: &Context<Self>) -> impl IntoElement {
         let target = self.functions.target_app.as_ref();
         h_flex()
             .gap_2()
             .py_1()
             .when_some(target, |row, (id, name)| {
                 row.child(app_icon(self.apps.icon_for(id), 24.))
-                    .child(div().text_size(px(12.)).child(name.clone()))
+                    .child(div().text_sm().child(name.clone()))
             })
             .when_some(self.functions.environment.backup.as_ref(), |row, backup| {
                 row.child(
                     div()
                         .text_xs()
-                        .text_color(theme::toolbar_muted())
+                        .text_color(theme::muted(cx))
                         .text_ellipsis()
                         .child(backup.name.clone()),
                 )
@@ -364,10 +1000,7 @@ impl SessionView {
         height: f32,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let editor = self
-            .functions
-            .selected
-            .is_some_and(|spec| spec.id != "app-list");
+        let editor = self.function_editor_visible();
         let side = width >= 900. && height >= 480.;
         h_flex()
             .id("function-panel")
@@ -421,21 +1054,12 @@ impl SessionView {
                 .collect()
         };
         let target = self.functions.target_app.clone();
-        v_flex()
+        crate::ui::tool_panel(cx)
             .id("app-environment")
             .debug_selector(|| "app-environment".into())
             .w(px(360f32.min(width - 16.)))
             .max_h(px((height - 16.).max(100.)))
             .overflow_y_scroll()
-            .p_2()
-            .gap_2()
-            .rounded_lg()
-            .border_1()
-            .border_color(theme::toolbar_line())
-            .bg(theme::toolbar())
-            .text_color(theme::toolbar_fg())
-            .shadow_lg()
-            .text_size(px(12.))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
             .when(target.is_some(), |panel| {
@@ -446,8 +1070,6 @@ impl SessionView {
                         .child(
                             Button::new("environment-back")
                                 .ghost()
-                                .text_color(theme::toolbar_fg())
-                                .size(px(24.))
                                 .icon(IconName::ChevronLeft)
                                 .disabled(locked)
                                 .on_click(cx.listener(|this, _, window, cx| {
@@ -474,25 +1096,15 @@ impl SessionView {
                         .child(
                             Button::new("environment-close")
                                 .ghost()
-                                .text_color(theme::toolbar_fg())
-                                .size(px(24.))
                                 .icon(IconName::Close)
                                 .on_click(cx.listener(|this, _, window, cx| {
-                                    this.functions.open = false;
-                                    this.clear_function_text(window, cx);
-                                    this.focus.focus(window, cx);
-                                    cx.notify();
+                                    this.close_function_panel(window, cx);
                                 })),
                         ),
                 )
             })
             .when(target.is_none(), |panel| {
                 panel
-                    .when(self.functions.environment.restore_pending, |panel| {
-                        panel.child(div().text_xs().child(
-                            "恢复未完成：请重新切换目标备份或查看运行状态，完成恢复后再保存。",
-                        ))
-                    })
                     .child(self.render_function_navigation(cx))
                     .when(catalog, |panel| {
                         panel.child(
@@ -500,16 +1112,13 @@ impl SessionView {
                                 .justify_between()
                                 .child(
                                     div()
-                                        .text_size(px(11.))
-                                        .text_color(theme::toolbar_muted())
+                                        .text_xs()
+                                        .text_color(theme::muted(cx))
                                         .child("添加环境 App"),
                                 )
                                 .child(
                                     Button::new("environment-catalog-done")
                                         .ghost()
-                                        .small()
-                                        .h(px(24.))
-                                        .text_color(theme::toolbar_fg())
                                         .label("完成")
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.functions.environment.catalog_open = false;
@@ -543,9 +1152,9 @@ impl SessionView {
                                     .gap_2()
                                     .items_center()
                                     .justify_center()
-                                    .rounded_md()
+                                    .rounded(theme::radius(cx))
                                     .cursor_pointer()
-                                    .hover(|s| s.bg(rgb(0x29333e)))
+                                    .hover(|s| s.bg(theme::hover(cx)))
                                     .child(app_icon(self.apps.icon_for(&id), 38.))
                                     .child(
                                         div()
@@ -562,7 +1171,7 @@ impl SessionView {
                                                 .top_1()
                                                 .right_1()
                                                 .text_color(theme::accent(cx))
-                                                .child(Icon::new(IconName::Check).size(px(12.))),
+                                                .child(Icon::new(IconName::Check)),
                                         )
                                     })
                                     .on_click(cx.listener(move |this, _, window, cx| {
@@ -575,40 +1184,40 @@ impl SessionView {
                             }))
                             .when(!catalog, |grid| {
                                 grid.child(
-                                    Button::new("environment-add-app")
-                                        .debug_selector(|| "environment-add-app".into())
-                                        .ghost()
-                                        .text_color(theme::toolbar_fg())
-                                        .w(px(80.))
-                                        .h(px(80.))
-                                        .tooltip("添加 App")
-                                        .child(
-                                            v_flex().gap_2().items_center().child(
-                                                div()
-                                                    .size(px(38.))
-                                                    .border_1()
-                                                    .rounded_md()
-                                                    .border_color(theme::toolbar_line())
-                                                    .flex()
-                                                    .items_center()
-                                                    .justify_center()
-                                                    .child(Icon::new(IconName::Plus).size(px(20.))),
-                                            ),
-                                        )
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            if this.environment_locked() {
-                                                return;
-                                            }
-                                            this.functions.environment.catalog_open = true;
-                                            this.apps.picker_open = false;
-                                            this.refresh_apps(cx);
-                                            cx.notify();
-                                        })),
+                                    div().size(px(80.)).child(
+                                        Button::new("environment-add-app")
+                                            .debug_selector(|| "environment-add-app".into())
+                                            .ghost()
+                                            .size_full()
+                                            .accessibility_label("添加 App")
+                                            .child(
+                                                v_flex().gap_2().items_center().child(
+                                                    div()
+                                                        .size(px(38.))
+                                                        .border_1()
+                                                        .rounded(theme::radius(cx))
+                                                        .border_color(theme::line(cx))
+                                                        .flex()
+                                                        .items_center()
+                                                        .justify_center()
+                                                        .child(Icon::new(IconName::Plus)),
+                                                ),
+                                            )
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                if this.environment_locked() {
+                                                    return;
+                                                }
+                                                this.functions.environment.catalog_open = true;
+                                                this.apps.picker_open = false;
+                                                this.refresh_apps(cx);
+                                                cx.notify();
+                                            })),
+                                    ),
                                 )
                             }),
                     )
                     .when(environment_apps.is_empty(), |panel| {
-                        panel.child(div().text_color(theme::toolbar_muted()).child(if catalog {
+                        panel.child(div().text_color(theme::muted(cx)).child(if catalog {
                             "暂无可添加的 App"
                         } else {
                             "点击 + 添加 App"
@@ -618,19 +1227,19 @@ impl SessionView {
             .when_some(target.as_ref(), |panel, (id, _)| {
                 let launch = id.clone();
                 let stop = id.clone();
-                let entity = cx.entity();
                 panel
                     .child(
                         h_flex()
+                            .debug_selector(|| "environment-actions".into())
+                            .items_center()
                             .gap_1()
                             .child(
                                 Button::new("environment-launch")
                                     .ghost()
-                                    .text_color(theme::toolbar_fg())
-                                    .small()
-                                    .h(px(26.))
                                     .icon(IconName::Play)
-                                    .label("打开")
+                                    .debug_selector(|| "environment-launch".into())
+                                    .tooltip("打开 App")
+                                    .accessibility_label("打开 App")
                                     .disabled(!self.app_allowed(id, 2) || locked)
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.dispatch_app(AppCommand::Launch(launch.clone()), cx)
@@ -639,87 +1248,79 @@ impl SessionView {
                             .child(
                                 Button::new("environment-stop")
                                     .ghost()
-                                    .text_color(theme::toolbar_fg())
-                                    .small()
-                                    .h(px(26.))
                                     .icon(crate::assets::AppActionIcon::Terminate)
-                                    .label("停止")
+                                    .debug_selector(|| "environment-stop".into())
+                                    .tooltip("停止 App")
+                                    .accessibility_label("停止 App")
                                     .disabled(!self.app_allowed(id, 3) || locked)
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.dispatch_app(AppCommand::Terminate(stop.clone()), cx)
                                     })),
                             )
-                            .child(
-                                Popover::new("environment-more-menu")
-                                    .bg(theme::toolbar())
-                                    .text_color(theme::toolbar_fg())
-                                    .border_color(theme::toolbar_line())
-                                    .p_1()
-                                    .rounded_md()
-                                    .trigger(
-                                        Button::new("environment-more")
-                                            .ghost()
-                                            .text_color(theme::toolbar_fg())
-                                            .small()
-                                            .h(px(26.))
-                                            .label("更多 ⋯")
-                                            .disabled(disabled),
+                            .child({
+                                let state = &self.functions.environment;
+                                let (icon, color, label) = if state.status_failed {
+                                    (
+                                        Icon::new(FunctionIcon::Monitor),
+                                        theme::danger(cx),
+                                        "状态读取失败",
                                     )
-                                    .content(move |_, _, cx| {
-                                        let state = cx.entity();
-                                        v_flex().w(px(144.)).gap_0p5().children(
-                                            [
-                                                ("创建空白基线", "app-baseline"),
-                                                ("环境详情", "app-describe"),
-                                                ("运行状态", "app-status"),
-                                            ]
-                                            .into_iter()
-                                            .map(
-                                                |(label, action)| {
-                                                    let entity = entity.clone();
-                                                    let state = state.clone();
-                                                    Button::new(action)
-                                                        .custom(
-                                                            ButtonCustomVariant::new(cx)
-                                                                .foreground(theme::toolbar_fg())
-                                                                .hover(rgb(0x2a343f).into())
-                                                                .active(rgb(0x35404e).into()),
-                                                        )
-                                                        .small()
-                                                        .h(px(26.))
-                                                        .w_full()
-                                                        .label(label)
-                                                        .on_click(move |_, window, cx| {
-                                                            state.update(cx, |state, cx| {
-                                                                state.dismiss(window, cx)
-                                                            });
-                                                            entity.update(cx, |this, cx| {
-                                                                this.environment_action(
-                                                                    action, None, window, cx,
-                                                                )
-                                                            });
-                                                        })
-                                                },
-                                            ),
-                                        )
-                                    }),
-                            ),
-                    )
-                    .child(
-                        h_flex()
-                            .border_t_1()
-                            .border_color(theme::toolbar_line())
-                            .pt_2()
-                            .gap_1()
-                            .child(div().flex_1().font_semibold().child("环境与备份"))
+                                } else {
+                                    match state.running {
+                                        Some(true) => (
+                                            Icon::new(FunctionIcon::Monitor),
+                                            theme::success(cx),
+                                            "运行中",
+                                        ),
+                                        Some(false) => (
+                                            Icon::new(FunctionIcon::Monitor),
+                                            theme::muted(cx),
+                                            "已停止",
+                                        ),
+                                        None => (
+                                            Icon::new(FunctionIcon::Monitor),
+                                            theme::muted(cx),
+                                            "读取运行状态",
+                                        ),
+                                    }
+                                };
+                                Button::new("app-status")
+                                    .ghost()
+                                    .icon(icon)
+                                    .text_color(color)
+                                    .debug_selector(|| "environment-status".into())
+                                    .tooltip(label)
+                                    .accessibility_label(label)
+                                    .disabled(disabled)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.environment_action("app-status", None, window, cx)
+                                    }))
+                            })
+                            .child(div().flex_1())
+                            .children(
+                                [
+                                    ("app-baseline", "创建空白基线", IconName::Plus),
+                                    ("app-describe", "环境详情", IconName::Info),
+                                ]
+                                .map(|(action, label, icon)| {
+                                    Button::new(action)
+                                        .ghost()
+                                        .icon(icon)
+                                        .tooltip(label)
+                                        .accessibility_label(label)
+                                        .disabled(disabled)
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.environment_action(action, None, window, cx)
+                                        }))
+                                }),
+                            )
                             .child(
                                 Button::new("environment-save")
-                                    .primary()
-                                    .small()
-                                    .h(px(26.))
-                                    .label("保存当前环境")
-                                    .bg(theme::accent(cx))
-                                    .text_color(theme::accent_fg(cx))
+                                    .debug_selector(|| "environment-save".into())
+                                    .ghost()
+                                    .icon(FunctionIcon::Archive)
+                                    .tooltip("保存当前环境")
+                                    .accessibility_label("保存当前环境")
                                     .disabled(
                                         disabled || self.functions.environment.restore_pending,
                                     )
@@ -730,27 +1331,27 @@ impl SessionView {
                             .child(
                                 Button::new("environment-refresh")
                                     .ghost()
-                                    .text_color(theme::toolbar_fg())
-                                    .size(px(26.))
-                                    .icon(IconName::Redo)
+                                    .debug_selector(|| "environment-refresh".into())
+                                    .icon(FunctionIcon::Refresh)
                                     .tooltip("刷新备份")
+                                    .accessibility_label("刷新备份")
                                     .disabled(disabled)
                                     .on_click(
                                         cx.listener(|this, _, _, cx| this.refresh_environment(cx)),
                                     ),
                             ),
                     )
-                    .when(self.functions.environment.restore_pending, |panel| {
-                        panel.child(div().text_xs().child(
-                            "恢复未完成：请重新切换目标备份或查看运行状态，完成恢复后再保存。",
-                        ))
-                    })
                     .child(
                         v_flex()
                             .id("environment-backups")
                             .gap_1()
                             .max_h(px(270.))
                             .overflow_y_scroll()
+                            .children(
+                                self.functions.environment.baselines.iter().map(|baseline| {
+                                    self.render_baseline_row(baseline, disabled, cx)
+                                }),
+                            )
                             .children(
                                 self.functions
                                     .environment
@@ -761,14 +1362,10 @@ impl SessionView {
                     )
                     .when(
                         self.functions.environment.loaded
-                            && self.functions.environment.records.is_empty(),
+                            && self.functions.environment.records.is_empty()
+                            && self.functions.environment.baselines.is_empty(),
                         |panel| {
-                            panel.child(
-                                div()
-                                    .py_2()
-                                    .text_color(theme::toolbar_muted())
-                                    .child("暂无备份，先保存当前环境或创建空白基线"),
-                            )
+                            panel.child(div().py_2().text_color(theme::muted(cx)).child("暂无备份"))
                         },
                     )
             })
@@ -779,26 +1376,17 @@ impl SessionView {
                         .selected
                         .is_some_and(|spec| spec.id == "app-list"),
                 |panel| {
-                    panel.child(
-                        h_flex()
-                            .gap_2()
-                            .items_center()
-                            .child(
-                                gpui_component::spinner::Spinner::new()
-                                    .small()
-                                    .color(theme::toolbar_muted()),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(theme::toolbar_muted())
-                                    .child("正在读取备份…"),
-                            ),
-                    )
+                    panel.child(super::function_loading(
+                        "function-backup-loading",
+                        "App 备份",
+                        "正在读取备份…".into(),
+                        cx,
+                    ))
                 },
             )
             .when(
-                !self.functions.message.is_empty()
+                self.functions.environment.run.is_none()
+                    && !self.functions.message.is_empty()
                     && !(self.functions.busy
                         && self
                             .functions
@@ -808,32 +1396,98 @@ impl SessionView {
                     panel.child(
                         div()
                             .text_xs()
-                            .text_color(theme::toolbar_muted())
+                            .text_color(theme::muted(cx))
                             .child(self.functions.message.clone()),
                     )
                 },
             )
-            .when(self.functions.uncertain, |panel| {
-                panel.child(
-                    Button::new("environment-resume")
-                        .ghost()
-                        .text_color(theme::toolbar_fg())
-                        .small()
-                        .h(px(26.))
-                        .label("查询原操作")
-                        .disabled(self.functions.busy || !self.functions.available)
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            if let Some((task, operation_id)) = this.functions.operation.clone() {
-                                this.send_function_command(FunctionCommand::Resume {
-                                    task,
-                                    operation_id,
-                                });
-                                this.functions.busy = true;
-                                cx.notify();
-                            }
-                        })),
-                )
+    }
+    fn render_baseline_row(
+        &self,
+        baseline: &Backup,
+        disabled: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let backup = baseline.clone();
+        let activate = baseline.clone();
+        let entity = cx.entity();
+        let focus = self.focus.clone();
+        let pending = self.functions.environment.restore_pending
+            && (self.functions.environment.pending_backup.as_ref() == Some(&baseline.id)
+                || self.functions.environment.pending_backup.is_none());
+        let version = if baseline.version.is_empty() {
+            baseline
+                .id
+                .strip_prefix("baseline:")
+                .unwrap_or(&baseline.name)
+        } else {
+            &baseline.version
+        };
+        let label = if baseline.build.is_empty() {
+            format!("基线 {version}")
+        } else {
+            format!("基线 {version} ({})", baseline.build)
+        };
+        h_flex()
+            .gap_2()
+            .py_2()
+            .items_center()
+            .debug_selector({
+                let id = baseline.id.clone();
+                move || format!("baseline-{id}")
             })
+            .child(Icon::new(FunctionIcon::Archive).text_color(theme::muted(cx)))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_sm()
+                    .text_ellipsis()
+                    .child(label),
+            )
+            .child(
+                Button::new(format!("switch-{}", baseline.id))
+                    .ghost()
+                    .icon(IconName::ArrowRight)
+                    .debug_selector({
+                        let id = baseline.id.clone();
+                        move || format!("switch-{id}")
+                    })
+                    .tooltip("启用基线")
+                    .accessibility_label("启用基线")
+                    .disabled(disabled)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.environment_action("app-switch", Some(activate.clone()), window, cx)
+                    })),
+            )
+            .child(
+                Button::new(format!("baseline-menu-{}", baseline.id))
+                    .ghost()
+                    .icon(IconName::Ellipsis)
+                    .tooltip("更多")
+                    .accessibility_label("更多")
+                    .disabled(disabled)
+                    .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
+                        let delete = entity.clone();
+                        let backup = backup.clone();
+                        menu.action_context(focus.clone()).item(
+                            PopupMenuItem::new("删除基线…")
+                                .icon(FunctionIcon::Trash)
+                                .disabled(pending)
+                                .on_click(move |_, window, cx| {
+                                    delete.update(cx, |this, cx| {
+                                        this.environment_action(
+                                            "app-delete",
+                                            Some(backup.clone()),
+                                            window,
+                                            cx,
+                                        )
+                                    });
+                                }),
+                        )
+                    }),
+            )
+            .into_any_element()
     }
     fn render_backup_row(
         &self,
@@ -844,17 +1498,27 @@ impl SessionView {
         let switch = backup.clone();
         let menu_backup = backup.clone();
         let entity = cx.entity();
+        let focus = self.focus.clone();
         let current = self.functions.environment.current.as_ref() == Some(&backup.id);
         h_flex()
             .gap_2()
             .py_2()
             .border_b_1()
-            .border_color(theme::toolbar_line())
+            .border_color(theme::line(cx))
             .items_center()
             .child(
-                Icon::new(IconName::Folder)
-                    .size(px(16.))
-                    .text_color(theme::toolbar_muted()),
+                div().self_start().pt_1().child(
+                    Icon::new(if current {
+                        IconName::CircleCheck
+                    } else {
+                        IconName::Folder
+                    })
+                    .text_color(if current {
+                        theme::success(cx)
+                    } else {
+                        theme::muted(cx)
+                    }),
+                ),
             )
             .child(
                 v_flex()
@@ -871,41 +1535,33 @@ impl SessionView {
                         row.child(
                             div()
                                 .text_xs()
-                                .text_color(theme::toolbar_muted())
+                                .text_color(theme::muted(cx))
                                 .text_ellipsis()
                                 .child(backup.note.clone()),
                         )
                     })
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(theme::toolbar_muted())
-                            .child(if current {
-                                format!(
-                                    "{} · {}",
-                                    backup.date,
-                                    if self.functions.environment.restore_pending {
-                                        "恢复未完成"
-                                    } else {
-                                        "当前环境"
-                                    }
-                                )
-                            } else {
-                                backup.date.clone()
-                            }),
-                    ),
+                    .child(div().text_xs().text_color(theme::muted(cx)).child(
+                        if current && self.functions.environment.restore_pending {
+                            format!("{} · 恢复未完成", backup.date)
+                        } else {
+                            backup.date.clone()
+                        },
+                    )),
             )
             .child(
                 Button::new(format!("switch-{}", backup.id))
                     .ghost()
-                    .text_color(theme::toolbar_fg())
                     .debug_selector({
                         let id = backup.id.clone();
                         move || format!("switch-{id}")
                     })
-                    .small()
-                    .h(px(26.))
-                    .label(if current && self.functions.environment.restore_pending {
+                    .icon(IconName::ArrowRight)
+                    .tooltip(if current && self.functions.environment.restore_pending {
+                        "恢复"
+                    } else {
+                        "切换"
+                    })
+                    .accessibility_label(if current && self.functions.environment.restore_pending {
                         "恢复"
                     } else {
                         "切换"
@@ -916,67 +1572,88 @@ impl SessionView {
                     })),
             )
             .child(
-                Popover::new(SharedString::from(format!("backup-actions-{}", backup.id)))
-                    .bg(theme::toolbar())
-                    .text_color(theme::toolbar_fg())
-                    .border_color(theme::toolbar_line())
-                    .p_1()
-                    .rounded_md()
-                    .trigger(
-                        Button::new(format!("backup-menu-{}", backup.id))
-                            .ghost()
-                            .text_color(theme::toolbar_fg())
-                            .size(px(26.))
-                            .label("⋯")
-                            .disabled(disabled),
-                    )
-                    .content(move |_, _, cx| {
-                        let state = cx.entity();
-                        v_flex().w(px(168.)).gap_0p5().children(
-                            [
-                                ("编辑名称与备注", "app-edit", !menu_backup.snapshot),
-                                ("复制备份标识", "copy-backup", false),
-                                ("删除备份…", "app-delete", !menu_backup.snapshot || current),
-                            ]
-                            .into_iter()
-                            .map(|(label, action, disabled)| {
-                                let entity = entity.clone();
-                                let state = state.clone();
-                                let backup = menu_backup.clone();
-                                Button::new(action)
-                                    .custom(
-                                        ButtonCustomVariant::new(cx)
-                                            .foreground(theme::toolbar_fg())
-                                            .hover(rgb(0x2a343f).into())
-                                            .active(rgb(0x35404e).into()),
-                                    )
-                                    .small()
-                                    .h(px(26.))
-                                    .w_full()
-                                    .label(label)
-                                    .disabled(disabled)
+                Button::new(format!("backup-menu-{}", backup.id))
+                    .ghost()
+                    .icon(IconName::Ellipsis)
+                    .tooltip("更多")
+                    .accessibility_label("更多")
+                    .disabled(disabled)
+                    .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
+                        let edit = entity.clone();
+                        let delete = entity.clone();
+                        let edit_backup = menu_backup.clone();
+                        let delete_backup = menu_backup.clone();
+                        let copy = menu_backup.id.clone();
+                        menu.action_context(focus.clone())
+                            .item(
+                                PopupMenuItem::new("编辑名称与备注")
+                                    .icon(FunctionIcon::Edit)
+                                    .disabled(!menu_backup.snapshot)
                                     .on_click(move |_, window, cx| {
-                                        state.update(cx, |state, cx| state.dismiss(window, cx));
-                                        if action == "copy-backup" {
-                                            cx.write_to_clipboard(ClipboardItem::new_string(
-                                                backup.id.clone(),
-                                            ));
-                                        } else {
-                                            entity.update(cx, |this, cx| {
-                                                this.environment_action(
-                                                    action,
-                                                    Some(backup.clone()),
-                                                    window,
-                                                    cx,
-                                                )
-                                            });
-                                        }
-                                    })
-                            }),
-                        )
+                                        edit.update(cx, |this, cx| {
+                                            this.environment_action(
+                                                "app-edit",
+                                                Some(edit_backup.clone()),
+                                                window,
+                                                cx,
+                                            )
+                                        });
+                                    }),
+                            )
+                            .item(
+                                PopupMenuItem::new("复制备份标识")
+                                    .icon(IconName::Copy)
+                                    .on_click(move |_, _, cx| {
+                                        cx.write_to_clipboard(ClipboardItem::new_string(
+                                            copy.clone(),
+                                        ))
+                                    }),
+                            )
+                            .separator()
+                            .item(
+                                PopupMenuItem::new("删除备份…")
+                                    .icon(FunctionIcon::Trash)
+                                    .disabled(current)
+                                    .on_click(move |_, window, cx| {
+                                        delete.update(cx, |this, cx| {
+                                            this.environment_action(
+                                                "app-delete",
+                                                Some(delete_backup.clone()),
+                                                window,
+                                                cx,
+                                            )
+                                        });
+                                    }),
+                            )
                     }),
             )
             .into_any_element()
+    }
+}
+pub(super) fn environment_progress_label(progress: &serde_json::Value) -> String {
+    let phase = match progress["phase"].as_str() {
+        Some("backup") => "备份当前环境",
+        Some("restore") => "恢复目标环境",
+        Some("baseline") => "创建基线",
+        _ => "处理环境",
+    };
+    let stage = match progress["stage"].as_str() {
+        Some("prepare") => "准备",
+        Some("copy") => "复制文件",
+        Some("verify_files") => "校验文件",
+        Some("keychain") | Some("verify_keychain") => "处理凭据",
+        Some("identity") | Some("verify_identity") => "处理身份",
+        Some("publish") => "保存备份",
+        Some("preferences") | Some("verify_preferences") => "刷新设置",
+        Some("complete") => "完成",
+        _ => "",
+    };
+    if progress.is_null() {
+        String::new()
+    } else if stage.is_empty() {
+        phase.into()
+    } else {
+        format!("{phase} · {stage}")
     }
 }
 pub(super) fn example(spec: &OperationSpec, has_backup: bool) -> String {
@@ -1092,6 +1769,7 @@ impl SessionView {
 
 #[cfg(test)]
 mod tests {
+    use gpui_component::WindowExt;
     fn unscoped(cmd: rv_session::SessionCommand) -> rv_session::SessionCommand {
         match cmd {
             rv_session::SessionCommand::Function(FunctionCommand::Scoped { command, .. }) => {
@@ -1113,6 +1791,37 @@ mod tests {
                 view.preview_environment("records", window, cx)
             })
         });
+    }
+    #[gpui::test]
+    fn home_backup_browse_keeps_active_and_stashed_operations(cx: &mut TestAppContext) {
+        let (view, cx, mut peer) = setup(cx, false);
+        fixture(&view, cx);
+        while peer.commands.try_recv().is_ok() {}
+        for stashed in [false, true] {
+            cx.update(|window, cx| {
+                view.update(cx, |view, cx| {
+                    view.functions.selected = OPERATIONS.iter().find(|s| s.id == "app-switch");
+                    view.functions.busy = true;
+                    view.functions.operation = Some((32, "original-operation".into()));
+                    if stashed {
+                        view.functions.stash_panel();
+                        view.functions.selected = None;
+                        view.functions.busy = false;
+                        view.functions.operation = None;
+                    }
+                    let selected = view.functions.selected.map(|s| s.id);
+                    let operation = view.functions.operation.clone();
+                    view.show_home_environment(Some("other.app".into()), window, cx);
+                    assert_eq!(view.functions.selected.map(|s| s.id), selected);
+                    assert_eq!(view.functions.operation, operation);
+                    assert!(view.functions.app_state_unsettled());
+                    view.requested_environment = Some("other.app".into());
+                    view.tick_home_environment(cx);
+                    assert_eq!(view.requested_environment.as_deref(), Some("other.app"));
+                })
+            });
+            assert!(peer.commands.try_recv().is_err());
+        }
     }
     #[gpui::test]
     fn environment_catalog_is_independent_and_excludes_system_apps(cx: &mut TestAppContext) {
@@ -1200,6 +1909,29 @@ mod tests {
         while peer.commands.try_recv().map(unscoped).is_ok() {}
         cx.simulate_resize(size(px(640.), px(400.)));
         cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(cx.debug_bounds("switch-baseline:1").is_some());
+        let actions = cx.debug_bounds("environment-actions").unwrap();
+        for selector in [
+            "environment-launch",
+            "environment-stop",
+            "environment-save",
+            "environment-refresh",
+        ] {
+            let button = cx.debug_bounds(selector).unwrap();
+            assert!(button.left() >= actions.left() && button.right() <= actions.right());
+            assert!(button.top() >= actions.top() && button.bottom() <= actions.bottom());
+        }
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.functions.environment.records.len(), 2);
+            assert!(
+                view.functions
+                    .environment
+                    .records
+                    .iter()
+                    .all(|backup| backup.snapshot)
+            );
+            assert_eq!(view.functions.environment.records[0].name, "工作账号 A");
+        });
         let row = cx.debug_bounds("switch-snapshot:spare").unwrap();
         cx.simulate_click(row.center(), Modifiers::default());
         assert!(
@@ -1209,44 +1941,13 @@ mod tests {
                 .all(|cmd| !matches!(cmd, SessionCommand::Function(_)))
         );
         cx.update(|window, cx| {
-            view.update(cx, |view, cx| {
-                assert_eq!(
-                    view.functions.environment.backup.as_ref().unwrap().id,
-                    "snapshot:spare"
-                );
-                view.functions.text.update(cx, |input, cx| {
-                    input.set_value("名称=当前工作账号\n备注=保存后切换", window, cx)
-                });
-                view.execute_function(window, cx);
-            })
+            assert!(window.has_active_dialog(cx));
+            window.draw(cx).clear(cx);
         });
-        let commands: Vec<_> =
-            std::iter::from_fn(|| peer.commands.try_recv().map(unscoped).ok()).collect();
-        let text = commands
-            .iter()
-            .find_map(|cmd| match cmd {
-                SessionCommand::Function(FunctionCommand::Invoke { id, text })
-                    if id == "app-switch" =>
-                {
-                    Some(text)
-                }
-                _ => None,
-            })
-            .unwrap();
-        let operation = parse_operation(
-            OPERATIONS
-                .iter()
-                .find(|spec| spec.id == "app-switch")
-                .unwrap(),
-            text,
-        )
-        .unwrap();
-        assert_eq!(operation.params["bundle_id"], "fr.vinted");
-        assert_eq!(operation.params["backup_id"], "snapshot:spare");
-        cx.update(|window, cx| window.draw(cx).clear(cx));
-        assert!(cx.debug_bounds("function-execute").is_none());
-        assert!(cx.debug_bounds("function-input-area").is_some());
-        assert!(cx.debug_bounds("function-query-loading").unwrap().bottom() <= px(400.));
+        assert!(cx.debug_bounds("switch-backup-current").is_some());
+        assert!(cx.debug_bounds("function-input-area").is_none());
+        cx.update(|window, cx| window.close_dialog(cx));
+        assert!(peer.commands.try_recv().is_err());
     }
     #[gpui::test]
     fn stale_record_and_readonly_do_not_dispatch_mutations(cx: &mut TestAppContext) {
@@ -1259,6 +1960,8 @@ mod tests {
                     app: "com.other.app".into(),
                     id: "snapshot:spare".into(),
                     name: "stale".into(),
+                    version: "".into(),
+                    build: "".into(),
                     note: "".into(),
                     date: "".into(),
                     snapshot: true,
@@ -1336,6 +2039,12 @@ mod tests {
                 assert!(!view.functions.environment.open);
                 assert!(view.functions.open);
                 assert_eq!(view.functions.category, "Apple");
+                view.apply_function_event(
+                    FunctionEvent::AccountState(Ok(serde_json::json!({
+                        "app_store":{"status":"not_signed_in","account":null}
+                    }))),
+                    cx,
+                );
                 view.select_function(&OPERATIONS[0], window, cx);
                 assert_eq!(view.functions.selected.unwrap().task, 31);
                 view.open_app_environment(None, window, cx);

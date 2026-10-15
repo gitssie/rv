@@ -16,34 +16,63 @@ pub fn validate_code_url(text: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Only a complete six-digit value or explicit JSON code fields are accepted.
-/// Do not guess arbitrary six-digit substrings in IDs, dates or an email body.
+/// Match an explicitly labelled code, never an arbitrary number in IDs or dates.
+fn text_codes(body: &str) -> Vec<String> {
+    static CODE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(?ix)
+            (?:
+                \b(?:your\s+)?apple\s+(?:account|id)\s+(?:verification\s+)?code
+                | \b(?:verification|security|one[-\s]time|otp)\s+code
+                | 验证码 | 驗證碼 | 安全码 | 安全碼
+            )
+            \s*(?:is|为|為|是)?\s*[:：]?\s*
+            ([0-9]{6})
+        ").expect("valid verification-code pattern")
+    });
+    CODE.captures_iter(body).filter_map(|capture| {
+        let code = capture.get(1)?;
+        // Check the boundary without consuming the next SMS label.
+        if body.as_bytes().get(code.end()).is_some_and(u8::is_ascii_digit) {
+            return None;
+        }
+        Some(code.as_str().to_owned())
+    }).collect()
+}
+
+/// Accept complete codes, explicit JSON fields and labelled SMS text.
+/// Preserve leading zeroes and reject conflicting candidates.
 pub fn extract_verification_code(body: &str) -> Result<String, String> {
     let body = body.trim();
     if valid_code(body) {
         return Ok(body.into());
     }
-    let value: Value =
-        serde_json::from_str(body).map_err(|_| "接口未返回明确的六位验证码，可手动粘贴验证码")?;
     let mut codes = Vec::new();
-    for candidate in [&value, &value["data"], &value["result"]] {
-        if let Some(s) = candidate.as_str()
-            && valid_code(s)
-        {
-            codes.push(s.to_owned());
-        }
-        for key in ["code", "verification_code", "verificationCode", "otp"] {
-            if let Some(s) = candidate.get(key).and_then(Value::as_str)
-                && valid_code(s)
-            {
-                codes.push(s.to_owned());
+    if let Ok(value) = serde_json::from_str::<Value>(body) {
+        for candidate in [&value, &value["data"], &value["result"]] {
+            if let Some(text) = candidate.as_str() {
+                if valid_code(text) { codes.push(text.to_owned()); }
+                else { codes.extend(text_codes(text)); }
+            }
+            for key in ["code", "verification_code", "verificationCode", "otp"] {
+                if let Some(code) = candidate.get(key).and_then(Value::as_str)
+                    && valid_code(code)
+                {
+                    codes.push(code.to_owned());
+                }
+            }
+            for key in ["message", "text", "body", "content", "sms"] {
+                if let Some(text) = candidate.get(key).and_then(Value::as_str) {
+                    codes.extend(text_codes(text));
+                }
             }
         }
+    } else {
+        codes.extend(text_codes(body));
     }
     codes.sort();
     codes.dedup();
     if codes.len() != 1 {
-        return Err("接口验证码缺失或不唯一，可手动粘贴六位验证码".into());
+        return Err("暂未获取验证码".into());
     }
     Ok(codes.remove(0))
 }
@@ -70,4 +99,29 @@ pub(super) async fn fetch_code(url: &str) -> Result<String, String> {
         body.extend_from_slice(&chunk);
     }
     extract_verification_code(std::str::from_utf8(&body).map_err(|_| "验证码响应不是 UTF-8 文本")?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_apple_sms_with_timestamp_and_preserves_leading_zero() {
+        assert_eq!(extract_verification_code(
+            "Your Apple Account code is: 053322. Do not share it with anyone.|2026-11-29"
+        ).unwrap(), "053322");
+    }
+
+    #[test]
+    fn labeled_codes_exclude_long_numbers_dates_and_ambiguous_codes() {
+        assert_eq!(extract_verification_code("Apple ID verification code: 001234.").unwrap(), "001234");
+        assert_eq!(extract_verification_code("您的 Apple 验证码是：053322，请勿分享。").unwrap(), "053322");
+        assert!(extract_verification_code("Your Apple Account code is: 10533220.").is_err());
+        assert!(extract_verification_code("Your Apple Account code is: 0533220.").is_err());
+        assert!(extract_verification_code("2026-11-29 / id=053322").is_err());
+        assert!(extract_verification_code("Apple Account code: 053322. Apple ID code: 001234.").is_err());
+        assert!(extract_verification_code("验证码：053322验证码：001234").is_err());
+        assert!(extract_verification_code(r#"{"id":"053322","date":"2026-11-29"}"#).is_err());
+        assert_eq!(extract_verification_code(r#"{"data":{"message":"Your Apple Account code is: 053322.|2026-11-29"}}"#).unwrap(), "053322");
+    }
 }

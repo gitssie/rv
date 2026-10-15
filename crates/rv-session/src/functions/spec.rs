@@ -36,9 +36,9 @@ pub static OPERATIONS: &[OperationSpec] = &[
         "Apple",
         31,
         "enableICloud",
-        ["apple_id", "password", "device_passcode", "code_url?"],
-        "账号=demo@example.com\n密码=填写密码\n设备密码=填写设备密码",
-        "也支持：账号----密码----设备密码----验证码链接。"
+        ["password", "code_url?", "device_passcode?"],
+        "密码=填写密码",
+        "登录密码；验证码链接可选。"
     ),
     op!(
         "store-logout",
@@ -224,7 +224,7 @@ pub static OPERATIONS: &[OperationSpec] = &[
         "delete",
         ["bundle_id", "backup_id"],
         "App=fr.vinted\n备份=填写备份标识",
-        "当前关联备份与空白基线不能删除。"
+        "删除所选快照或版本基线；当前关联快照与正在恢复的归档不能删除。"
     ),
     op!(
         "app-open",
@@ -461,6 +461,18 @@ pub fn valid_code(code: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cloud_login_only_requires_password_and_never_accepts_a_pasted_account() {
+        let spec = OPERATIONS.iter().find(|spec| spec.id == "cloud-login").unwrap();
+        assert_eq!(parse_operation(spec, "test-password").unwrap().params,
+            serde_json::json!({"password":"test-password"}));
+        assert!(parse_operation(spec, "账号=other@test\n密码=test-password").is_err());
+        let parsed = parse_operation(spec,
+            "密码=test-password\n设备密码=001234\n验证码链接=https://code.example.test/get?id=123").unwrap();
+        assert_eq!(parsed.params, serde_json::json!({"password":"test-password","device_passcode":"001234"}));
+        assert!(parsed.code_url.is_some());
+    }
+
     #[test]
     fn oauth_email_material_is_removed_from_phone_parameters() {
         let spec = OPERATIONS.iter().find(|s| s.id == "email-add").unwrap();

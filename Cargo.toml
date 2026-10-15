@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/rv-core", "crates/rv-session", "crates/rv-app"]
+members = ["crates/rv-core", "crates/rv-session", "crates/rv-app", "crates/rv-business"]
 exclude = ["vendor/vnc-rs"]
 resolver = "2"
 default-members = ["crates/rv-app"]
@@ -33,6 +33,7 @@ smallvec = "1"
 
 rv-core = { path = "crates/rv-core" }
 rv-session = { path = "crates/rv-session" }
+rv-business = { path = "crates/rv-business" }
 
 [workspace.lints.clippy]
 dbg_macro = "deny"

@@ -1,12 +1,13 @@
 //! Shared HTTP/2 client for the phone control service, including raw Karing streams.
 use reqwest::{Client, Method, Response, header::HeaderMap};
 use serde_json::Value;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 #[derive(Clone)]
 pub struct PhoneHttpClient {
     client: Client,
     origin: String,
-    token: String,
+    token: Arc<RwLock<String>>,
 }
 impl PhoneHttpClient {
     pub fn new(host: &str, port: u16, token: String) -> Result<Self, reqwest::Error> {
@@ -24,7 +25,7 @@ impl PhoneHttpClient {
                 .connect_timeout(Duration::from_secs(5))
                 .build()?,
             origin: format!("http://{host}:{port}"),
-            token,
+            token: Arc::new(RwLock::new(token)),
         })
     }
     /// Returns the actual status, headers and response body/stream. No JSON schema.
@@ -36,13 +37,59 @@ impl PhoneHttpClient {
         headers: HeaderMap,
         body: Vec<u8>,
     ) -> Result<Response, reqwest::Error> {
+        let token = self.token.read().unwrap().clone();
         self.client
             .request(method, format!("{}{}", self.origin, path_and_query))
             .headers(headers)
-            .bearer_auth(&self.token)
+            .bearer_auth(token)
             .body(body)
             .send()
             .await
+    }
+    pub(crate) async fn connect(&self, password: &str) -> Result<crate::AppCapabilities, String> {
+        let (status, response) = self
+            .json(
+                "/api/control/connect",
+                &serde_json::json!({"password":password}),
+            )
+            .await?;
+        self.accept_connect(status, response)
+    }
+    fn accept_connect(
+        &self,
+        status: u16,
+        response: Value,
+    ) -> Result<crate::AppCapabilities, String> {
+        if status != 200 {
+            return Err(if status == 401
+                && response["error"] == "Control authorization expired or unavailable"
+            {
+                "ZXTouch 认证入口被前置授权拦截；请更新 TrollVNC 3.2-320 或更新版本并重启服务"
+            } else if status == 401 && response["error"] == "authentication_failed" {
+                "ZXTouch 密码验证失败"
+            } else {
+                "ZXTouch 独立控制接口不可用，请更新手机版"
+            }
+            .into());
+        }
+        let token = response["access_token"]
+            .as_str()
+            .filter(|t| t.len() <= 4096 && t.split('.').count() == 3)
+            .ok_or("ZXTouch 未返回 JWT")?;
+        if response["token_type"] != "Bearer" {
+            return Err("ZXTouch 认证返回不正确".into());
+        }
+        let caps: crate::AppCapabilities = serde_json::from_value(response["capabilities"].clone())
+            .map_err(|_| "ZXTouch 能力信息不正确")?;
+        if !caps
+            .zx_control
+            .as_ref()
+            .is_some_and(|e| e.version == 3 && e.token == token)
+        {
+            return Err("ZXTouch 独立控制版本不正确".into());
+        }
+        *self.token.write().unwrap() = token.to_owned();
+        Ok(caps)
     }
     pub(crate) async fn json(&self, path: &str, value: &Value) -> Result<(u16, Value), String> {
         tokio::time::timeout(Duration::from_secs(10), async {
@@ -86,6 +133,7 @@ pub(crate) fn app_route(op: u8) -> Option<&'static str> {
         6 => "/api/apps/icon",
         12 => "/api/device/home",
         16 => "/api/device/clipboard",
+        25 => "/api/device/info",
         _ => return None,
     })
 }

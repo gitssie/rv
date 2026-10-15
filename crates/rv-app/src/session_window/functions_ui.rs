@@ -1,6 +1,10 @@
 use super::*;
 use crate::assets::FunctionIcon;
-use gpui_component::input::{Textarea, TextareaState};
+use gpui_component::{
+    WindowExt,
+    input::{Editor, EditorState, Textarea, TextareaState},
+    notification::{Notification, NotificationDelivery},
+};
 use rv_session::{
     FunctionCommand, FunctionEvent,
     functions::{OPERATIONS, OperationSpec, parse_operation},
@@ -8,6 +12,8 @@ use rv_session::{
 #[path = "app_environments.rs"]
 mod environments;
 use environments::EnvironmentUi;
+#[path = "apple_ui.rs"]
+mod apple_ui;
 
 #[derive(Clone)]
 struct FunctionPanel {
@@ -17,14 +23,19 @@ struct FunctionPanel {
     busy: bool,
     uncertain: bool,
     target_app: Option<(String, String)>,
+    expected_account: Option<String>,
     text: Entity<TextareaState>,
-    verification_text: Entity<TextareaState>,
+    cloud_password: Entity<InputState>,
+    cloud_preparation: Option<u64>,
+    verification_text: Entity<InputState>,
+    _verification_subscription: Rc<Subscription>,
     verification_submitted: bool,
     verification_received: bool,
     pending_verification_code: Option<String>,
     selected: Option<&'static OperationSpec>,
     message: SharedString,
     result: Option<serde_json::Value>,
+    result_editor: Entity<EditorState>,
     result_open: bool,
     operation: Option<(u8, String)>,
     email_operation: Option<(u8, String)>,
@@ -33,7 +44,44 @@ struct FunctionPanel {
     local_data_policy: Option<&'static str>,
 }
 impl FunctionPanel {
+    /// Completed history is display-only; a new menu click starts a fresh operation.
+    /// Live receipts and challenges remain resumable. Ended login attempts become notification history.
+    fn resumable(&self) -> bool {
+        self.busy
+            || self.uncertain
+            || self.cloud_preparation.is_some()
+            || self.operation.is_some()
+            || self.challenge.is_some()
+            || self.email_operation.is_some()
+    }
+    fn finished(&self) -> bool {
+        let terminal = self
+            .result
+            .as_ref()
+            .is_some_and(|record| record["status"] == "completed");
+        if self.selected.is_some_and(is_login_action) && terminal {
+            return !self.busy && self.cloud_preparation.is_none() && self.challenge.is_none();
+        }
+        !self.resumable() && terminal
+    }
+    fn clear_login_result(&mut self) {
+        self.busy = false;
+        self.uncertain = false;
+        self.operation = None;
+        self.challenge = None;
+        self.message = "".into();
+        self.result = None;
+        self.result_open = false;
+        self.verification_submitted = false;
+        self.verification_received = false;
+        self.pending_verification_code = None;
+    }
+
     fn disconnected(&mut self) {
+        if self.cloud_preparation.take().is_some() {
+            self.busy = false;
+            self.message = "登录准备已中断，请重新点击登录".into();
+        }
         if self.busy {
             self.uncertain = true;
         }
@@ -50,6 +98,9 @@ impl FunctionPanel {
 }
 pub(super) struct FunctionUi {
     panels: std::collections::HashMap<&'static str, FunctionPanel>,
+    next_cloud_preparation: u64,
+    pending_results: Vec<(&'static OperationSpec, serde_json::Value)>,
+    notified_results: std::collections::HashSet<String>,
     pub open: bool,
     editor_hidden: bool,
     email_rebinding: bool,
@@ -61,9 +112,13 @@ pub(super) struct FunctionUi {
     busy: bool,
     uncertain: bool,
     target_app: Option<(String, String)>,
+    expected_account: Option<String>,
     environment: EnvironmentUi,
     text: Entity<TextareaState>,
-    verification_text: Entity<TextareaState>,
+    cloud_password: Entity<InputState>,
+    cloud_preparation: Option<u64>,
+    verification_text: Entity<InputState>,
+    _verification_subscription: Rc<Subscription>,
     verification_submitted: bool,
     verification_received: bool,
     pending_verification_code: Option<String>,
@@ -71,6 +126,7 @@ pub(super) struct FunctionUi {
     pub(super) selected: Option<&'static OperationSpec>,
     message: SharedString,
     result: Option<serde_json::Value>,
+    result_editor: Entity<EditorState>,
     result_open: bool,
     operation: Option<(u8, String)>,
     email_operation: Option<(u8, String)>,
@@ -79,6 +135,15 @@ pub(super) struct FunctionUi {
     local_data_policy: Option<&'static str>,
 }
 impl FunctionUi {
+    pub(in crate::session_window) fn app_state_unsettled(&self) -> bool {
+        let active =
+            self.selected.is_some_and(|spec| spec.task == 32) && (self.busy || self.uncertain);
+        active
+            || self.panels.values().any(|panel| {
+                panel.selected.is_some_and(|spec| spec.task == 32)
+                    && (panel.busy || panel.uncertain)
+            })
+    }
     fn panel_key(&self) -> Option<&'static str> {
         self.selected.map(|s| {
             if s.id == "email-verify" {
@@ -88,6 +153,24 @@ impl FunctionUi {
             }
         })
     }
+    fn has_pending(&self, spec: &OperationSpec) -> bool {
+        let key = if spec.id == "email-verify" {
+            "email-add"
+        } else {
+            spec.id
+        };
+        if self.panel_key() == Some(key) {
+            self.busy
+                || self.uncertain
+                || self.cloud_preparation.is_some()
+                || self.operation.is_some()
+                || self.challenge.is_some()
+                || self.email_operation.is_some()
+        } else {
+            self.panels.get(key).is_some_and(FunctionPanel::resumable)
+        }
+    }
+
     fn snapshot(&self) -> FunctionPanel {
         FunctionPanel {
             editor_hidden: self.editor_hidden.clone(),
@@ -96,14 +179,19 @@ impl FunctionUi {
             busy: self.busy.clone(),
             uncertain: self.uncertain.clone(),
             target_app: self.target_app.clone(),
+            expected_account: self.expected_account.clone(),
             text: self.text.clone(),
+            cloud_password: self.cloud_password.clone(),
+            cloud_preparation: self.cloud_preparation,
             verification_text: self.verification_text.clone(),
+            _verification_subscription: self._verification_subscription.clone(),
             verification_submitted: self.verification_submitted.clone(),
             verification_received: self.verification_received.clone(),
             pending_verification_code: self.pending_verification_code.clone(),
             selected: self.selected.clone(),
             message: self.message.clone(),
             result: self.result.clone(),
+            result_editor: self.result_editor.clone(),
             result_open: self.result_open.clone(),
             operation: self.operation.clone(),
             email_operation: self.email_operation.clone(),
@@ -119,14 +207,19 @@ impl FunctionUi {
         self.busy = p.busy;
         self.uncertain = p.uncertain;
         self.target_app = p.target_app;
+        self.expected_account = p.expected_account;
         self.text = p.text;
+        self.cloud_password = p.cloud_password;
+        self.cloud_preparation = p.cloud_preparation;
         self.verification_text = p.verification_text;
+        self._verification_subscription = p._verification_subscription;
         self.verification_submitted = p.verification_submitted;
         self.verification_received = p.verification_received;
         self.pending_verification_code = p.pending_verification_code;
         self.selected = p.selected;
         self.message = p.message;
         self.result = p.result;
+        self.result_editor = p.result_editor;
         self.result_open = p.result_open;
         self.operation = p.operation;
         self.email_operation = p.email_operation;
@@ -142,15 +235,26 @@ impl FunctionUi {
         let text = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .rows(4)
-                .placeholder("粘贴资料，或复制示例后修改")
+                .placeholder("粘贴资料")
         });
-        let verification_text = cx.new(|cx| {
-            TextareaState::new(window, cx)
-                .rows(4)
-                .placeholder("六位验证码")
+        let cloud_password = cx.new(|cx| {
+            InputState::new(window, cx)
+                .masked(true)
+                .placeholder("当前 App Store 账户的登录密码")
+        });
+        let verification_text = cx.new(|cx| InputState::new(window, cx).placeholder("六位验证码"));
+        let verification_subscription =
+            Rc::new(cx.observe(&verification_text, |_, _, cx| cx.notify()));
+        let result_editor = cx.new(|cx| {
+            EditorState::new(window, cx)
+                .language("json")
+                .soft_wrap(false)
         });
         Self {
             panels: Default::default(),
+            next_cloud_preparation: 0,
+            pending_results: Vec::new(),
+            notified_results: Default::default(),
             open: false,
             editor_hidden: false,
             email_rebinding: false,
@@ -162,9 +266,13 @@ impl FunctionUi {
             busy: false,
             uncertain: false,
             target_app: None,
+            expected_account: None,
             environment: EnvironmentUi::new(environment_apps),
             text,
+            cloud_password,
+            cloud_preparation: None,
             verification_text,
+            _verification_subscription: verification_subscription,
             verification_submitted: false,
             verification_received: false,
             pending_verification_code: None,
@@ -172,6 +280,7 @@ impl FunctionUi {
             selected: None,
             message: "".into(),
             result: None,
+            result_editor,
             result_open: false,
             operation: None,
             email_operation: None,
@@ -181,15 +290,33 @@ impl FunctionUi {
         }
     }
     fn stash_panel(&mut self) {
+        if self.cloud_preparation.take().is_some() {
+            self.busy = false;
+            self.message = "登录准备已中断，请重新点击登录".into();
+        }
         if let Some(key) = self.panel_key() {
             self.panels.insert(key, self.snapshot());
         }
     }
+    pub(super) fn cancel_cloud_preparations(&mut self) {
+        if self.cloud_preparation.take().is_some() {
+            self.busy = false;
+            self.message = "登录准备已中断，请重新点击登录".into();
+        }
+        for panel in self.panels.values_mut() {
+            if panel.cloud_preparation.take().is_some() {
+                panel.busy = false;
+                panel.message = "登录准备已中断，请重新点击登录".into();
+            }
+        }
+    }
+
     pub fn disconnected(&mut self) {
         self.available = false;
         self.account_state = None;
         self.account_loading = false;
         self.account_error = None;
+        self.environment.mark_disconnected();
         self.environment.clear_records();
         let mut current = self.snapshot();
         current.disconnected();
@@ -207,6 +334,8 @@ impl FunctionUi {
     }
 }
 
+use crate::ui::loading as function_loading;
+
 impl SessionView {
     #[cfg(test)]
     pub(super) fn preview_function(
@@ -216,11 +345,38 @@ impl SessionView {
         cx: &mut Context<Self>,
     ) {
         self.functions.open = true;
+        let preview = id;
+        let id = match id {
+            "authorization-result" => "authorization-list",
+            "devices-result" => "device-list",
+            "login-challenge" => "store-login",
+            "unknown-operation" => "name",
+            "email-unknown" => "email-add",
+            "authorization-confirmation" => "authorization-stop",
+            "menu-signed-out" | "menu-store-only" => "",
+            _ => id,
+        };
         let query_success = id == "query-result";
         let id = if query_success { "name-query" } else { id };
         let logout_success = id == "logout-success";
         let id = if logout_success { "apple-logout" } else { id };
         self.apply_function_event(FunctionEvent::Available(true), cx);
+        let section = |signed: bool| {
+            if signed {
+                serde_json::json!({"status":"signed_in","account":{"apple_id":"demo@example.com","authenticated":true,"enabled_dataclasses":["contacts"]},"find_my_enabled":true})
+            } else {
+                serde_json::json!({"status":"not_signed_in","account":null})
+            }
+        };
+        let signed_out = matches!(
+            preview,
+            "store-login" | "login-challenge" | "menu-signed-out"
+        );
+        self.apply_function_event(FunctionEvent::AccountState(Ok(serde_json::json!({
+            "app_store":section(!signed_out),
+            "icloud":section(!signed_out && id != "cloud-login" && preview != "menu-store-only"),
+            "identity":section(!signed_out && id != "cloud-login" && preview != "menu-store-only")
+        }))), cx);
         if let Some(spec) = OPERATIONS.iter().find(|s| s.id == id) {
             if needs_app(spec) {
                 self.functions.environment.open = true;
@@ -249,6 +405,63 @@ impl SessionView {
             self.functions.text.update(cx, |input, cx| {
                 input.set_value(function_example(spec), window, cx)
             });
+            if preview == "authorization-result" {
+                self.apply_function_event(FunctionEvent::State {task:31, record:serde_json::json!({
+                    "operation_id":"preview-apps", "method":"querySignInWithAppleApps", "status":"completed",
+                    "result":{"apple_id":"demo@example.com","apps":[
+                        {"name":"Vinted","bundle_id":"fr.vinted","client_id":"fr.vinted.app"},
+                        {"name":"Example App","bundle_id":"test.example","client_id":"test.example.app"}]}
+                })}, cx);
+            }
+            if preview == "devices-result" {
+                self.apply_function_event(FunctionEvent::State {task:31, record:serde_json::json!({
+                    "operation_id":"preview-devices", "method":"queryICloudDevices", "status":"completed",
+                    "result":{"apple_id":"demo@example.com","devices":[
+                        {"name":"我的 iPhone","model":"iPhone 15","current_device":true},
+                        {"name":"旧 iPhone","model":"iPhone 12","current_device":false}]}
+                })}, cx);
+            }
+            if preview == "login-challenge" {
+                self.apply_function_event(FunctionEvent::State {task:31, record:serde_json::json!({
+                    "operation_id":"preview-login", "method":"signInAppStore", "status":"requires_verification_code",
+                    "challenge":{"challenge_id":"preview-challenge"}
+                })}, cx);
+                self.apply_function_event(
+                    FunctionEvent::CodeFetchWaiting {
+                        remaining_seconds: 0,
+                    },
+                    cx,
+                );
+            }
+            if preview == "authorization-confirmation" {
+                self.functions
+                    .text
+                    .update(cx, |input, cx| input.set_value("App=fr.vinted", window, cx));
+            }
+            if preview == "email-unknown" {
+                self.apply_function_event(FunctionEvent::State {task:31, record:serde_json::json!({
+                    "operation_id":"preview-email", "method":"beginAddingContactEmail", "status":"running"
+                })}, cx);
+                self.apply_function_event(
+                    FunctionEvent::Uncertain("连接中断，结果待确认".into()),
+                    cx,
+                );
+            }
+            if preview == "unknown-operation" {
+                self.apply_function_event(
+                    FunctionEvent::State {
+                        task: 31,
+                        record: serde_json::json!({
+                            "operation_id":"preview-unknown", "method":"setName", "status":"running"
+                        }),
+                    },
+                    cx,
+                );
+                self.apply_function_event(
+                    FunctionEvent::Uncertain("连接中断，结果待确认".into()),
+                    cx,
+                );
+            }
             if query_success {
                 self.apply_function_event(FunctionEvent::State { task:31, record:serde_json::json!({
                     "operation_id":"preview-query", "method":"queryName", "status":"completed",
@@ -263,7 +476,18 @@ impl SessionView {
             }
         }
     }
+    #[cfg(test)]
+    pub(super) fn preview_function_confirmation(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.confirm_apple_operation(window, cx);
+    }
     pub(super) fn apply_function_event(&mut self, event: FunctionEvent, cx: &mut Context<Self>) {
+        if self.receive_home_delete(&event, cx) {
+            return;
+        }
         match event {
             FunctionEvent::AccountStateLoading => {
                 self.functions.account_loading = true;
@@ -272,8 +496,14 @@ impl SessionView {
             FunctionEvent::AccountState(state) => {
                 self.functions.account_loading = false;
                 match state {
-                    Ok(state) => { self.functions.account_state = Some(state); self.functions.account_error = None; }
-                    Err(error) => { self.functions.account_state = None; self.functions.account_error = Some(error); }
+                    Ok(state) => {
+                        self.functions.account_state = Some(state);
+                        self.functions.account_error = None;
+                    }
+                    Err(error) => {
+                        self.functions.account_state = None;
+                        self.functions.account_error = Some(error);
+                    }
                 }
             }
             FunctionEvent::ForOperation { id, event } => {
@@ -325,12 +555,32 @@ impl SessionView {
             }
             FunctionEvent::Available(available) => {
                 self.functions.available = available;
-                if available { self.functions.account_loading = true; }
-            },
+                if available {
+                    self.functions.account_loading = true;
+                } else {
+                    self.functions.cancel_cloud_preparations();
+                }
+            }
             FunctionEvent::EmailCodePending(record) => {
                 self.apply_function_event(FunctionEvent::State { task: 31, record }, cx);
                 self.functions.busy = true;
                 self.functions.message = "正在读取邮箱验证码…".into();
+            }
+            FunctionEvent::CodeFetchWaiting { remaining_seconds } => {
+                self.functions.busy = false;
+                self.functions.message = if remaining_seconds == 0 {
+                    "请手动输入验证码".into()
+                } else {
+                    format!("自动获取中 · 剩余 {remaining_seconds} 秒").into()
+                };
+            }
+            FunctionEvent::CodeFetched(code) => {
+                self.functions.busy = false;
+                if rv_session::functions::valid_code(&code) {
+                    self.functions.pending_verification_code = Some(code);
+                    self.functions.verification_received = true;
+                    self.functions.message = "已获取验证码".into();
+                }
             }
             FunctionEvent::EmailCodeFetched(code) => {
                 self.functions.busy = false;
@@ -346,6 +596,7 @@ impl SessionView {
             }
             FunctionEvent::VerificationCodeReceived(code) => {
                 if rv_session::functions::valid_code(&code) {
+                    self.functions.verification_submitted = true;
                     self.functions.pending_verification_code = Some(code);
                     self.functions.verification_received = true;
                     self.functions.message = "已收到验证码，正在验证…".into();
@@ -356,16 +607,37 @@ impl SessionView {
                 self.functions.message = message.into();
             }
             FunctionEvent::Uncertain(message) => {
+                self.environment_run_error(&message, true);
+                if self.functions.environment.open
+                    && self
+                        .functions
+                        .selected
+                        .is_some_and(|spec| spec.id == "app-status")
+                {
+                    self.functions.environment.mark_status_failed();
+                }
                 self.functions.uncertain = true;
                 self.functions.busy = false;
                 self.functions.message = message.into();
             }
             FunctionEvent::Error(message) => {
+                self.environment_run_error(&message, false);
+                if self.functions.environment.open
+                    && self
+                        .functions
+                        .selected
+                        .is_some_and(|spec| spec.id == "app-status")
+                {
+                    self.functions.environment.mark_status_failed();
+                }
                 // Keep operation/challenge for query or manual verification; no replay.
                 self.functions.busy = false;
                 self.functions.message = message.into();
             }
             FunctionEvent::State { task, record } => {
+                if task == 32 {
+                    self.update_environment_run(&record);
+                }
                 let environment_completed = task == 32
                     && record["status"] == "completed"
                     && self.functions.environment.open;
@@ -375,17 +647,25 @@ impl SessionView {
                 self.functions.operation = Some((task, id.into()));
                 self.functions.challenge = record["challenge"]["challenge_id"]
                     .as_str()
+                    .filter(|challenge| !challenge.is_empty() && challenge.len() <= 128)
                     .map(str::to_owned);
                 self.functions.result = Some(record.clone());
                 self.functions.message = match record["status"].as_str() {
                     Some("requires_verification_code") => {
                         self.functions.busy = false;
+                        // A queried native challenge confirms this original operation is awaiting input.
+                        if self.functions.challenge.is_some() {
+                            self.functions.uncertain = false;
+                        }
                         "请输入六位验证码，或等待链接读取".into()
                     }
                     Some("completed") => {
                         self.functions.busy = false;
-                        self.functions.result_open =
-                            record["result"]["outcome"] != "requires_email_verification";
+                        self.functions.result_open = !self
+                            .functions
+                            .selected
+                            .is_some_and(|spec| spec.task == 31 && is_query(spec))
+                            && record["result"]["outcome"] != "requires_email_verification";
                         let unknown = rv_session::functions::uncertain_result(task, &record);
                         self.functions.email_rebinding = false;
                         self.functions.uncertain = unknown;
@@ -416,7 +696,7 @@ impl SessionView {
                                 OPERATIONS.iter().find(|spec| spec.id == "email-verify");
                             "请输入邮箱收到的六位验证码".into()
                         } else {
-                            "操作已完成，可复制结果查看详情".into()
+                            "操作已完成".into()
                         }
                     }
                     _ => {
@@ -427,9 +707,27 @@ impl SessionView {
                                 record["operation_id"].as_str().map(str::to_owned);
                         }
                         self.functions.busy = true;
-                        "正在执行…".into()
+                        if task == 32 && record["progress"].is_object() {
+                            environments::environment_progress_label(&record["progress"]).into()
+                        } else if self.functions.selected.is_some_and(is_query) {
+                            "正在读取…".into()
+                        } else if self
+                            .functions
+                            .selected
+                            .is_some_and(|spec| spec.id == "cloud-login")
+                        {
+                            "等待手机确认 iCloud 登录结果…".into()
+                        } else {
+                            "正在执行…".into()
+                        }
                     }
                 };
+                if record["status"] == "completed"
+                    && let Some(spec) = self.functions.selected.filter(|spec| is_login_action(spec))
+                    && self.functions.notified_results.insert(id.to_owned())
+                {
+                    self.functions.pending_results.push((spec, record.clone()));
+                }
                 if environment_completed {
                     self.finish_environment_operation(&record, cx);
                 }
@@ -439,7 +737,9 @@ impl SessionView {
     }
     fn send_function_command(&self, command: FunctionCommand) {
         let id = match &command {
-            FunctionCommand::Invoke { id, .. } => id.clone(),
+            FunctionCommand::Invoke { id, .. } | FunctionCommand::InvokeForAccount { id, .. } => {
+                id.clone()
+            }
             _ => self
                 .functions
                 .selected
@@ -451,21 +751,163 @@ impl SessionView {
             command: Box::new(command),
         });
     }
-    fn function_input(&self) -> &Entity<TextareaState> {
-        let verification = if self.functions.busy {
-            self.functions.verification_submitted
-        } else {
-            self.functions
+    fn verification_input_active(&self) -> bool {
+        self.functions.verification_submitted
+            || self
+                .functions
                 .selected
                 .is_some_and(|spec| spec.id == "email-verify")
-                || self.functions.challenge.is_some()
-        };
-        if verification {
-            &self.functions.verification_text
+            || self.functions.challenge.is_some()
+    }
+    fn function_input_value(&self, cx: &App) -> SharedString {
+        if self.verification_input_active() {
+            self.functions.verification_text.read(cx).value()
         } else {
-            &self.functions.text
+            self.functions.text.read(cx).value()
         }
     }
+    fn focus_function_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.verification_input_active() {
+            self.functions
+                .verification_text
+                .update(cx, |input, cx| input.focus(window, cx));
+        } else {
+            self.functions
+                .text
+                .update(cx, |input, cx| input.focus(window, cx));
+        }
+    }
+    pub(super) fn sync_function_notifications(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        for (spec, record) in std::mem::take(&mut self.functions.pending_results) {
+            let operation_id = record["operation_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned();
+            let matches_record = |panel: &FunctionPanel| {
+                !panel.busy
+                    && panel
+                        .result
+                        .as_ref()
+                        .is_some_and(|result| result["operation_id"] == operation_id)
+            };
+            if self.functions.panel_key() == Some(spec.id) {
+                let mut panel = self.functions.snapshot();
+                if matches_record(&panel) {
+                    panel.clear_login_result();
+                    self.functions.restore(panel);
+                    if self.functions.open
+                        && !self.functions.editor_hidden
+                        && !window.has_active_dialog(cx)
+                    {
+                        if spec.id == "cloud-login" {
+                            self.functions
+                                .cloud_password
+                                .update(cx, |input, cx| input.focus(window, cx));
+                        } else if spec.id == "store-login" {
+                            self.functions
+                                .text
+                                .update(cx, |input, cx| input.focus(window, cx));
+                        }
+                    }
+                }
+            } else if let Some(panel) = self.functions.panels.get_mut(spec.id) {
+                if matches_record(panel) {
+                    panel.clear_login_result();
+                }
+            }
+            // Notify owns an immutable historical result, independent of subsequent requests.
+            window.defer(cx, move |window, cx| {
+                let unknown = rv_session::functions::uncertain_result(31, &record);
+                let mut note = if unknown {
+                    Notification::info("操作已结束，结果待确认")
+                } else if record.get("error").is_some() {
+                    Notification::error(function_error_message(&record))
+                } else {
+                    Notification::success(result_summary(&record).0)
+                };
+                let response = function_response_text(&record);
+                note = note
+                    .title(spec.title)
+                    .id1::<FunctionUi>(operation_id)
+                    .placement(Anchor::BottomRight)
+                    .delivery(NotificationDelivery::InApp)
+                    .autohide(false)
+                    .action(move |_, _, _| {
+                        let response = response.clone();
+                        Button::new("function-notification-details")
+                            .debug_selector(|| "function-notification-details".into())
+                            .ghost()
+                            .icon(IconName::File)
+                            .accessibility_label("原始结果")
+                            .on_click(move |_, window, cx| {
+                                let editor = cx.new(|cx| {
+                                    EditorState::new(window, cx)
+                                        .language("json")
+                                        .soft_wrap(false)
+                                        .default_value(response.clone())
+                                });
+                                let copy = response.clone();
+                                window.open_dialog(cx, move |dialog, _, _| {
+                                    let copy = copy.clone();
+                                    dialog
+                                        .title(spec.title)
+                                        .child(
+                                            div()
+                                                .debug_selector(|| {
+                                                    "function-notification-result".into()
+                                                })
+                                                .child(
+                                                    Editor::new(&editor).readonly(true).h(px(320.)),
+                                                ),
+                                        )
+                                        .footer(
+                                            gpui_component::dialog::DialogFooter::new().child(
+                                                Button::new("function-notification-copy")
+                                                    .ghost()
+                                                    .icon(IconName::Copy)
+                                                    .accessibility_label("复制原始结果")
+                                                    .on_click(move |_, _, cx| {
+                                                        cx.write_to_clipboard(
+                                                            ClipboardItem::new_string(copy.clone()),
+                                                        );
+                                                    }),
+                                            ),
+                                        )
+                                });
+                            })
+                    });
+                window.push_notification(note, cx);
+            });
+        }
+    }
+
+    pub(super) fn sync_function_result_editor(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.functions.open || self.functions.editor_hidden || self.functions.busy {
+            return;
+        }
+        let Some(record) = self.functions.result.as_ref() else {
+            return;
+        };
+        if record["status"] != "completed" {
+            return;
+        }
+        let text = function_response_text(record);
+        // Do not reset selection or scroll position on unrelated window redraws.
+        if self.functions.result_editor.read(cx).value().as_ref() != text {
+            self.functions.result_editor.update(cx, |editor, cx| {
+                editor.set_value(text, window, cx);
+            });
+        }
+    }
+
     pub(super) fn fill_received_verification_code(
         &mut self,
         window: &mut Window,
@@ -484,6 +926,9 @@ impl SessionView {
         self.functions
             .verification_text
             .update(cx, |input, cx| input.set_value("", window, cx));
+        self.functions
+            .cloud_password
+            .update(cx, |input, cx| input.set_value("", window, cx));
         self.functions.verification_submitted = false;
         self.functions.verification_received = false;
         self.functions.pending_verification_code = None;
@@ -495,7 +940,12 @@ impl SessionView {
         cx.notify();
     }
     fn refresh_function_accounts(&mut self, cx: &mut Context<Self>) {
-        if !self.functions.available || self.phase != Phase::Connected || self.functions.account_loading { return; }
+        if !self.functions.available
+            || self.phase != Phase::Connected
+            || self.functions.account_loading
+        {
+            return;
+        }
         self.functions.account_loading = true;
         self.functions.account_state = None;
         self.functions.account_error = None;
@@ -508,13 +958,22 @@ impl SessionView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !account_action_visible(spec.id, self.functions.account_state.as_ref()) { return; }
+        if !account_action_visible(spec.id, self.functions.account_state.as_ref())
+            && !self.functions.has_pending(spec)
+        {
+            return;
+        }
         if self.functions.selected.is_some_and(|selected| {
             selected.id == spec.id || (selected.id == "email-verify" && spec.id == "email-add")
-        }) {
+        }) && !self.functions.snapshot().finished()
+        {
             self.functions.editor_hidden = false;
             cx.notify();
             return;
+        }
+        if self.functions.cloud_preparation.take().is_some() {
+            self.functions.busy = false;
+            self.functions.message = "登录准备已中断，请重新点击登录".into();
         }
         if let Some(key) = self.functions.panel_key() {
             let state = self.functions.snapshot();
@@ -525,7 +984,11 @@ impl SessionView {
         } else {
             spec.id
         };
-        let previous = self.functions.panels.remove(key);
+        let previous = self
+            .functions
+            .panels
+            .remove(key)
+            .filter(|panel| !panel.finished());
         let existing = previous.is_some();
         let app = self.functions.target_app.clone();
         let state = previous.unwrap_or_else(|| FunctionUi::new(Vec::new(), window, cx).snapshot());
@@ -553,8 +1016,24 @@ impl SessionView {
         self.functions.result = None;
         self.functions.result_open = false;
         self.clear_function_text(window, cx);
-        self.function_input()
-            .update(cx, |input, cx| input.focus(window, cx));
+        self.functions.text.update(cx, |input, cx| {
+            input.set_placeholder(
+                match spec.id {
+                    "store-login" => "账号----密码----验证码链接（可选）",
+                    "cloud-login" => "登录密码（使用当前 App Store 账户）",
+                    _ => spec.hint,
+                },
+                window,
+                cx,
+            );
+        });
+        if spec.id == "cloud-login" {
+            self.functions
+                .cloud_password
+                .update(cx, |input, cx| input.focus(window, cx));
+        } else {
+            self.focus_function_input(window, cx);
+        }
         if is_query(spec) {
             self.execute_function(window, cx);
         }
@@ -571,9 +1050,13 @@ impl SessionView {
         let Some(spec) = self.functions.selected else {
             return;
         };
+        if self.functions.uncertain && !is_query(spec) {
+            return;
+        }
         if !account_action_visible(spec.id, self.functions.account_state.as_ref()) {
             self.functions.message = "账户状态已改变，请重新选择操作".into();
-            cx.notify(); return;
+            cx.notify();
+            return;
         }
         if self
             .functions
@@ -588,7 +1071,11 @@ impl SessionView {
             cx.notify();
             return;
         }
-        let text = self.function_input().read(cx).value().to_string();
+        let text = if spec.id == "cloud-login" {
+            format!("密码={}", self.functions.cloud_password.read(cx).value())
+        } else {
+            self.function_input_value(cx).to_string()
+        };
         let text = if matches!(spec.id, "apple-logout" | "cloud-logout") {
             let Some(policy) = self.functions.local_data_policy else {
                 self.functions.message = "请选择保留或移除本机数据".into();
@@ -625,10 +1112,24 @@ impl SessionView {
             cx.notify();
             return;
         }
-        self.send_function_command(FunctionCommand::Invoke {
-            id: spec.id.into(),
-            text,
-        });
+        if spec.id == "cloud-login" {
+            self.prepare_cloud_login(text, cx);
+            return;
+        }
+        self.send_function_command(
+            if let Some(apple_id) = self.functions.expected_account.clone() {
+                FunctionCommand::InvokeForAccount {
+                    id: spec.id.into(),
+                    text,
+                    apple_id,
+                }
+            } else {
+                FunctionCommand::Invoke {
+                    id: spec.id.into(),
+                    text,
+                }
+            },
+        );
         self.functions.verification_submitted = spec.id == "email-verify";
         self.functions.busy = true;
         self.functions.result = None;
@@ -642,6 +1143,98 @@ impl SessionView {
         // Retain the current input in memory; the rendered processing state is read-only.
         cx.notify();
     }
+    fn prepare_cloud_login(&mut self, text: String, cx: &mut Context<Self>) {
+        let spec = OPERATIONS
+            .iter()
+            .find(|spec| spec.id == "cloud-login")
+            .unwrap();
+        let Ok(parsed) = parse_operation(spec, &text) else {
+            return;
+        };
+        let req = self.req.clone();
+        self.functions.next_cloud_preparation =
+            self.functions.next_cloud_preparation.wrapping_add(1).max(1);
+        let token = self.functions.next_cloud_preparation;
+        self.functions.cloud_preparation = Some(token);
+        self.functions.busy = true;
+        self.functions.result = None;
+        self.functions.result_open = false;
+        self.functions.verification_submitted = false;
+        self.functions.message = "正在读取本地锁屏配置…".into();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let code = cx
+                .background_executor()
+                .spawn(async move { rv_core::load_unlock_code(&req) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.finish_cloud_login_preparation(token, parsed, code, cx);
+            });
+        })
+        .detach();
+    }
+
+    fn finish_cloud_login_preparation(
+        &mut self,
+        token: u64,
+        mut parsed: rv_session::functions::PreparedOperation,
+        code: Result<Option<rv_core::UnlockCode>, rv_core::StoreError>,
+        cx: &mut Context<Self>,
+    ) {
+        // Every result branch belongs to one still-current local preparation.
+        // Switching panels or disconnecting invalidates the token before a new request.
+        if self.functions.cloud_preparation != Some(token) {
+            return;
+        }
+        self.functions.cloud_preparation = None;
+        if self.phase != Phase::Connected
+            || !self.functions.available
+            || self
+                .functions
+                .selected
+                .is_none_or(|spec| spec.id != "cloud-login")
+            || !self.functions.busy
+            || self.view_only()
+        {
+            self.functions.busy = false;
+            self.functions.message = "登录准备已中断，请重新点击登录".into();
+            cx.notify();
+            return;
+        }
+        let error = match code {
+            Ok(Some(code)) => {
+                parsed.params["device_passcode"] =
+                    serde_json::json!(String::from_utf8(code.digits().to_vec()).unwrap());
+                if let Some(url) = parsed.code_url.take() {
+                    parsed.params["code_url"] = serde_json::json!(url);
+                }
+                let text = parsed
+                    .params
+                    .as_object()
+                    .unwrap()
+                    .iter()
+                    .map(|(key, value)| format!("{key}={}", value.as_str().unwrap()))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                self.functions.message = "正在读取当前账户并登录…".into();
+                self.send_function_command(FunctionCommand::Invoke {
+                    id: "cloud-login".into(),
+                    text,
+                });
+                None
+            }
+            Ok(None) => {
+                self.prompt_unlock_setting(cx);
+                Some("请先设置本地锁屏密码，再点击登录".to_owned())
+            }
+            Err(_) => Some("读取本地锁屏密码失败，请检查锁屏设置".to_owned()),
+        };
+        if let Some(error) = error {
+            self.apply_function_event(FunctionEvent::Error(error), cx);
+        }
+        cx.notify();
+    }
+
     fn submit_function_code(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         if !self.functions.available || self.functions.busy || self.view_only() {
             return;
@@ -652,7 +1245,7 @@ impl SessionView {
         let Some(challenge_id) = self.functions.challenge.clone() else {
             return;
         };
-        let text = self.function_input().read(cx).value().to_string();
+        let text = self.function_input_value(cx).to_string();
         let code = text
             .trim()
             .strip_prefix("验证码=")
@@ -670,6 +1263,7 @@ impl SessionView {
         });
         self.functions.verification_submitted = true;
         self.functions.busy = true;
+        self.functions.message = "正在提交验证码…".into();
         cx.notify();
     }
     pub(super) fn render_function_button(
@@ -679,15 +1273,12 @@ impl SessionView {
     ) -> impl IntoElement {
         Button::new("function-menu-toggle")
             .debug_selector(|| "function-menu-toggle".into())
+            .accessibility_label("功能")
             .ghost()
-            .small()
-            .h(px(28.))
-            .icon(FunctionIcon::Wrench)
+            .icon(IconName::LayoutDashboard)
             .when(!compact, |button| button.label("功能"))
-            .when(compact, |button| button.size(px(28.)))
-            .text_color(theme::toolbar_fg())
+            .when(compact, |button| button)
             .selected(self.functions.open)
-            .when(self.functions.open, |button| button.bg(rgb(0x2a3a50)))
             .on_click(cx.listener(|this, _, window, cx| this.toggle_functions(window, cx)))
     }
     fn toggle_functions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -705,19 +1296,31 @@ impl SessionView {
             self.refresh_function_accounts(cx);
             self.assistant_open = false;
             if self.functions.selected.is_some() && !self.functions.editor_hidden {
-                self.functions
-                    .text
-                    .update(cx, |input, cx| input.focus(window, cx));
+                if self
+                    .functions
+                    .selected
+                    .is_some_and(|spec| spec.id == "cloud-login")
+                    && self.functions.challenge.is_none()
+                {
+                    self.functions
+                        .cloud_password
+                        .update(cx, |input, cx| input.focus(window, cx));
+                } else {
+                    self.focus_function_input(window, cx);
+                }
             } else {
                 self.focus.focus(window, cx);
             }
         } else {
-            if !self.functions.busy {
+            if self.functions.environment.open && !self.functions.busy {
                 self.clear_function_text(window, cx);
             }
             self.focus.focus(window, cx);
         }
         cx.notify();
+    }
+    pub(super) fn function_uses_two_panels(&self) -> bool {
+        self.functions.environment.open && self.function_editor_visible()
     }
     pub(super) fn render_functions(
         &self,
@@ -732,7 +1335,8 @@ impl SessionView {
             .functions
             .selected
             .filter(|_| !self.functions.editor_hidden);
-        let side_by_side = width >= 900. && height >= 480.;
+        // Apple operations use one stable panel at every window size.
+        let side_by_side = false;
         h_flex()
             .id("function-panel")
             .debug_selector(|| "function-panel".into())
@@ -759,100 +1363,81 @@ impl SessionView {
         let selected = self.functions.selected;
         let mut rows = Vec::new();
         let mut previous_group = "";
-        for spec in OPERATIONS
-            .iter()
-            .filter(|spec| spec.category == self.functions.category && spec.id != "email-verify"
-                && account_action_visible(spec.id, self.functions.account_state.as_ref()))
-        {
+        for spec in OPERATIONS.iter().filter(|spec| {
+            spec.category == self.functions.category
+                && spec.id != "email-verify"
+                && self.function_menu_visible(spec)
+        }) {
+            let reason = self.function_unavailable_reason(spec);
             let (group, icon) = function_presentation(spec);
             if group != previous_group {
-                rows.push(
-                    div()
-                        .pt(px(if previous_group.is_empty() { 2. } else { 10. }))
-                        .pb(px(4.))
-                        .px_2()
-                        .text_size(px(11.))
-                        .text_color(theme::toolbar_muted())
-                        .when(!previous_group.is_empty(), |el| {
-                            el.border_t_1().border_color(theme::toolbar_line())
-                        })
-                        .child(group)
-                        .into_any_element(),
-                );
+                if !previous_group.is_empty() {
+                    rows.push(
+                        div()
+                            .my_1()
+                            .border_t_1()
+                            .border_color(theme::line(cx))
+                            .into_any_element(),
+                    );
+                }
                 previous_group = group;
             }
             let active = selected.is_some_and(|s| {
                 s.id == spec.id || (s.id == "email-verify" && spec.id == "email-add")
             });
             rows.push(
-                h_flex()
-                    .h(px(28.))
-                    .rounded_md()
-                    .when(active, |el| el.bg(rgb(0x2a3a50)))
-                    .hover(|el| el.bg(rgb(0x29333e)))
+                Button::new(spec.id)
+                    .ghost()
+                    .selected(active)
+                    .w_full()
+                    .accessibility_label(spec.title)
+                    .debug_selector(move || format!("function-{}", spec.id))
+                    .disabled(reason.is_some())
                     .child(
-                        Button::new(spec.id)
-                            .debug_selector(move || format!("function-{}", spec.id))
-                            .ghost()
-                            .small()
-                            .h(px(28.))
-                            .disabled(account_action_requires_state(spec.id) &&
-                                (self.functions.account_loading || !account_action_known(spec.id, self.functions.account_state.as_ref())))
-                            .text_color(theme::toolbar_fg())
-                            .px_2()
-                            .flex_1()
-                            .min_w_0()
+                        h_flex()
+                            .w_full()
+                            .gap_2()
+                            .debug_selector(move || format!("function-menu-content-{}", spec.id))
+                            .child(Icon::new(icon))
                             .child(
-                                h_flex()
-                                    .w_full()
-                                    .gap_2()
-                                    .child(Icon::new(icon).size(px(15.)).text_color(if active {
-                                        theme::accent(cx)
-                                    } else {
-                                        theme::toolbar_fg()
-                                    }))
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .text_left()
-                                            .text_size(px(12.))
-                                            .child(if spec.id == "cloud-login" && domain_signed(self.functions.account_state.as_ref(), "icloud") == Some(true) { "继续开通 iCloud" } else { spec.title }),
-                                    )
-                                    .child(
-                                        Icon::new(IconName::ChevronRight)
-                                            .size(px(12.))
-                                            .text_color(theme::toolbar_muted()),
-                                    ),
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_left()
+                                    .text_sm()
+                                    .child(spec.title),
                             )
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.select_function(spec, window, cx)
-                            })),
+                            .child(Icon::new(IconName::ChevronRight)),
                     )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.select_function(spec, window, cx)
+                    }))
                     .into_any_element(),
             );
         }
-        v_flex()
+        crate::ui::tool_panel(cx)
             .id("function-browser")
             .debug_selector(|| "function-browser".into())
             .w(px(360f32.min(width - 16.)))
             .max_h(px((height - 16.).max(100.)))
             .flex_shrink_0()
-            .bg(theme::toolbar())
-            .text_color(theme::toolbar_fg())
-            .border_1()
-            .border_color(theme::toolbar_line())
-            .rounded_lg()
-            .shadow_lg()
-            .p_2()
-            .gap_2()
-            .text_size(px(12.))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
             .child(self.render_function_navigation(cx))
+            .when_some(self.functions.account_error.clone(), |panel, error| {
+                panel.child(
+                    div()
+                        .debug_selector(|| "function-account-error".into())
+                        .text_xs()
+                        .text_color(theme::muted(cx))
+                        .child(format!("账户读取失败：{error}")),
+                )
+            })
             .child(
                 h_flex().min_h_0().child(
                     v_flex()
                         .id("function-list")
+                        .debug_selector(|| "function-list".into())
                         .flex_1()
                         .min_w_0()
                         .max_h(px(400f32.min((height - 100.).max(60.))))
@@ -862,8 +1447,8 @@ impl SessionView {
                             list.child(
                                 div()
                                     .p_2()
-                                    .text_size(px(12.))
-                                    .text_color(theme::toolbar_muted())
+                                    .text_sm()
+                                    .text_color(theme::muted(cx))
                                     .child("暂无功能"),
                             )
                         }),
@@ -872,76 +1457,107 @@ impl SessionView {
     }
     fn render_function_navigation(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let environment = self.functions.environment.open;
+        let editor = self
+            .functions
+            .selected
+            .filter(|spec| spec.task == 31 && !self.functions.editor_hidden && !environment);
         h_flex()
+            .debug_selector(|| "function-navigation-bar".into())
             .gap_1()
             .items_center()
             .child(
-                h_flex().gap_1().flex_1().children(
-                    [("Apple", IconName::User), ("App 环境", IconName::Folder)]
+                gpui_component::tab::TabBar::new("function-navigation")
+                    .underline()
+                    .flex_shrink_0()
+                    .selected_index(if environment { 1 } else { 0 })
+                    .children(
+                        [
+                            ("Apple", FunctionIcon::User),
+                            ("App 环境", FunctionIcon::All),
+                        ]
                         .into_iter()
                         .map(|(category, icon)| {
-                            let active = if environment {
-                                category == "App 环境"
-                            } else {
-                                self.functions.category == category
-                            };
-                            Button::new(category)
-                                .debug_selector(move || format!("function-tab-{category}"))
-                                .ghost()
-                                .small()
-                                .h(px(26.))
-                                .flex_1()
-                                .text_color(theme::toolbar_muted())
-                                .child(
-                                    h_flex()
-                                        .gap_1()
-                                        .items_center()
-                                        .child(Icon::new(icon).size(px(13.)))
-                                        .child(div().text_size(px(11.)).child(category)),
-                                )
-                                .when(active, |button| {
-                                    button.bg(rgb(0x2a3a50)).text_color(theme::accent(cx))
-                                })
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    if category == "App 环境" {
-                                        if !this.functions.environment.open {
-                                            this.open_app_environment(None, window, cx);
-                                        }
-                                        return;
-                                    }
-                                    if this.functions.environment.open {
-                                        this.return_function_menu(window, cx);
-                                    }
-                                    this.functions.category = category;
-                                    cx.notify();
-                                }))
+                            gpui_component::tab::Tab::new().aria_label(category).child(
+                                h_flex()
+                                    .gap_2()
+                                    .items_center()
+                                    .child(Icon::new(icon))
+                                    .child(
+                                        div()
+                                            .id(format!("function-tab-{category}"))
+                                            .debug_selector(move || {
+                                                format!("function-tab-{category}")
+                                            })
+                                            .child(category),
+                                    ),
+                            )
                         }),
-                ),
+                    )
+                    .on_click(cx.listener(|this, index: &usize, window, cx| {
+                        if *index == 1 {
+                            if !this.functions.environment.open {
+                                this.open_app_environment(None, window, cx);
+                            }
+                        } else {
+                            if this.functions.environment.open {
+                                this.return_function_menu(window, cx);
+                            }
+                            this.functions.category = "Apple";
+                            cx.notify();
+                        }
+                    })),
             )
-            .when(!environment, |row| row.child(
-                Button::new("function-account-refresh")
-                    .debug_selector(|| "function-account-refresh".into())
-                    .ghost().size(px(24.))
-                    .icon(Icon::new(IconName::Redo).size(px(14.)))
-                    .loading(self.functions.account_loading)
-                    .disabled(!self.functions.available || self.functions.account_loading)
-                    .tooltip(self.functions.account_error.clone().unwrap_or_else(|| "刷新账户状态".into()))
-                    .text_color(theme::toolbar_muted())
-                    .on_click(cx.listener(|this, _, _, cx| this.refresh_function_accounts(cx))),
-            ))
+            .child(div().flex_1())
+            .when(
+                !environment && (self.functions.selected.is_none() || self.functions.editor_hidden),
+                |row| {
+                    row.child(
+                        Button::new("function-account-refresh")
+                            .accessibility_label("刷新账户状态")
+                            .debug_selector(|| "function-account-refresh".into())
+                            .ghost()
+                            .icon(FunctionIcon::Refresh)
+                            .disabled(!self.functions.available || self.functions.account_loading)
+                            .loading(self.functions.account_loading)
+                            .text_color(theme::muted(cx))
+                            .on_click(
+                                cx.listener(|this, _, _, cx| this.refresh_function_accounts(cx)),
+                            ),
+                    )
+                },
+            )
+            .when(editor.is_some_and(is_query), |row| {
+                row.child(
+                    crate::ui::icon_button(
+                        "function-query-refresh",
+                        FunctionIcon::Refresh,
+                        "刷新资料",
+                    )
+                    .on_click(cx.listener(|this, _, window, cx| this.execute_function(window, cx)))
+                    .debug_selector(|| "function-query-refresh".into())
+                    .disabled(!self.functions.available || self.functions.busy),
+                )
+            })
+            .when(editor.is_some(), |row| {
+                row.child(
+                    Button::new("function-back")
+                        .ghost()
+                        .icon(IconName::ArrowLeft)
+                        .accessibility_label("返回菜单")
+                        .debug_selector(|| "function-back".into())
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.close_function_editor(window, cx)
+                        })),
+                )
+            })
             .child(
                 Button::new("function-close")
+                    .accessibility_label("关闭面板")
+                    .debug_selector(|| "function-close".into())
                     .ghost()
-                    .size(px(24.))
-                    .icon(Icon::new(IconName::Close).size(px(14.)))
-                    .text_color(theme::toolbar_fg())
+                    .icon(Icon::new(IconName::Close))
                     .on_click(cx.listener(|this, _, window, cx| {
-                        this.functions.open = false;
-                        if !this.functions.busy && this.functions.operation.is_none() {
-                            this.clear_function_text(window, cx);
-                        }
-                        this.focus.focus(window, cx);
-                        cx.notify();
+                        this.close_function_panel(window, cx);
                     })),
             )
     }
@@ -968,32 +1584,19 @@ impl SessionView {
                 && !self.functions.uncertain
                 && record["result"]["outcome"] != "requires_email_verification"
         });
-        v_flex()
+        crate::ui::tool_panel(cx)
             .id("function-editor")
             .debug_selector(|| "function-editor".into())
-            .w(px((if selected
-                .is_some_and(|spec| matches!(spec.id, "apple-logout" | "cloud-logout"))
-            {
-                320f32
-            } else {
-                360f32
-            })
-            .min(width - 16.)))
+            .w(px(360f32.min(width - 16.)))
             .max_h(px((height - if side_by_side { 56. } else { 16. }).max(100.)))
             .when(side_by_side, |panel| panel.mt(px(40.)))
             .overflow_y_scroll()
             .flex_shrink_0()
-            .p_3()
-            .gap_2()
-            .bg(theme::toolbar())
-            .text_color(theme::toolbar_fg())
-            .border_1()
-            .border_color(theme::toolbar_line())
-            .rounded_lg()
-            .shadow_lg()
-            .text_size(px(12.))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+            .when(selected.is_some_and(|spec| spec.task == 31), |panel| {
+                panel.child(self.render_function_navigation(cx))
+            })
             .when_some(selected, |panel, spec| {
                 panel.child(
                     v_flex()
@@ -1003,74 +1606,147 @@ impl SessionView {
                                 .items_center()
                                 .gap_1()
                                 .pb_1()
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .min_w_0()
-                                        .text_size(px(13.))
-                                        .font_semibold()
-                                        .child(spec.title),
-                                )
-                                .when(query, |row| {
+                                .child(div().flex_1().min_w_0().text_sm().font_semibold().child(
+                                    if spec.id == "apple-query" {
+                                        "账户资料"
+                                    } else if spec.id == "app-delete"
+                                        && self.functions.environment.backup.as_ref().is_some_and(
+                                            |backup| backup.id.starts_with("baseline:"),
+                                        )
+                                    {
+                                        "删除基线"
+                                    } else {
+                                        spec.title
+                                    },
+                                ))
+                                .when(query && spec.task != 31, |row| {
                                     row.child(
-                                        tool_btn(
-                                            cx,
+                                        crate::ui::icon_button(
                                             "function-query-refresh",
-                                            crate::assets::AppActionIcon::Restart,
-                                            "刷新原始结果",
-                                            cx.listener(|this, _, window, cx| {
-                                                this.execute_function(window, cx)
-                                            }),
+                                            FunctionIcon::Refresh,
+                                            "刷新资料",
                                         )
-                                        .size(px(24.))
-                                        .icon(
-                                            Icon::new(crate::assets::AppActionIcon::Restart)
-                                                .size(px(14.)),
-                                        )
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.execute_function(window, cx)
+                                        }))
                                         .debug_selector(|| "function-query-refresh".into())
                                         .disabled(!live || locked),
                                     )
-                                    .child(
-                                        tool_btn(
-                                            cx,
-                                            "function-copy-result",
-                                            IconName::Copy,
-                                            "复制原始结果",
-                                            cx.listener(|this, _, _, cx| {
-                                                if let Some(result) = &this.functions.result {
-                                                    cx.write_to_clipboard(
-                                                        ClipboardItem::new_string(
-                                                            function_response_text(result),
-                                                        ),
-                                                    );
-                                                }
-                                            }),
+                                })
+                                .when(
+                                    self.functions.query_target().is_some()
+                                        && (self.functions.uncertain
+                                            || self.functions.email_needs_resume),
+                                    |row| {
+                                        row.child(
+                                            Button::new("function-query")
+                                                .debug_selector(|| "function-query-resume".into())
+                                                .ghost()
+                                                .icon(IconName::Redo)
+                                                .loading(locked)
+                                                .label("查询结果")
+                                                .accessibility_label("查询原操作结果，不重新提交")
+                                                .text_color(theme::muted(cx))
+                                                .disabled(!live || locked)
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    if let Some((task, operation_id)) =
+                                                        this.functions.query_target()
+                                                    {
+                                                        this.send_function_command(
+                                                            FunctionCommand::Resume {
+                                                                task,
+                                                                operation_id,
+                                                            },
+                                                        );
+                                                        this.functions.busy = true;
+                                                        this.functions.message =
+                                                            "正在查询原操作结果…".into();
+                                                        cx.notify();
+                                                    }
+                                                })),
                                         )
-                                        .size(px(24.))
-                                        .icon(Icon::new(IconName::Copy).size(px(14.)))
-                                        .disabled(self.functions.result.is_none()),
+                                    },
+                                )
+                                .when(spec.task != 31, |row| {
+                                    row.child(
+                                        crate::ui::icon_button(
+                                            "function-back",
+                                            IconName::ArrowLeft,
+                                            "返回",
+                                        )
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.close_function_editor(window, cx);
+                                        }))
+                                        .debug_selector(|| "function-back".into()),
                                     )
                                 })
-                                .child(
-                                    tool_btn(
-                                        cx,
-                                        "function-editor-close",
-                                        IconName::Close,
-                                        "关闭",
-                                        cx.listener(|this, _, window, cx| {
-                                            this.close_function_editor(window, cx);
-                                        }),
+                                .when(spec.task != 31, |row| {
+                                    row.child(
+                                        crate::ui::icon_button(
+                                            "function-editor-close",
+                                            IconName::Close,
+                                            "关闭",
+                                        )
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.close_function_panel(window, cx);
+                                        }))
+                                        .debug_selector(|| "function-editor-close".into())
+                                        .icon(Icon::new(IconName::Close)),
                                     )
-                                    .debug_selector(|| "function-editor-close".into())
-                                    .size(px(24.))
-                                    .icon(Icon::new(IconName::Close).size(px(14.))),
-                                ),
+                                }),
+                        )
+                        .when(spec.task == 31 && spec.id != "apple-query", |panel| {
+                            panel.child(self.render_apple_operation_context(spec, cx))
+                        })
+                        .when(
+                            matches!(spec.id, "email-add" | "email-verify")
+                                && self.functions.uncertain,
+                            |row| {
+                                row.child(
+                                    Button::new("function-email-rebind")
+                                        .ghost()
+                                        .label("重新发送绑定")
+                                        .debug_selector(|| "function-email-rebind".into())
+                                        .text_color(theme::accent(cx))
+                                        .disabled(!live || self.functions.busy)
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            if this.functions.busy {
+                                                return;
+                                            }
+                                            let text =
+                                                this.functions.text.read(cx).value().to_string();
+                                            this.functions.email_rebinding = true;
+                                            this.functions.email_rebind_operation = None;
+                                            this.send_function_command(
+                                                if let Some(apple_id) =
+                                                    this.functions.expected_account.clone()
+                                                {
+                                                    FunctionCommand::InvokeForAccount {
+                                                        id: "email-add".into(),
+                                                        text,
+                                                        apple_id,
+                                                    }
+                                                } else {
+                                                    FunctionCommand::RebindEmail { text }
+                                                },
+                                            );
+                                            this.functions.selected =
+                                                OPERATIONS.iter().find(|s| s.id == "email-add");
+                                            this.functions.busy = true;
+                                            this.functions.result_open = false;
+                                            this.functions.message =
+                                                "正在核对邮箱并初始化新绑定…".into();
+                                            cx.notify();
+                                        })),
+                                )
+                            },
                         )
                         .when(self.functions.environment.open, |panel| {
                             panel.child(self.render_environment_context(cx))
                         })
                         .when(
                             !operation_done
+                                && !self.functions.uncertain
                                 && !self.functions.busy
                                 && matches!(spec.id, "apple-logout" | "cloud-logout"),
                             |panel| {
@@ -1080,120 +1756,92 @@ impl SessionView {
                                         .gap_2()
                                         .child(
                                             div()
-                                                .text_size(px(11.))
-                                                .text_color(theme::toolbar_muted())
+                                                .text_xs()
+                                                .text_color(theme::muted(cx))
                                                 .child("本机数据"),
                                         )
                                         .child(
-                                            h_flex()
-                                                .p(px(2.))
-                                                .gap(px(2.))
-                                                .rounded_md()
-                                                .bg(rgb(0x151b22))
-                                                .children(
-                                                    [("keep", "保留"), ("remove", "移除")].map(
-                                                        |(policy, label)| {
-                                                            let active =
-                                                                self.functions.local_data_policy
-                                                                    == Some(policy);
-                                                            Button::new(SharedString::from(
-                                                                format!("logout-data-{policy}"),
-                                                            ))
-                                                            .ghost()
-                                                            .small()
-                                                            .border_0()
-                                                            .debug_selector(move || {
-                                                                format!("logout-data-{policy}")
-                                                            })
-                                                            .h(px(24.))
-                                                            .w(px(64.))
-                                                            .rounded(px(4.))
-                                                            .bg(if active {
-                                                                rgb(0x334356)
-                                                            } else {
-                                                                rgb(0x151b22)
-                                                            })
-                                                            .text_color(if active {
-                                                                theme::toolbar_fg()
-                                                            } else {
-                                                                theme::toolbar_muted()
-                                                            })
-                                                            .text_size(px(12.))
-                                                            .when(active, |choice| {
-                                                                choice.icon(
-                                                                    Icon::new(IconName::Check)
-                                                                        .size(px(12.)),
-                                                                )
-                                                            })
-                                                            .label(label)
-                                                            .disabled(!live || locked)
-                                                            .on_click(cx.listener(
-                                                                move |this, _, _, cx| {
-                                                                    this.functions
-                                                                        .local_data_policy =
-                                                                        Some(policy);
-                                                                    this.functions.message =
-                                                                        "".into();
-                                                                    cx.notify();
-                                                                },
-                                                            ))
-                                                        },
-                                                    ),
-                                                ),
+                                            gpui_component::radio::RadioGroup::horizontal(
+                                                "logout-data-policy",
+                                            )
+                                            .disabled(!live || locked)
+                                            .selected_index(
+                                                match self.functions.local_data_policy {
+                                                    Some("keep") => Some(0),
+                                                    Some("remove") => Some(1),
+                                                    _ => None,
+                                                },
+                                            )
+                                            .children([("keep", "保留"), ("remove", "移除")].map(
+                                                |(policy, label)| {
+                                                    gpui_component::radio::Radio::new(format!(
+                                                        "logout-data-{policy}"
+                                                    ))
+                                                    .label(label)
+                                                    .debug_selector(move || {
+                                                        format!("logout-data-{policy}")
+                                                    })
+                                                },
+                                            ))
+                                            .on_click(
+                                                cx.listener(|this, index: &usize, _, cx| {
+                                                    cx.stop_propagation();
+                                                    this.functions.local_data_policy =
+                                                        Some(if *index == 0 {
+                                                            "keep"
+                                                        } else {
+                                                            "remove"
+                                                        });
+                                                    this.functions.message = "".into();
+                                                    cx.notify();
+                                                }),
+                                            ),
                                         ),
                                 )
                             },
                         )
                         .when(
                             !operation_done
-                                && (self.function_has_text(spec)
-                                    || self.functions.challenge.is_some()),
+                                && !self.functions.uncertain
+                                && self.functions.challenge.is_none()
+                                && !self.functions.verification_submitted
+                                && self.function_has_text(spec),
                             |panel| {
-                                panel.child(div().text_size(px(12.)).child(
-                                    if self.functions.busy {
-                                        "已提交资料"
-                                    } else if self.functions.challenge.is_some()
-                                        || spec.id == "email-verify"
-                                    {
-                                        "粘贴验证码"
-                                    } else {
-                                        "粘贴操作资料"
-                                    },
-                                ))
-                            },
-                        )
-                        .when(
-                            !operation_done
-                                && (self.function_has_text(spec)
-                                    || self.functions.challenge.is_some()),
-                            |panel| {
+                                if spec.id == "email-verify" {
+                                    return panel.child(
+                                        div()
+                                            .debug_selector(|| "function-input-area".into())
+                                            .child(
+                                                Input::new(&self.functions.verification_text)
+                                                    .readonly(self.functions.busy),
+                                            ),
+                                    );
+                                }
+                                if spec.id == "cloud-login"
+                                    && self.functions.challenge.is_none()
+                                    && !self.functions.verification_submitted
+                                {
+                                    return panel.child(
+                                        div()
+                                            .debug_selector(|| "function-input-area".into())
+                                            .child(
+                                                Input::new(&self.functions.cloud_password)
+                                                    .readonly(self.functions.busy),
+                                            ),
+                                    );
+                                }
                                 panel.child(
-                                    div()
-                                        .debug_selector(|| "function-input-area".into())
-                                        .rounded_md()
-                                        .border_1()
-                                        .border_color(if self.functions.busy {
-                                            theme::toolbar_line()
-                                        } else {
-                                            theme::accent(cx).opacity(0.65)
-                                        })
-                                        .bg(rgb(0x28323d))
-                                        .text_color(theme::toolbar_fg())
-                                        .child(
-                                            Textarea::new(self.function_input())
-                                                .readonly(self.functions.busy)
-                                                .h(px(100.))
-                                                .appearance(false)
-                                                .bordered(false)
-                                                .font_family("Menlo")
-                                                .text_size(px(12.))
-                                                .text_color(theme::toolbar_fg()),
-                                        ),
+                                    div().debug_selector(|| "function-input-area".into()).child(
+                                        Textarea::new(&self.functions.text)
+                                            .readonly(self.functions.busy)
+                                            .h(px(100.)),
+                                    ),
                                 )
                             },
                         )
                         .when(
                             self.functions.verification_received
+                                && self.functions.challenge.is_none()
                                 && (self.functions.busy || operation_done),
                             |panel| {
                                 panel.child(
@@ -1201,74 +1849,63 @@ impl SessionView {
                                         .debug_selector(|| "function-received-code".into())
                                         .gap_2()
                                         .items_center()
-                                        .child(div().text_size(px(12.)).child("验证码"))
+                                        .child(div().text_sm().child("验证码"))
                                         .child(
-                                            Textarea::new(&self.functions.verification_text)
+                                            Input::new(&self.functions.verification_text)
                                                 .readonly(true)
-                                                .h(px(28.))
-                                                .w(px(112.))
-                                                .appearance(false)
-                                                .bordered(false)
-                                                .font_family("Menlo")
-                                                .text_size(px(12.))
-                                                .text_color(theme::toolbar_fg()),
+                                                .w(px(112.)),
                                         ),
                                 )
                             },
                         )
-                        .when(!operation_done && !query && !self.functions.busy, |panel| {
-                            panel.child(
-                                div()
-                                    .text_size(px(11.))
-                                    .text_color(theme::toolbar_muted())
-                                    .child(match spec.id {
-                                        "cloud-logout" => "退出手机当前的 iCloud",
-                                        "apple-logout" => "退出手机当前的 Apple 账户",
-                                        _ => spec.hint,
-                                    }),
-                            )
-                        })
-                        .when(!operation_done && !query && !self.functions.busy, |panel| {
-                            panel.child(
-                                h_flex()
-                                    .justify_end()
-                                    .gap_1()
-                                    .when(self.function_has_text(spec) && !locked, |row| {
-                                        row.child(
-                                            Button::new("function-example")
-                                                .ghost()
-                                                .text_color(theme::toolbar_fg())
-                                                .small()
-                                                .h(px(26.))
-                                                .label("复制示例")
-                                                .icon(IconName::Copy)
-                                                .text_color(theme::accent(cx))
-                                                .disabled(locked)
-                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                    cx.write_to_clipboard(
-                                                        ClipboardItem::new_string(
-                                                            environments::example(
-                                                                spec,
-                                                                this.functions
-                                                                    .environment
-                                                                    .backup
-                                                                    .is_some(),
-                                                            ),
-                                                        ),
-                                                    )
-                                                })),
+                        .when(
+                            !operation_done
+                                && !self.functions.uncertain
+                                && !query
+                                && !self.functions.busy
+                                && self.functions.challenge.is_none()
+                                && !self.functions.verification_submitted,
+                            |panel| {
+                                panel.child(
+                                    h_flex()
+                                        .justify_end()
+                                        .gap_1()
+                                        .when(
+                                            self.function_has_text(spec)
+                                                && !locked
+                                                && spec.id != "cloud-login",
+                                            |row| {
+                                                row.child(
+                                                    Button::new("function-example")
+                                                        .ghost()
+                                                        .accessibility_label("复制示例")
+                                                        .icon(IconName::Copy)
+                                                        .text_color(theme::accent(cx))
+                                                        .disabled(locked)
+                                                        .on_click(cx.listener(
+                                                            move |this, _, _, cx| {
+                                                                cx.write_to_clipboard(
+                                                                    ClipboardItem::new_string(
+                                                                        environments::example(
+                                                                            spec,
+                                                                            this.functions
+                                                                                .environment
+                                                                                .backup
+                                                                                .is_some(),
+                                                                        ),
+                                                                    ),
+                                                                )
+                                                            },
+                                                        )),
+                                                )
+                                            },
                                         )
-                                    })
-                                    .when(
-                                        matches!(spec.id, "email-add" | "email-verify")
-                                            && self.functions.uncertain,
-                                        |row| {
+                                        .when(spec.id == "email-verify", |row| {
                                             row.child(
-                                                Button::new("function-email-rebind")
+                                                Button::new("function-email-refetch")
                                                     .ghost()
-                                                    .small()
-                                                    .h(px(26.))
-                                                    .label("重新发送绑定")
+                                                    .icon(IconName::Redo)
+                                                    .label("重新获取验证码")
                                                     .text_color(theme::accent(cx))
                                                     .disabled(!live || self.functions.busy)
                                                     .on_click(cx.listener(|this, _, _, cx| {
@@ -1281,197 +1918,191 @@ impl SessionView {
                                                             .read(cx)
                                                             .value()
                                                             .to_string();
-                                                        this.functions.email_rebinding = true;
-                                                        this.functions.email_rebind_operation =
-                                                            None;
                                                         this.send_function_command(
-                                                            FunctionCommand::RebindEmail { text },
+                                                            FunctionCommand::ReadEmailCode { text },
                                                         );
-                                                        this.functions.selected = OPERATIONS
-                                                            .iter()
-                                                            .find(|s| s.id == "email-add");
                                                         this.functions.busy = true;
-                                                        this.functions.result_open = false;
                                                         this.functions.message =
-                                                            "正在核对邮箱并初始化新绑定…".into();
+                                                            "正在重新读取最新邮件验证码…".into();
                                                         cx.notify();
                                                     })),
                                             )
-                                        },
-                                    )
-                                    .when(spec.id == "email-verify", |row| {
-                                        row.child(
-                                            Button::new("function-email-refetch")
-                                                .ghost()
-                                                .small()
-                                                .h(px(26.))
-                                                .icon(IconName::Redo)
-                                                .label("重新获取验证码")
-                                                .text_color(theme::accent(cx))
-                                                .disabled(!live || self.functions.busy)
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    if this.functions.busy {
-                                                        return;
-                                                    }
-                                                    let text = this
-                                                        .functions
-                                                        .text
-                                                        .read(cx)
-                                                        .value()
-                                                        .to_string();
-                                                    this.send_function_command(
-                                                        FunctionCommand::ReadEmailCode { text },
-                                                    );
-                                                    this.functions.busy = true;
-                                                    this.functions.message =
-                                                        "正在重新读取最新邮件验证码…".into();
-                                                    cx.notify();
-                                                })),
-                                        )
-                                    })
-                                    .child(div().flex_1())
-                                    .child(
-                                        Button::new("function-editor-cancel")
-                                            .ghost()
-                                            .bg(theme::toolbar())
-                                            .text_color(theme::toolbar_fg())
-                                            .disabled(locked)
-                                            .small()
-                                            .h(px(26.))
-                                            .label("取消")
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.functions.stash_panel();
-                                                this.functions.editor_hidden = true;
-                                                this.functions.environment.backup = None;
-                                                this.focus.focus(window, cx);
-                                                cx.notify();
-                                            })),
-                                    )
-                                    .when(self.functions.challenge.is_none(), |row| {
-                                        row.child(
-                                            Button::new("function-execute")
-                                                .loading(self.functions.busy)
-                                                .debug_selector(|| "function-execute".into())
-                                                .primary()
-                                                .small()
-                                                .h(px(26.))
-                                                .label(
-                                                    if spec.id == "store-login"
-                                                        || spec.id == "cloud-login"
-                                                    {
-                                                        "解析并登录"
-                                                    } else {
-                                                        match spec.id {
-                                                            "app-save" => "保存",
-                                                            "app-switch" => "切换",
-                                                            "app-delete" => "确认删除",
-                                                            "app-edit" => "保存修改",
-                                                            "store-logout" => "退出 App Store",
-                                                            "cloud-logout" => "退出 iCloud",
-                                                            "apple-logout" => "退出账户",
-                                                            "device-remove" => "确认移除其它设备",
-                                                            "email-add" => "添加并验证",
-                                                            "email-verify" => "验证",
-                                                            _ => "执行",
-                                                        }
-                                                    },
-                                                )
-                                                .bg(theme::accent(cx))
-                                                .text_color(theme::accent_fg(cx))
-                                                .disabled(
-                                                    !live
-                                                        || locked
-                                                        || (spec.id == "email-verify"
-                                                            && self.functions.email_needs_resume)
-                                                        || (matches!(
+                                        })
+                                        .child(div().flex_1())
+                                        .when(spec.task != 31, |row| {
+                                            row.child(
+                                                Button::new("function-editor-cancel")
+                                                    .ghost()
+                                                    .disabled(locked)
+                                                    .label("取消")
+                                                    .on_click(cx.listener(
+                                                        |this, _, window, cx| {
+                                                            this.functions.stash_panel();
+                                                            this.functions.editor_hidden = true;
+                                                            this.functions.environment.backup =
+                                                                None;
+                                                            this.focus.focus(window, cx);
+                                                            cx.notify();
+                                                        },
+                                                    )),
+                                            )
+                                        })
+                                        .when(self.functions.challenge.is_none(), |row| {
+                                            row.child(
+                                                Button::new("function-execute")
+                                                    .loading(self.functions.busy)
+                                                    .debug_selector(|| "function-execute".into())
+                                                    .primary()
+                                                    .label(
+                                                        if matches!(
                                                             spec.id,
-                                                            "apple-logout" | "cloud-logout"
-                                                        ) && self
-                                                            .functions
-                                                            .local_data_policy
-                                                            .is_none())
-                                                        || (needs_app(spec)
-                                                            && self.functions.target_app.is_none()),
-                                                )
-                                                .on_click(cx.listener(|this, _, window, cx| {
-                                                    this.execute_function(window, cx)
-                                                })),
-                                        )
-                                    })
-                                    .when(self.functions.challenge.is_some(), |row| {
-                                        row.child(
-                                            Button::new("function-read-code")
-                                                .small()
-                                                .h(px(26.))
-                                                .label("重新读取链接")
-                                                .disabled(!live || self.functions.busy)
-                                                .on_click(cx.listener(|this, _, _, _| {
-                                                    this.send_function_command(
-                                                        FunctionCommand::FetchCode,
+                                                            "store-login" | "cloud-login"
+                                                        ) {
+                                                            "登录"
+                                                        } else {
+                                                            match spec.id {
+                                                                "app-save" => "保存",
+                                                                "app-switch" => "切换",
+                                                                "app-delete" => "确认删除",
+                                                                "app-edit" => "保存修改",
+                                                                "store-logout" => "退出 App Store",
+                                                                "cloud-logout" => "退出 iCloud",
+                                                                "apple-logout" => "退出账户",
+                                                                "device-remove" => {
+                                                                    "确认移除其它设备"
+                                                                }
+                                                                "name" => "保存姓名",
+                                                                "forward" => "设置转发邮箱",
+                                                                "authorization-stop" => "停止授权",
+                                                                "email-add" => "添加并验证",
+                                                                "email-verify" => "验证",
+                                                                _ => "执行",
+                                                            }
+                                                        },
                                                     )
-                                                })),
-                                        )
-                                        .child(
-                                            Button::new("function-submit-code")
-                                                .primary()
-                                                .small()
-                                                .h(px(26.))
-                                                .label("提交验证码")
-                                                .bg(theme::accent(cx))
-                                                .text_color(theme::accent_fg(cx))
-                                                .disabled(!live || self.functions.busy)
-                                                .on_click(cx.listener(|this, _, window, cx| {
-                                                    this.submit_function_code(window, cx)
-                                                })),
-                                        )
-                                    }),
-                            )
-                        }),
+                                                    .primary()
+                                                    .disabled(
+                                                        !live
+                                                            || locked
+                                                            || (spec.id == "email-verify"
+                                                                && self
+                                                                    .functions
+                                                                    .email_needs_resume)
+                                                            || (matches!(
+                                                                spec.id,
+                                                                "apple-logout" | "cloud-logout"
+                                                            ) && self
+                                                                .functions
+                                                                .local_data_policy
+                                                                .is_none())
+                                                            || (needs_app(spec)
+                                                                && self
+                                                                    .functions
+                                                                    .target_app
+                                                                    .is_none()),
+                                                    )
+                                                    .on_click(cx.listener(
+                                                        |this, _, window, cx| {
+                                                            this.confirm_apple_operation(window, cx)
+                                                        },
+                                                    )),
+                                            )
+                                        }),
+                                )
+                            },
+                        ),
                 )
             })
             .when(
-                selected.is_some_and(|spec| matches!(spec.id, "store-login" | "cloud-login"))
-                    && self.functions.message.is_empty(),
+                !operation_done
+                    && !self.functions.uncertain
+                    && (self.functions.challenge.is_some()
+                        || self.functions.verification_submitted),
                 |panel| {
                     panel.child(
                         h_flex()
+                            .debug_selector(|| "function-verification-row".into())
+                            .items_center()
                             .gap_1()
-                            .text_size(px(11.))
-                            .text_color(theme::toolbar_muted())
-                            .child(Icon::new(IconName::Info).size(px(12.)))
-                            .child("需要验证时，再读取链接。"),
-                    )
-                },
-            )
-            .when(
-                self.functions.challenge.is_some() && !self.functions.busy,
-                |panel| {
-                    panel.child(
-                        Button::new("function-cancel-verification")
-                            .ghost()
-                            .text_color(theme::toolbar_fg())
-                            .small()
-                            .h(px(26.))
-                            .label("取消验证码验证")
-                            .disabled(!live || self.functions.busy)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                if let (Some((_, operation_id)), Some(challenge_id)) = (
-                                    this.functions.operation.clone(),
-                                    this.functions.challenge.clone(),
-                                ) {
-                                    this.send_function_command(FunctionCommand::CancelChallenge {
-                                        operation_id,
-                                        challenge_id,
-                                    });
-                                    this.functions.busy = true;
-                                    cx.notify();
-                                }
-                            })),
+                            .child(
+                                Input::new(&self.functions.verification_text)
+                                    .flex_1()
+                                    .min_w_0()
+                                    .aria_label("六位验证码")
+                                    .readonly(locked),
+                            )
+                            .when(self.functions.challenge.is_some(), |row| {
+                                row.child(
+                                    Button::new("function-read-code")
+                                        .debug_selector(|| "function-read-code".into())
+                                        .ghost()
+                                        .icon(IconName::Redo)
+                                        .loading(locked)
+                                        .accessibility_label("获取验证码")
+                                        .disabled(!live || locked)
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            if !this.functions.available
+                                                || this.functions.busy
+                                                || this.view_only()
+                                            {
+                                                return;
+                                            }
+                                            this.functions.busy = true;
+                                            this.functions.message = "正在获取验证码…".into();
+                                            this.send_function_command(FunctionCommand::FetchCode);
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(
+                                    Button::new("function-submit-code")
+                                        .debug_selector(|| "function-submit-code".into())
+                                        .primary()
+                                        .icon(IconName::Check)
+                                        .accessibility_label("提交验证码")
+                                        .disabled(
+                                            !live
+                                                || locked
+                                                || !rv_session::functions::valid_code(
+                                                    self.functions
+                                                        .verification_text
+                                                        .read(cx)
+                                                        .value()
+                                                        .trim(),
+                                                ),
+                                        )
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.submit_function_code(window, cx)
+                                        })),
+                                )
+                                .child(
+                                    Button::new("function-cancel-verification")
+                                        .ghost()
+                                        .icon(IconName::Close)
+                                        .accessibility_label("取消验证")
+                                        .disabled(!live || locked)
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            if let (Some((_, operation_id)), Some(challenge_id)) = (
+                                                this.functions.operation.clone(),
+                                                this.functions.challenge.clone(),
+                                            ) {
+                                                this.send_function_command(
+                                                    FunctionCommand::CancelChallenge {
+                                                        operation_id,
+                                                        challenge_id,
+                                                    },
+                                                );
+                                                this.functions.busy = true;
+                                                this.functions.message = "正在取消验证…".into();
+                                                cx.notify();
+                                            }
+                                        })),
+                                )
+                            }),
                     )
                 },
             )
             .when(!live, |panel| {
-                panel.child(div().text_xs().text_color(theme::toolbar_muted()).child(
+                panel.child(div().text_xs().text_color(theme::muted(cx)).child(
                     if self.view_only() {
                         "只读连接不能执行手机操作"
                     } else {
@@ -1479,34 +2110,41 @@ impl SessionView {
                     },
                 ))
             })
-            .when(self.functions.busy, |panel| {
-                panel.child(
-                    h_flex()
-                        .id("function-query-loading")
-                        .debug_selector(|| "function-query-loading".into())
-                        .items_center()
-                        .gap_2()
-                        .py_2()
-                        .child(
-                            gpui_component::spinner::Spinner::new()
-                                .small()
-                                .color(theme::toolbar_muted()),
-                        )
-                        .child(
-                            div()
-                                .debug_selector(|| "function-operation-message".into())
-                                .text_xs()
-                                .text_color(theme::toolbar_muted())
-                                .child(if query {
-                                    SharedString::from("正在读取…")
-                                } else if self.functions.message.is_empty() {
-                                    SharedString::from("正在处理…")
+            .when(
+                self.functions.busy && self.functions.challenge.is_none(),
+                |panel| {
+                    panel.child(
+                        div()
+                            .debug_selector(|| "function-operation-message".into())
+                            .child(function_loading(
+                                "function-query-loading",
+                                selected.map(|spec| spec.title).unwrap_or("手机操作"),
+                                if self.functions.message.is_empty() {
+                                    if query {
+                                        "正在读取…"
+                                    } else {
+                                        "正在处理…"
+                                    }
+                                    .into()
                                 } else {
                                     self.functions.message.clone()
-                                }),
-                        ),
-                )
-            })
+                                },
+                                cx,
+                            ))
+                            .when(selected.is_some_and(|spec| spec.task == 32), |body| {
+                                let progress = self
+                                    .functions
+                                    .result
+                                    .as_ref()
+                                    .map(|record| &record["progress"]);
+                                body.child(crate::ui::operation_progress(
+                                    "function-app-progress",
+                                    progress,
+                                ))
+                            }),
+                    )
+                },
+            )
             .when(
                 !completed && !self.functions.message.is_empty() && !self.functions.busy,
                 |panel| {
@@ -1514,32 +2152,14 @@ impl SessionView {
                         div()
                             .debug_selector(|| "function-operation-message".into())
                             .text_xs()
-                            .child(self.functions.message.clone()),
-                    )
-                },
-            )
-            .when(
-                self.functions.query_target().is_some() && !self.functions.busy,
-                |panel| {
-                    panel.child(
-                        Button::new("function-query")
-                            .ghost()
-                            .text_color(theme::toolbar_fg())
-                            .small()
-                            .h(px(26.))
-                            .debug_selector(|| "function-query-resume".into())
-                            .label("查询原操作结果")
-                            .disabled(!live || self.functions.busy)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                if let Some((task, operation_id)) = this.functions.query_target() {
-                                    this.send_function_command(FunctionCommand::Resume {
-                                        task,
-                                        operation_id,
-                                    });
-                                    this.functions.busy = true;
-                                    cx.notify();
-                                }
-                            })),
+                            .text_color(theme::muted(cx))
+                            .child(if self.functions.uncertain {
+                                SharedString::from(
+                                    "结果待确认。请查询原操作结果；也可返回菜单读取账户资料核实。",
+                                )
+                            } else {
+                                self.functions.message.clone()
+                            }),
                     )
                 },
             )
@@ -1553,30 +2173,25 @@ impl SessionView {
                         .gap_2()
                         .py_1()
                         .items_start()
-                        .child(
-                            Icon::new(IconName::Check)
-                                .size(px(15.))
-                                .text_color(rgb(0x7cc4a4)),
-                        )
+                        .child(Icon::new(IconName::Check).text_color(theme::success(cx)))
                         .child(
                             v_flex()
                                 .gap_1()
                                 .flex_1()
-                                .child(div().text_size(px(12.)).child(title))
+                                .child(div().text_sm().child(title))
                                 .when(!detail.is_empty(), |text| {
                                     text.child(
-                                        div()
-                                            .text_size(px(11.))
-                                            .text_color(theme::toolbar_muted())
-                                            .child(detail),
+                                        div().text_xs().text_color(theme::muted(cx)).child(detail),
                                     )
                                 }),
                         ),
                 )
             })
+            .when(query && completed, |panel| {
+                panel.child(self.render_apple_query_result(cx))
+            })
             .when(
-                !query
-                    && !self.functions.busy
+                !self.functions.busy
                     && self
                         .functions
                         .result
@@ -1585,41 +2200,41 @@ impl SessionView {
                 |panel| {
                     panel.child(
                         h_flex()
-                            .justify_end()
+                            .debug_selector(|| "function-result-toolbar".into())
+                            .items_center()
                             .gap_1()
                             .child(
                                 Button::new("function-view-result")
+                                    .debug_selector(|| "function-view-result".into())
                                     .ghost()
-                                    .small()
-                                    .h(px(24.))
-                                    .text_color(theme::toolbar_muted())
-                                    .label(if self.functions.result_open {
-                                        "收起详情"
+                                    .icon(IconName::SquareTerminal)
+                                    .selected(self.functions.result_open)
+                                    .text_color(theme::muted(cx))
+                                    .accessibility_label(if self.functions.result_open {
+                                        "收起原始结果"
                                     } else {
-                                        "详情"
+                                        "展开原始结果"
                                     })
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.functions.result_open = !this.functions.result_open;
                                         cx.notify();
                                     })),
                             )
-                            .when(self.functions.result_open, |row| {
-                                row.child(
-                                    Button::new("function-copy-result")
-                                        .ghost()
-                                        .size(px(24.))
-                                        .icon(Icon::new(IconName::Copy).size(px(14.)))
-                                        .text_color(theme::toolbar_muted())
-                                        .tooltip("复制原始结果")
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            if let Some(result) = &this.functions.result {
-                                                cx.write_to_clipboard(ClipboardItem::new_string(
-                                                    function_response_text(result),
-                                                ));
-                                            }
-                                        })),
-                                )
-                            }),
+                            .child(div().flex_1())
+                            .child(
+                                Button::new("function-copy-result")
+                                    .ghost()
+                                    .icon(IconName::Copy)
+                                    .text_color(theme::muted(cx))
+                                    .accessibility_label("复制原始结果")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        if let Some(result) = &this.functions.result {
+                                            cx.write_to_clipboard(ClipboardItem::new_string(
+                                                function_response_text(result),
+                                            ));
+                                        }
+                                    })),
+                            ),
                     )
                 },
             )
@@ -1629,32 +2244,21 @@ impl SessionView {
                     .as_ref()
                     .is_some_and(|record| record["status"] == "completed")
                     && !self.functions.busy
-                    && (query || self.functions.result_open),
+                    && self.functions.result_open,
                 |panel| {
-                    let text = self
-                        .functions
-                        .result
-                        .as_ref()
-                        .map(function_response_text)
-                        .unwrap_or_default();
                     panel.child(
                         div()
                             .id("function-result-text")
                             .debug_selector(|| "function-result-text".into())
-                            .p_2()
-                            .rounded_md()
-                            .bg(rgb(0x151b22))
-                            .font_family("Menlo")
-                            .text_color(theme::toolbar_muted())
-                            .border_1()
-                            .border_color(theme::toolbar_line())
-                            .max_h(px(
-                                (height - if side_by_side { 156. } else { 116. }).clamp(60., 320.)
-                            ))
-                            .overflow_scroll()
-                            .text_size(px(11.))
-                            .line_height(px(17.))
-                            .child(div().whitespace_nowrap().child(raw_json_text(text))),
+                            .w_full()
+                            .min_w_0()
+                            .child(
+                                Editor::new(&self.functions.result_editor)
+                                    .readonly(true)
+                                    .aria_label("ZXTouch 原始返回结果")
+                                    .h(px((height - if side_by_side { 156. } else { 116. })
+                                        .clamp(60., 320.))),
+                            ),
                     )
                 },
             )
@@ -1671,47 +2275,6 @@ fn function_response_text(record: &serde_json::Value) -> String {
     serde_json::to_string_pretty(&response).unwrap_or_default()
 }
 
-fn raw_json_text(text: String) -> gpui::StyledText {
-    let mut highlights = Vec::new();
-    let bytes = text.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] != b'"' {
-            i += 1;
-            continue;
-        }
-        let start = i;
-        i += 1;
-        while i < bytes.len() {
-            match bytes[i] {
-                b'\\' => i = (i + 2).min(bytes.len()),
-                b'"' => {
-                    i += 1;
-                    break;
-                }
-                _ => i += 1,
-            }
-        }
-        let end = i;
-        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        let color = if bytes.get(i) == Some(&b':') {
-            rgb(0x9cc7ec)
-        } else {
-            rgb(0xdddbc7)
-        };
-        highlights.push((
-            start..end,
-            gpui::HighlightStyle {
-                color: Some(color.into()),
-                ..Default::default()
-            },
-        ));
-    }
-    gpui::StyledText::new(text).with_highlights(highlights)
-}
-
 fn domain_signed(state: Option<&serde_json::Value>, domain: &str) -> Option<bool> {
     let section = &state?[domain];
     match section["status"].as_str() {
@@ -1721,27 +2284,86 @@ fn domain_signed(state: Option<&serde_json::Value>, domain: &str) -> Option<bool
     }
 }
 fn account_action_requires_state(id: &str) -> bool {
-    matches!(id, "store-login" | "store-logout" | "cloud-login" | "cloud-logout" | "apple-logout" | "findmy-off")
+    matches!(
+        id,
+        "store-login"
+            | "store-logout"
+            | "cloud-login"
+            | "cloud-logout"
+            | "apple-logout"
+            | "findmy-off"
+    ) || apple_profile_action(id)
+        || matches!(id, "device-list" | "device-remove")
+}
+fn apple_profile_action(id: &str) -> bool {
+    matches!(
+        id,
+        "name"
+            | "name-query"
+            | "email-add"
+            | "email-verify"
+            | "email-query"
+            | "forward"
+            | "authorization-list"
+            | "authorization-stop"
+    )
 }
 fn account_action_known(id: &str, state: Option<&serde_json::Value>) -> bool {
     match id {
         "store-login" | "store-logout" => domain_signed(state, "app_store").is_some(),
-        "cloud-login" | "cloud-logout" => domain_signed(state, "icloud").is_some(),
-        "findmy-off" => domain_signed(state, "icloud").is_some() && state.and_then(|s| s["icloud"]["find_my_enabled"].as_bool()).is_some(),
-        "apple-logout" => ["app_store", "icloud", "identity"].iter().all(|d| domain_signed(state, d).is_some()),
+        "cloud-login" => {
+            domain_signed(state, "app_store") == Some(true)
+                && state.is_some_and(|state| state["app_store"]["account"]["authenticated"] == true)
+                && domain_signed(state, "icloud").is_some()
+        }
+        "cloud-logout" => domain_signed(state, "icloud").is_some(),
+        "findmy-off" => {
+            domain_signed(state, "icloud").is_some()
+                && state
+                    .and_then(|s| s["icloud"]["find_my_enabled"].as_bool())
+                    .is_some()
+        }
+        "apple-logout" => ["app_store", "icloud", "identity"]
+            .iter()
+            .all(|d| domain_signed(state, d).is_some()),
+        "device-list" | "device-remove" => domain_signed(state, "icloud").is_some(),
+        id if apple_profile_action(id) => {
+            domain_signed(state, "icloud").is_some() && domain_signed(state, "identity").is_some()
+        }
         _ => true,
     }
 }
 fn account_action_visible(id: &str, state: Option<&serde_json::Value>) -> bool {
     match id {
-        "store-login" => domain_signed(state, "app_store") != Some(true),
-        "store-logout" => domain_signed(state, "app_store") != Some(false),
-        "cloud-login" => !(domain_signed(state, "icloud") == Some(true) && state.and_then(|s| s["icloud"]["account"]["enabled_dataclasses"].as_array()).is_some_and(|classes| !classes.is_empty())),
-        "cloud-logout" => domain_signed(state, "icloud") != Some(false),
-        "apple-logout" => !["app_store", "icloud", "identity"].iter().all(|d| domain_signed(state, d) == Some(false)),
-        "findmy-off" => domain_signed(state, "icloud") != Some(false) && state.and_then(|s|s["icloud"]["find_my_enabled"].as_bool()) != Some(false),
+        "store-login" => domain_signed(state, "app_store") == Some(false),
+        "store-logout" => domain_signed(state, "app_store") == Some(true),
+        "cloud-login" => {
+            domain_signed(state, "icloud") == Some(false)
+                && domain_signed(state, "app_store") == Some(true)
+                && state.is_some_and(|state| state["app_store"]["account"]["authenticated"] == true)
+        }
+        "cloud-logout" => domain_signed(state, "icloud") == Some(true),
+        "apple-logout" => ["app_store", "icloud", "identity"]
+            .iter()
+            .any(|d| domain_signed(state, d) == Some(true)),
+        "findmy-off" => {
+            domain_signed(state, "icloud") == Some(true)
+                && state.and_then(|s| s["icloud"]["find_my_enabled"].as_bool()) == Some(true)
+        }
+        "device-list" | "device-remove" => domain_signed(state, "icloud") == Some(true),
+        id if apple_profile_action(id) => {
+            domain_signed(state, "identity") == Some(true)
+                || domain_signed(state, "icloud") == Some(true)
+        }
         _ => true,
     }
+}
+
+fn is_login_action(spec: &OperationSpec) -> bool {
+    matches!(
+        spec.id,
+        "store-login" | "cloud-login" | "store-logout" | "cloud-logout" | "apple-logout"
+    )
 }
 
 fn is_query(spec: &OperationSpec) -> bool {
@@ -1800,7 +2422,7 @@ fn result_summary(record: &serde_json::Value) -> (String, String) {
     (title.into(), detail)
 }
 
-fn function_error_message(record: &serde_json::Value) -> &'static str {
+pub(super) fn function_error_message(record: &serde_json::Value) -> &'static str {
     if record["error"]["domain"] == "org.trollvnc.apple" {
         match record["error"]["code"].as_i64() {
             Some(1) => "手机暂不支持此操作",
@@ -1811,10 +2433,27 @@ fn function_error_message(record: &serde_json::Value) -> &'static str {
             Some(7) => "手机账户状态不一致",
             Some(8) => "账户验证未通过",
             Some(9) => "验证码无效或已过期",
-            _ => "操作未完成，请查看详情",
+            _ => "操作未完成",
+        }
+    } else if record["error"]["domain"] == "TVAppStateServices" {
+        match record["error"]["reason"].as_str() {
+            Some("restore_pending") => "当前环境恢复未完成",
+            Some("name_required") => "当前环境尚未命名",
+            Some("store_busy") => "备份目录正被占用",
+            Some("archive_unavailable") => "所选备份已不存在",
+            Some("invalid_archive") => "备份文件校验失败",
+            Some("keychain_failed") => "凭据恢复失败",
+            Some("identity_failed") => "设备身份恢复失败",
+            _ => match record["error"]["code"].as_i64() {
+                Some(1) => "无法准备手机环境服务",
+                Some(2) => "手机环境操作失败",
+                Some(3) => "操作结束，但临时文件清理失败",
+                Some(4) => "手机操作结果未确认",
+                _ => "手机环境操作失败",
+            },
         }
     } else {
-        "操作未完成，请查看详情"
+        "操作未完成"
     }
 }
 
@@ -1896,33 +2535,42 @@ mod tests {
     use super::{FunctionCommand, FunctionEvent, OPERATIONS, SessionView};
     use gpui::{Entity, TestAppContext, VisualTestContext, px, size};
 
+    fn account_fixture(store_signed: bool) -> serde_json::Value {
+        serde_json::json!({
+            "app_store":if store_signed { serde_json::json!({"status":"signed_in","account":{"apple_id":"demo@example.test","authenticated":true}}) }
+                else { serde_json::json!({"status":"not_signed_in","account":null}) },
+            "icloud":{"status":"signed_in","account":{"apple_id":"demo@example.test","enabled_dataclasses":["contacts"]},"find_my_enabled":true},
+            "identity":{"status":"signed_in","account":{"apple_id":"demo@example.test"}}
+        })
+    }
     fn enable(view: &Entity<SessionView>, cx: &mut VisualTestContext) {
         view.update(cx, |view, cx| {
             view.functions.open = true;
             view.apply_function_event(FunctionEvent::Available(true), cx);
+            view.apply_function_event(FunctionEvent::AccountState(Ok(account_fixture(false))), cx);
         });
     }
     #[test]
     fn menu_actions_follow_independent_account_domains() {
         use serde_json::json;
-        let mut state=json!({"app_store":{"status":"signed_in","account":{"authenticated":true}},
+        let mut state = json!({"app_store":{"status":"signed_in","account":{"authenticated":true}},
             "icloud":{"status":"not_signed_in","account":null},"identity":{"status":"signed_in","account":{}}});
-        assert!(!super::account_action_visible("store-login",Some(&state)));
-        assert!(super::account_action_visible("store-logout",Some(&state)));
-        assert!(super::account_action_visible("cloud-login",Some(&state)));
-        assert!(!super::account_action_visible("cloud-logout",Some(&state)));
-        assert!(!super::account_action_visible("findmy-off",Some(&state)));
-        state["icloud"]=json!({"status":"signed_in","account":{"enabled_dataclasses":["contacts"]},"find_my_enabled":false});
-        assert!(!super::account_action_visible("cloud-login",Some(&state)));
-        assert!(super::account_action_visible("cloud-logout",Some(&state)));
-        assert!(!super::account_action_visible("findmy-off",Some(&state)));
-        state["icloud"]["find_my_enabled"]=json!(true);
-        assert!(super::account_action_visible("findmy-off",Some(&state)));
-        state["icloud"]["account"]["enabled_dataclasses"]=json!([]);
-        assert!(super::account_action_visible("cloud-login",Some(&state)));
-        state["app_store"]=json!({"status":"conflict","account":null});
-        assert!(!super::account_action_known("store-login",Some(&state)));
-        assert!(!super::account_action_known("store-login",None));
+        assert!(!super::account_action_visible("store-login", Some(&state)));
+        assert!(super::account_action_visible("store-logout", Some(&state)));
+        assert!(super::account_action_visible("cloud-login", Some(&state)));
+        assert!(!super::account_action_visible("cloud-logout", Some(&state)));
+        assert!(!super::account_action_visible("findmy-off", Some(&state)));
+        state["icloud"] = json!({"status":"signed_in","account":{"enabled_dataclasses":["contacts"]},"find_my_enabled":false});
+        assert!(!super::account_action_visible("cloud-login", Some(&state)));
+        assert!(super::account_action_visible("cloud-logout", Some(&state)));
+        assert!(!super::account_action_visible("findmy-off", Some(&state)));
+        state["icloud"]["find_my_enabled"] = json!(true);
+        assert!(super::account_action_visible("findmy-off", Some(&state)));
+        state["icloud"]["account"]["enabled_dataclasses"] = json!([]);
+        assert!(!super::account_action_visible("cloud-login", Some(&state)));
+        state["app_store"] = json!({"status":"conflict","account":null});
+        assert!(!super::account_action_known("store-login", Some(&state)));
+        assert!(!super::account_action_known("store-login", None));
     }
     #[test]
     fn selected_app_cannot_be_overridden_by_pasted_text() {
@@ -1944,7 +2592,7 @@ mod tests {
         );
     }
     #[gpui::test]
-    fn successful_logout_hides_actions_and_opens_raw_result(cx: &mut TestAppContext) {
+    fn successful_logout_notifies_and_keeps_a_new_form(cx: &mut TestAppContext) {
         let (view, cx, _) = setup(cx, false);
         cx.update(|window, cx| {
             view.update(cx, |view, cx| {
@@ -1952,10 +2600,10 @@ mod tests {
             });
             window.draw(cx).clear(cx);
         });
-        assert!(cx.debug_bounds("function-result-summary").is_some());
-        assert!(cx.debug_bounds("function-result-text").is_some());
-        assert!(cx.debug_bounds("function-execute").is_none());
-        assert!(cx.debug_bounds("logout-data-keep").is_none());
+        assert!(cx.debug_bounds("function-result-summary").is_none());
+        assert!(cx.debug_bounds("function-result-text").is_none());
+        assert!(cx.debug_bounds("function-execute").is_some());
+        assert!(cx.debug_bounds("logout-data-keep").is_some());
         assert_eq!(
             super::result_summary(
                 &serde_json::json!({"method":"signOutAppleID","result":{"completed_domains":["icloud","identity","media"]}})
@@ -1980,6 +2628,26 @@ mod tests {
     }
 
     #[gpui::test]
+    fn function_tabs_can_switch_repeatedly_without_hover_style_conflicts(cx: &mut TestAppContext) {
+        let (view, cx, _) = setup(cx, false);
+        enable(&view, cx);
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        for (category, selector) in [
+            ("App 环境", "function-tab-App 环境"),
+            ("Apple", "function-tab-Apple"),
+            ("App 环境", "function-tab-App 环境"),
+            ("Apple", "function-tab-Apple"),
+        ] {
+            let bounds = cx.debug_bounds(selector).unwrap();
+            cx.simulate_click(bounds.center(), gpui::Modifiers::default());
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            view.read_with(cx, |view, _| {
+                assert_eq!(view.functions.environment.open, category == "App 环境");
+            });
+        }
+    }
+
+    #[gpui::test]
     fn query_click_starts_once_shows_loading_and_needs_no_confirmation(cx: &mut TestAppContext) {
         let (view, cx, mut peer) = setup(cx, false);
         enable(&view, cx);
@@ -1990,7 +2658,19 @@ mod tests {
         });
         while peer.commands.try_recv().map(unscoped).is_ok() {}
         cx.update(|window, cx| window.draw(cx).clear(cx));
+        let list = cx.debug_bounds("function-list").unwrap();
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position: list.center(),
+            delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(-260.))),
+            modifiers: Default::default(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
         let bounds = cx.debug_bounds("function-authorization-list").unwrap();
+        assert!(
+            bounds.center().y < list.bottom(),
+            "query must be scrolled into view: {bounds:?}"
+        );
         cx.simulate_click(bounds.center(), gpui::Modifiers::default());
         cx.update(|window, cx| window.draw(cx).clear(cx));
         assert!(cx.debug_bounds("function-query-loading").is_some());
@@ -2023,6 +2703,11 @@ mod tests {
         cx.update(|window, cx| window.draw(cx).clear(cx));
         assert!(cx.debug_bounds("function-query-loading").is_none());
         assert!(cx.debug_bounds("function-result-summary").is_none());
+        assert!(cx.debug_bounds("function-query-content").is_some());
+        assert!(cx.debug_bounds("function-result-text").is_none());
+        let details = cx.debug_bounds("function-view-result").unwrap();
+        cx.simulate_click(details.center(), gpui::Modifiers::default());
+        cx.update(|window, cx| window.draw(cx).clear(cx));
         assert!(cx.debug_bounds("function-result-text").is_some());
         cx.update(|window, cx| view.update(cx, |view, cx| view.close_function_editor(window, cx)));
         view.read_with(cx, |view, _| {
@@ -2035,6 +2720,302 @@ mod tests {
         assert!(cx.debug_bounds("function-authorization-list").is_some());
         assert!(cx.debug_bounds("function-editor").is_none());
         assert!(cx.debug_bounds("function-execute").is_none());
+    }
+
+    #[gpui::test]
+    fn completed_unknown_login_notifies_and_allows_an_explicit_new_attempt(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let (view, cx, mut peer) = setup(cx, false);
+        enable(&view, cx);
+        while peer.commands.try_recv().is_ok() {}
+        view.update(cx, |view, cx| {
+            view.functions.selected = OPERATIONS.iter().find(|spec| spec.id == "cloud-login");
+            view.apply_function_event(FunctionEvent::VerificationCodeReceived("053322".into()), cx);
+            view.apply_function_event(
+                FunctionEvent::State {
+                    task: 31,
+                    record: serde_json::json!({
+                        "operation_id":"cloud-old", "method":"enableICloud", "status":"completed",
+                        "result":{"outcome":"unknown","signed_in_domains":["identity","media"]}
+                    }),
+                },
+                cx,
+            );
+            assert_eq!(view.functions.pending_results.len(), 1);
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.background_executor
+            .advance_clock(std::time::Duration::from_millis(500));
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(cx.debug_bounds("function-input-area").is_some());
+        assert!(cx.debug_bounds("function-execute").is_some());
+        assert!(cx.debug_bounds("function-query-resume").is_none());
+        assert!(cx.debug_bounds("function-result-text").is_none());
+        assert!(cx.debug_bounds("function-notification-details").is_some());
+        assert!(
+            peer.commands.try_recv().is_err(),
+            "a notification must not replay login"
+        );
+        view.update(cx, |view, cx| {
+            assert!(!view.functions.uncertain);
+            assert!(view.functions.result.is_none());
+            assert!(view.functions.operation.is_none());
+            view.functions.next_cloud_preparation += 1;
+            let token = view.functions.next_cloud_preparation;
+            view.functions.cloud_preparation = Some(token);
+            view.functions.busy = true;
+            let spec = view.functions.selected.unwrap();
+            let parsed = super::parse_operation(spec, "new-password").unwrap();
+            view.finish_cloud_login_preparation(
+                token,
+                parsed,
+                Ok(Some(rv_core::UnlockCode::new("001234".into()).unwrap())),
+                cx,
+            );
+        });
+        assert!(matches!(peer.commands.try_recv().map(unscoped).unwrap(),
+            rv_session::SessionCommand::Function(FunctionCommand::Invoke {id, text})
+                if id == "cloud-login" && text.contains("new-password")));
+        // Viewing the immutable historical result must not replace the running new request.
+        let bounds = cx.debug_bounds("function-notification-details").unwrap();
+        cx.simulate_mouse_move(bounds.center(), None, gpui::Modifiers::default());
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let bounds = cx.debug_bounds("function-notification-details").unwrap();
+        cx.simulate_click(bounds.center(), gpui::Modifiers::default());
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(cx.debug_bounds("function-notification-result").is_some());
+        view.read_with(cx, |view, _| assert!(view.functions.busy));
+        assert!(peer.commands.try_recv().is_err());
+    }
+
+    #[gpui::test]
+    fn completed_cloud_result_stops_loading_even_after_account_refresh(cx: &mut TestAppContext) {
+        let (view, cx, _) = setup(cx, false);
+        enable(&view, cx);
+        view.update(cx, |view, cx| {
+            view.functions.selected = OPERATIONS.iter().find(|spec| spec.id == "cloud-login");
+            view.functions.busy = true;
+            view.apply_function_event(
+                FunctionEvent::AccountState(Ok(serde_json::json!({
+                    "icloud":{"status":"signed_in","account":{"enabled_dataclasses":["contacts"]}}
+                }))),
+                cx,
+            );
+            // A saved account alone is not the native operation's terminal reply.
+            assert!(view.functions.busy);
+            view.apply_function_event(
+                FunctionEvent::ForOperation {
+                    id: "cloud-login".into(),
+                    event: Box::new(FunctionEvent::State {
+                        task: 31,
+                        record: serde_json::json!({"operation_id":"cloud", "method":"enableICloud",
+                        "status":"completed", "result":{"outcome":"succeeded"}}),
+                    }),
+                },
+                cx,
+            );
+            assert!(!view.functions.busy);
+            assert!(!view.functions.uncertain);
+            view.apply_function_event(FunctionEvent::AccountStateLoading, cx);
+            assert!(!view.functions.busy);
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(cx.debug_bounds("function-query-loading").is_none());
+        assert!(cx.debug_bounds("function-result-text").is_none());
+        assert!(cx.debug_bounds("function-input-area").is_some());
+    }
+
+    #[gpui::test]
+    fn completed_logout_is_fresh_after_login_and_can_run_again(cx: &mut TestAppContext) {
+        let (view, cx, mut peer) = setup(cx, false);
+        enable(&view, cx);
+        while peer.commands.try_recv().is_ok() {}
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                let logout = OPERATIONS
+                    .iter()
+                    .find(|spec| spec.id == "store-logout")
+                    .unwrap();
+                let login = OPERATIONS
+                    .iter()
+                    .find(|spec| spec.id == "store-login")
+                    .unwrap();
+                view.apply_function_event(
+                    FunctionEvent::AccountState(Ok(account_fixture(true))),
+                    cx,
+                );
+                view.select_function(logout, window, cx);
+                view.execute_function(window, cx);
+                view.apply_function_event(FunctionEvent::State { task:31, record:serde_json::json!({
+                "operation_id":"logout-1", "method":"signOutAppStore", "status":"completed",
+                "result":{"outcome":"succeeded"}
+            })}, cx);
+                assert!(!view.functions.busy);
+                view.apply_function_event(
+                    FunctionEvent::AccountState(Ok(account_fixture(false))),
+                    cx,
+                );
+                view.select_function(login, window, cx);
+                view.functions.text.update(cx, |input, cx| {
+                    input.set_value("demo@test----test-secret", window, cx)
+                });
+                view.execute_function(window, cx);
+                view.apply_function_event(FunctionEvent::State { task:31, record:serde_json::json!({
+                "operation_id":"login-1", "method":"signInAppStore", "status":"completed",
+                "result":{"outcome":"succeeded"}
+            })}, cx);
+                view.apply_function_event(
+                    FunctionEvent::AccountState(Ok(account_fixture(true))),
+                    cx,
+                );
+                view.select_function(logout, window, cx);
+                assert!(view.functions.result.is_none());
+                assert!(!view.functions.result_open);
+                view.execute_function(window, cx);
+                assert!(view.functions.busy);
+                // A second click while this new operation runs must not create another invocation.
+                view.select_function(logout, window, cx);
+                view.execute_function(window, cx);
+            })
+        });
+        let mut ids = Vec::new();
+        while let Ok(command) = peer.commands.try_recv().map(unscoped) {
+            if let rv_session::SessionCommand::Function(FunctionCommand::Invoke { id, .. }) =
+                command
+            {
+                ids.push(id);
+            }
+        }
+        assert_eq!(ids, ["store-logout", "store-login", "store-logout"]);
+    }
+
+    #[gpui::test]
+    fn unknown_logout_remains_visible_after_account_state_changes(cx: &mut TestAppContext) {
+        let (view, cx, mut peer) = setup(cx, false);
+        enable(&view, cx);
+        while peer.commands.try_recv().is_ok() {}
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                let logout = OPERATIONS
+                    .iter()
+                    .find(|spec| spec.id == "store-logout")
+                    .unwrap();
+                let query = OPERATIONS
+                    .iter()
+                    .find(|spec| spec.id == "name-query")
+                    .unwrap();
+                view.apply_function_event(
+                    FunctionEvent::AccountState(Ok(account_fixture(true))),
+                    cx,
+                );
+                view.select_function(logout, window, cx);
+                view.apply_function_event(FunctionEvent::State {task:31, record:serde_json::json!({
+                "operation_id":"logout-unknown", "method":"signOutAppStore", "status":"running"
+            })}, cx);
+                view.apply_function_event(FunctionEvent::Uncertain("结果待确认".into()), cx);
+                view.apply_function_event(
+                    FunctionEvent::AccountState(Ok(account_fixture(false))),
+                    cx,
+                );
+                view.select_function(query, window, cx);
+                view.select_function(logout, window, cx);
+                assert!(view.functions.uncertain);
+                assert_eq!(
+                    view.functions.operation.as_ref().unwrap().1,
+                    "logout-unknown"
+                );
+                assert!(view.functions.has_pending(logout));
+                view.execute_function(window, cx);
+            })
+        });
+        // Switching to a read-only query is allowed; no duplicate logout is issued.
+        while let Ok(command) = peer.commands.try_recv().map(unscoped) {
+            assert!(!matches!(command,
+                rv_session::SessionCommand::Function(FunctionCommand::Invoke {id, ..}) if id == "store-logout"));
+        }
+    }
+
+    #[gpui::test]
+    fn code_timeout_keeps_manual_challenge_and_hides_unrelated_actions(cx: &mut TestAppContext) {
+        let (view, cx, mut peer) = setup(cx, false);
+        enable(&view, cx);
+        while peer.commands.try_recv().is_ok() {}
+        cx.update(|window, cx| view.update(cx, |view, cx| {
+            let login = OPERATIONS.iter().find(|spec| spec.id == "store-login").unwrap();
+            view.select_function(login, window, cx);
+            view.apply_function_event(FunctionEvent::State { task:31, record:serde_json::json!({
+                "operation_id":"login-pending", "method":"signInAppStore", "status":"requires_verification_code",
+                "challenge":{"challenge_id":"challenge"}
+            })}, cx);
+            view.apply_function_event(FunctionEvent::CodeFetchWaiting { remaining_seconds:0 }, cx);
+            assert!(!view.functions.busy);
+            assert!(!view.functions.uncertain);
+            assert_eq!(view.functions.challenge.as_deref(), Some("challenge"));
+            assert_eq!(view.functions.message, "请手动输入验证码");
+            view.select_function(login, window, cx);
+            assert_eq!(view.functions.operation.as_ref().unwrap().1, "login-pending");
+        }));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(cx.debug_bounds("function-verification-row").is_some());
+        assert!(cx.debug_bounds("function-read-code").is_some());
+        assert!(cx.debug_bounds("function-submit-code").is_some());
+        assert!(cx.debug_bounds("function-query-resume").is_none());
+        assert!(cx.debug_bounds("function-input-area").is_none());
+        assert!(cx.debug_bounds("function-execute").is_none());
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.functions
+                    .verification_text
+                    .update(cx, |input, cx| input.set_value("053322", window, cx));
+                view.submit_function_code(window, cx);
+            })
+        });
+        assert!(matches!(peer.commands.try_recv().map(unscoped).unwrap(),
+            rv_session::SessionCommand::Function(FunctionCommand::SubmitCode {operation_id, code, ..})
+                if operation_id == "login-pending" && code == "053322"));
+    }
+
+    #[gpui::test]
+    fn stale_cloud_preparation_cannot_submit_or_open_settings(cx: &mut TestAppContext) {
+        let (view, cx, mut peer) = setup(cx, false);
+        enable(&view, cx);
+        while peer.commands.try_recv().is_ok() {}
+        view.update(cx, |view, cx| {
+            let spec = OPERATIONS
+                .iter()
+                .find(|spec| spec.id == "cloud-login")
+                .unwrap();
+            view.functions.selected = Some(spec);
+            view.functions.busy = true;
+            view.functions.cloud_preparation = Some(2);
+            for code in [
+                None,
+                Some(rv_core::UnlockCode::new("001234".into()).unwrap()),
+            ] {
+                let parsed = super::parse_operation(spec, "old-password").unwrap();
+                view.finish_cloud_login_preparation(1, parsed, Ok(code), cx);
+                assert_eq!(view.functions.cloud_preparation, Some(2));
+                assert!(view.functions.busy);
+                assert!(!view.unlock.editing());
+            }
+            let parsed = super::parse_operation(spec, "old-password").unwrap();
+            view.finish_cloud_login_preparation(
+                1,
+                parsed,
+                Err(rv_core::UnlockCode::new("invalid".into()).unwrap_err()),
+                cx,
+            );
+            assert_eq!(view.functions.cloud_preparation, Some(2));
+            assert!(view.functions.busy);
+            view.functions.disconnected();
+            assert!(view.functions.cloud_preparation.is_none());
+            assert!(!view.functions.busy);
+            assert!(!view.functions.uncertain);
+        });
+        assert!(peer.commands.try_recv().is_err());
     }
 
     #[gpui::test]
@@ -2357,19 +3338,22 @@ mod tests {
                 view.toggle_functions(window, cx);
                 assert!(!view.assistant_open);
                 view.apply_function_event(FunctionEvent::Available(true), cx);
+                view.apply_function_event(
+                    FunctionEvent::AccountState(Ok(account_fixture(false))),
+                    cx,
+                );
                 view.select_function(&OPERATIONS[0], window, cx);
             });
             window.draw(cx).clear(cx);
         });
-        let menu = cx.debug_bounds("function-browser").unwrap();
+        assert!(cx.debug_bounds("function-browser").is_none());
         let editor = cx.debug_bounds("function-editor").unwrap();
         let execute = cx.debug_bounds("function-execute").unwrap();
-        assert!(editor.right() < menu.left());
-        assert!(menu.right() <= px(1100.) && menu.bottom() <= px(760.));
+        assert!(editor.right() <= px(1100.) && editor.bottom() <= px(760.));
         assert!(execute.bottom() <= editor.bottom());
         let phone = view.read_with(cx, |view, _| view.image_box.get());
         assert!(phone.size.width > px(0.) && phone.right() < editor.left());
-        assert!(cx.debug_bounds("function-store-login").is_some());
+        assert!(cx.debug_bounds("function-back").is_some());
     }
     #[gpui::test]
     fn function_text_stays_local_to_client(cx: &mut TestAppContext) {

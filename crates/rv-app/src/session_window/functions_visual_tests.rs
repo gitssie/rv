@@ -18,9 +18,21 @@ fn export_function_previews() {
     cx.update(|cx| {
         gpui_component::init(cx);
         crate::bind_keys(cx);
+        cx.set_reduce_motion(true);
     });
     let output = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs");
     for (name, id, width, height) in [
+        ("apple-ui-menu.png", "", 1100., 760.),
+        ("apple-ui-menu-signed-out.png", "menu-signed-out", 640., 620.),
+        ("apple-ui-menu-store-only.png", "menu-store-only", 640., 620.),
+        ("apple-ui-icloud.png", "cloud-login", 640., 400.),
+        ("apple-ui-authorizations.png", "authorization-result", 1100., 760.),
+        ("apple-ui-devices.png", "devices-result", 640., 400.),
+        ("apple-ui-code.png", "login-challenge", 640., 400.),
+        ("apple-ui-unknown.png", "unknown-operation", 640., 400.),
+        ("apple-ui-email-unknown.png", "email-unknown", 640., 400.),
+        ("apple-ui-confirmation.png", "authorization-confirmation", 640., 400.),
+        ("apple-ui-name.png", "name", 1100., 760.),
         ("zxtouch-email-processing.png", "email-loading", 640., 400.),
         (
             "zxtouch-query-raw-implemented-light.png",
@@ -138,6 +150,7 @@ fn export_function_previews() {
             &Connection::new("我的 iPhone", "fixture.test", 5901),
             None,
         );
+        let mut preview_view = None;
         let handle = cx
             .open_window(size(px(width), px(height)), |window, cx| {
                 crate::theme::apply(
@@ -159,6 +172,7 @@ fn export_function_previews() {
                             menu_key: "f8".into(),
                             hide_shots: true,
                             thumb_path: None,
+                            app_icon_cache: None,
                             address_book: None,
                             transfer_folders: Default::default(),
                             app_shortcuts: rv_core::default_app_shortcuts(),
@@ -169,6 +183,7 @@ fn export_function_previews() {
                         cx,
                     )
                 });
+                preview_view = Some(view.clone());
                 view.update(cx, |view, cx| {
                     view.pump(cx);
                     if id == "notifications" {
@@ -208,7 +223,7 @@ fn export_function_previews() {
                         view.preview_function(id, window, cx);
                     }
                 });
-                cx.new(|cx| Root::new(view, window, cx))
+                cx.new(|cx| Root::new(cx.new(|cx| super::SessionShell::new(view, cx)), window, cx))
             })
             .unwrap();
         for _ in 0..10 {
@@ -217,9 +232,22 @@ fn export_function_previews() {
             cx.update_window(handle.into(), |_, window, cx| window.draw(cx).clear(cx))
                 .unwrap();
         }
+        if id == "authorization-confirmation" {
+            cx.update_window(handle.into(), |_, window, cx| {
+                preview_view.as_ref().unwrap().update(cx, |view, cx| view.preview_function_confirmation(window, cx));
+                window.draw(cx).clear(cx);
+            }).unwrap();
+            cx.run_until_parked();
+            cx.update_window(handle.into(), |_, window, cx| window.draw(cx).clear(cx)).unwrap();
+        }
+        let destination = if name.starts_with("apple-ui-") {
+            let directory = output.parent().unwrap().join("tempdir/apple-ui");
+            std::fs::create_dir_all(&directory).unwrap();
+            directory.join(name)
+        } else { output.join(name) };
         cx.capture_screenshot(handle.into())
             .unwrap()
-            .save(output.join(name))
+            .save(destination)
             .unwrap();
     }
 }

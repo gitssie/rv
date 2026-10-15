@@ -3,6 +3,7 @@ mod account;
 mod code_url;
 mod mailbox;
 mod spec;
+mod operation_stream;
 use code_url::fetch_code;
 pub use code_url::{extract_verification_code, validate_code_url};
 #[cfg(test)]
@@ -24,6 +25,12 @@ pub enum FunctionCommand {
     Invoke {
         id: String,
         text: String,
+    },
+    /// Follow-up from a displayed query; preflight must still resolve this account.
+    InvokeForAccount {
+        id: String,
+        text: String,
+        apple_id: String,
     },
     Resume {
         task: u8,
@@ -64,6 +71,8 @@ pub enum FunctionEvent {
     EmailCodePending(Value),
     VerificationCodeReceived(String),
     EmailCodeFetched(String),
+    CodeFetched(String),
+    CodeFetchWaiting { remaining_seconds: u64 },
     State {
         task: u8,
         record: Value,
@@ -78,6 +87,8 @@ impl std::fmt::Debug for FunctionEvent {
             Self::AccountState(_) => f.write_str("AccountState([redacted])"),
             Self::ForOperation { id, .. } => f.debug_tuple("ForOperation").field(id).finish(),
             Self::EmailCodeFetched(_) => f.write_str("EmailCodeFetched([redacted])"),
+            Self::CodeFetched(_) => f.write_str("CodeFetched([redacted])"),
+            Self::CodeFetchWaiting { remaining_seconds } => f.debug_tuple("CodeFetchWaiting").field(remaining_seconds).finish(),
             Self::VerificationCodeReceived(_) => {
                 f.write_str("VerificationCodeReceived([redacted])")
             }
@@ -154,10 +165,13 @@ impl FunctionRuntime {
         let Some(mut endpoint) = caps.zx_control.clone() else {
             return;
         };
-        if endpoint.version != 2
+        if !matches!(endpoint.version, 2 | 3)
             || endpoint.port == 0
-            || endpoint.token.len() != 64
-            || !endpoint.token.bytes().all(|b| b.is_ascii_hexdigit())
+            || (endpoint.version == 2
+                && (endpoint.token.len() != 64
+                    || !endpoint.token.bytes().all(|b| b.is_ascii_hexdigit())))
+            || (endpoint.version == 3
+                && (endpoint.token.len() > 4096 || endpoint.token.split('.').count() != 3))
         {
             return;
         }
@@ -217,7 +231,7 @@ impl FunctionRuntime {
             return;
         }
         let family = scope.unwrap_or_else(|| match &command {
-            FunctionCommand::Invoke { id, .. } => id.clone(),
+            FunctionCommand::Invoke { id, .. } | FunctionCommand::InvokeForAccount { id, .. } => id.clone(),
             FunctionCommand::ReadEmailCode { .. } | FunctionCommand::RebindEmail { .. } => {
                 "email-add".into()
             }
@@ -361,15 +375,16 @@ fn accepted_code(response: &Value, id: &str) -> Result<(), String> {
 
 struct Wire {
     client: crate::phone_http::PhoneHttpClient,
+    app_state_stream: bool,
 }
 impl Wire {
     async fn connect(client: &crate::phone_http::PhoneHttpClient) -> Result<Self, String> {
         let client = client.clone();
-        let (status, _) = client.json("/api/control/authorize", &json!({})).await?;
+        let (status, capabilities) = client.json("/api/control/authorize", &json!({})).await?;
         if status != 200 {
             return Err("手机控制授权失败".into());
         }
-        Ok(Self { client })
+        Ok(Self { client, app_state_stream: capabilities["app_state_stream"] == 1 })
     }
     async fn request(&mut self, module: u8, body: Value) -> Result<Value, String> {
         let prefix = match module {
@@ -409,6 +424,27 @@ impl Wire {
     }
 }
 
+const CODE_RETRY_INTERVAL: Duration = Duration::from_secs(3);
+const CODE_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
+
+struct CodePoll {
+    challenge: String,
+    deadline: std::time::Instant,
+    next: std::time::Instant,
+    timeout_reported: bool,
+}
+impl CodePoll {
+    fn new(challenge: String, now: std::time::Instant) -> Self {
+        Self { challenge, deadline: now + CODE_WAIT_TIMEOUT, next: now, timeout_reported: false }
+    }
+    fn ready(&self, now: std::time::Instant) -> bool {
+        now >= self.next && now < self.deadline
+    }
+    fn retry_after(&mut self, now: std::time::Instant) {
+        self.next = now + CODE_RETRY_INTERVAL;
+    }
+}
+
 struct Active {
     task: u8,
     started: std::time::Instant,
@@ -416,6 +452,8 @@ struct Active {
     url: Option<String>,
     last: Value,
     fetched: std::collections::HashSet<String>,
+    code_poll: Option<CodePoll>,
+    manual_code_fetch: bool,
 }
 async fn worker(
     client: crate::phone_http::PhoneHttpClient,
@@ -459,8 +497,14 @@ async fn worker_with_provider(
             active = None;
             continue;
         }
+        let (command, expected_account) = match command {
+            Some(FunctionCommand::InvokeForAccount { id, text, apple_id }) => (
+                Some(FunctionCommand::Invoke { id, text }), Some(apple_id),
+            ),
+            command => (command, None),
+        };
         let request = match command {
-            Some(FunctionCommand::Scoped { .. } | FunctionCommand::RefreshAccountState) => continue,
+            Some(FunctionCommand::Scoped { .. } | FunctionCommand::RefreshAccountState | FunctionCommand::InvokeForAccount { .. }) => continue,
             Some(FunctionCommand::RebindEmail { text }) => {
                 if active.is_some() {
                     let _ = events
@@ -493,6 +537,14 @@ async fn worker_with_provider(
                         continue;
                     }
                 };
+                if spec.method == "enableICloud"
+                    && parsed.params["device_passcode"].as_str().is_none_or(str::is_empty)
+                {
+                    let _ = events.send(FunctionEvent::Error(
+                        "请先在本地设置锁屏密码，再登录 iCloud".into(),
+                    )).await;
+                    continue;
+                }
                 email_target = None;
                 email_mailbox = None;
                 if account::needs_current_account(spec) {
@@ -511,6 +563,12 @@ async fn worker_with_provider(
                             continue;
                         }
                     };
+                    if expected_account.as_deref().is_some_and(|expected| !expected.eq_ignore_ascii_case(&target)) {
+                        let _ = events.send(FunctionEvent::Error(
+                            "手机账户已改变，请重新查询后再操作".into(),
+                        )).await;
+                        continue;
+                    }
                     if spec.method == "verifyContactEmail" {
                         let (expected, challenge) = email_pending.as_ref().unwrap();
                         if expected
@@ -594,6 +652,8 @@ async fn worker_with_provider(
                         url: None,
                         last: Value::Null,
                         fetched: Default::default(),
+                        code_poll: None,
+                        manual_code_fetch: false,
                     });
                 }
                 Some((
@@ -698,7 +758,7 @@ async fn worker_with_provider(
             Some(FunctionCommand::FetchCode) => {
                 if let Some(a) = &mut active {
                     if a.url.is_some() && a.last["status"] == "requires_verification_code" {
-                        a.fetched.clear();
+                        a.manual_code_fetch = true;
                     } else {
                         let _ = events
                             .send(FunctionEvent::Error(
@@ -727,15 +787,27 @@ async fn worker_with_provider(
             let mut wire = match Wire::connect(&client).await {
                 Ok(connection) => connection,
                 Err(e) => {
-                    let _ = events.send(FunctionEvent::Error(e)).await;
+                    let event = if !invocation && body["action"] == "result" {
+                        // Keep the receipt in the UI, but stop background retries until queried again.
+                        active = None;
+                        FunctionEvent::Uncertain(e)
+                    } else { FunctionEvent::Error(e) };
+                    let _ = events.send(event).await;
                     continue;
                 }
             };
             let action = body["action"].as_str().unwrap_or("").to_owned();
-            let response = match wire.request(task, body).await {
+            let streaming = task == 32 && wire.app_state_stream;
+            let response = match if streaming {
+                operation_stream::request(&wire.client, &body, &events).await
+            } else { wire.request(task, body).await } {
                 Ok(r) => r,
                 Err(e) => {
                     let _ = events.send(FunctionEvent::Uncertain(e)).await;
+                    if streaming {
+                        active = None;
+                        continue;
+                    }
                     let _ = events.send(FunctionEvent::Available(false)).await;
                     return;
                 }
@@ -767,6 +839,8 @@ async fn worker_with_provider(
                     url,
                     last: Value::Null,
                     fetched: Default::default(),
+                    code_poll: None,
+                    manual_code_fetch: false,
                 });
             }
 
@@ -896,10 +970,43 @@ async fn worker_with_provider(
                 .as_str()
                 .map(str::to_owned)
             && let Some(url) = a.url.as_ref()
-            && a.fetched.insert(challenge.clone())
+            && (!a.fetched.contains(&challenge) || a.manual_code_fetch)
         {
-            match fetch_code(url).await {
+            let now = std::time::Instant::now();
+            if a.code_poll.as_ref().is_none_or(|poll| poll.challenge != challenge) {
+                a.code_poll = Some(CodePoll::new(challenge.clone(), now));
+            }
+            let poll = a.code_poll.as_mut().unwrap();
+            if now >= poll.deadline && !a.manual_code_fetch {
+                if !poll.timeout_reported {
+                    poll.timeout_reported = true;
+                    let _ = events.send(FunctionEvent::CodeFetchWaiting {
+                        remaining_seconds: 0,
+                    }).await;
+                }
+                continue;
+            }
+            if !poll.ready(now) && !a.manual_code_fetch {
+                continue;
+            }
+            let _ = events.send(FunctionEvent::Progress("正在读取验证码…".into())).await;
+            let fetch_timeout = if a.manual_code_fetch {
+                Duration::from_secs(10)
+            } else {
+                poll.deadline.saturating_duration_since(now)
+            };
+            let result = tokio::time::timeout(
+                fetch_timeout, fetch_code(url),
+            ).await.unwrap_or_else(|_| Err("等待验证码超时".into()));
+            match result {
                 Ok(code) => {
+                    // A fetched code is submitted once. Native rejection is not a fetch retry.
+                    a.fetched.insert(challenge.clone());
+                    if a.manual_code_fetch {
+                        a.manual_code_fetch = false;
+                        let _ = events.send(FunctionEvent::CodeFetched(code)).await;
+                        continue;
+                    }
                     if events
                         .send(FunctionEvent::VerificationCodeReceived(code.clone()))
                         .await
@@ -923,8 +1030,13 @@ async fn worker_with_provider(
                         Err(_)=>{let _=events.send(FunctionEvent::Uncertain("验证码提交结果未知；请查询原登录结果".into())).await;let _=events.send(FunctionEvent::Available(false)).await;return;},
                     }
                 }
-                Err(e) => {
-                    let _ = events.send(FunctionEvent::Error(e)).await;
+                Err(_) => {
+                    let now = std::time::Instant::now();
+                    poll.retry_after(now);
+                    a.manual_code_fetch = false;
+                    let remaining_seconds = poll.deadline.saturating_duration_since(now).as_secs();
+                    if remaining_seconds == 0 { poll.timeout_reported = true; }
+                    let _ = events.send(FunctionEvent::CodeFetchWaiting { remaining_seconds }).await;
                 }
             }
         }
@@ -934,6 +1046,20 @@ async fn worker_with_provider(
 #[cfg(test)]
 mod code_tests {
     use super::*;
+    #[test]
+    fn code_poll_obeys_retry_interval_and_overall_deadline() {
+        let now = std::time::Instant::now();
+        let mut poll = CodePoll::new("challenge".into(), now);
+        assert!(poll.ready(now));
+        poll.retry_after(now);
+        assert!(!poll.ready(now + Duration::from_secs(2)));
+        assert!(poll.ready(now + Duration::from_secs(3)));
+        assert!(!poll.ready(now + CODE_WAIT_TIMEOUT));
+        poll.retry_after(now + Duration::from_secs(14));
+        assert_eq!(poll.deadline, now + CODE_WAIT_TIMEOUT);
+        assert!(!poll.ready(now + Duration::from_secs(17)));
+    }
+
     #[test]
     fn code_is_explicit_and_preserves_zeroes() {
         assert_eq!(

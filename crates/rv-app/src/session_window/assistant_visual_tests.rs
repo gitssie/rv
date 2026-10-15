@@ -129,6 +129,7 @@ fn export_assistant_previews() {
                             menu_key: "f8".into(),
                             hide_shots: true,
                             thumb_path: Some(dir.path().join("thumbs/fixture.png")),
+                            app_icon_cache: None,
                             address_book: None,
                             transfer_folders: Default::default(),
                             app_shortcuts: rv_core::default_app_shortcuts(),

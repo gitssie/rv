@@ -1,4 +1,5 @@
 //! Compact two-pane browser for the TightVNC 1.x transfer extension.
+mod dialogs;
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -13,7 +14,7 @@ use directories::UserDirs;
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::{
-    Disableable as _, Icon, IconName, Sizable, StyledExt, TitleBar,
+    Disableable as _, Icon, IconName, StyledExt, TitleBar,
     button::{Button, ButtonVariants as _},
     h_flex,
     input::{Input, InputEvent, InputState},
@@ -29,14 +30,7 @@ use smallvec::SmallVec;
 
 use crate::actions::{FileTransferFullscreen, FileTransferPaste, FileTransferSelectAll};
 use crate::app::AddressBookApp;
-
-const BG: u32 = 0x171c22;
-const PANEL: u32 = 0x1e252e;
-const ROW_ALT: u32 = 0x222b35;
-const LINE: u32 = 0x35404b;
-const TEXT: u32 = 0xe8eef4;
-const MUTED: u32 = 0x9aa9b8;
-const SELECTED: u32 = 0x245a9a;
+use crate::theme;
 
 fn is_image_name(name: &str) -> bool {
     Path::new(name)
@@ -205,7 +199,13 @@ pub fn open(
     cx.open_window(options, move |window, cx| {
         let view =
             cx.new(|cx| FileTransferView::new(host, client, allow_upload, memory, window, cx));
-        cx.new(|cx| gpui_component::Root::new(view, window, cx))
+        cx.new(|cx| {
+            gpui_component::Root::new(
+                cx.new(|_| crate::file_transfer_window::dialogs::TransferShell(view)),
+                window,
+                cx,
+            )
+        })
     })
 }
 
@@ -246,6 +246,7 @@ pub struct FileTransferView {
     photo_thumbs: HashMap<String, Arc<RenderImage>>,
     allow_upload: bool,
     details: Option<FileDetails>,
+    component_dialog: Option<u8>,
     pending_delete: Option<FileDetails>,
     pending_rename: Option<FileDetails>,
     new_folder_side: Option<FileSide>,
@@ -361,6 +362,7 @@ impl FileTransferView {
             photo_thumbs: HashMap::new(),
             allow_upload,
             details: None,
+            component_dialog: None,
             pending_delete: None,
             pending_rename: None,
             new_folder_side: None,
@@ -1902,19 +1904,12 @@ impl FileTransferView {
             .id(("local-file", index))
             .debug_selector(move || format!("local-file-{index}"))
             .w_full()
-            .h(px(26.))
             .px_2()
             .gap_2()
             .items_center()
             .cursor_pointer()
-            .bg(rgb(if selected {
-                SELECTED
-            } else if index % 2 == 1 {
-                ROW_ALT
-            } else {
-                PANEL
-            }))
-            .text_xs()
+            .bg(theme::row_background(selected, index, cx))
+            .text_sm()
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, _, window, cx| {
@@ -1986,8 +1981,11 @@ impl FileTransferView {
                 } else {
                     IconName::File
                 })
-                .small()
-                .text_color(rgb(if is_dir { 0x69b8ef } else { MUTED })),
+                .text_color(if is_dir {
+                    theme::accent(cx)
+                } else {
+                    theme::muted(cx)
+                }),
             )
             .child(
                 div()
@@ -1999,13 +1997,13 @@ impl FileTransferView {
             .child(
                 div()
                     .w(px(70.))
-                    .text_color(rgb(MUTED))
+                    .text_color(theme::muted(cx))
                     .child(entry.size.clone()),
             )
             .child(
                 div()
                     .w(px(92.))
-                    .text_color(rgb(MUTED))
+                    .text_color(theme::muted(cx))
                     .text_ellipsis()
                     .child(entry.modified.clone()),
             )
@@ -2020,30 +2018,26 @@ impl FileTransferView {
             .h_full()
             .min_w_0()
             .min_h_0()
-            .bg(rgb(PANEL))
+            .bg(theme::card(cx))
             .child(
                 h_flex()
-                    .h(px(28.))
                     .px_2()
                     .gap_2()
                     .items_center()
                     .font_semibold()
                     .text_sm()
-                    .child(Icon::new(IconName::Folder).small())
+                    .child(Icon::new(IconName::Folder))
                     .child("Local")
                     .child(div().flex_1())
                     .child(
                         Button::new("local-new-folder")
-                            .xsmall()
                             .ghost()
-                            .text_color(rgb(TEXT))
                             .icon(IconName::Plus)
                             .label("New folder")
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.new_folder_side = Some(FileSide::Local);
                                 this.new_folder_input.update(cx, |input, cx| {
                                     input.set_value("", window, cx);
-                                    input.focus(window, cx);
                                 });
                                 cx.notify();
                             })),
@@ -2051,17 +2045,15 @@ impl FileTransferView {
             )
             .child(
                 h_flex()
-                    .h(px(27.))
+                    .py_1()
                     .px_2()
                     .gap_2()
                     .items_center()
                     .border_b_1()
-                    .border_color(rgb(LINE))
+                    .border_color(theme::line(cx))
                     .child(
                         Button::new("local-back")
-                            .xsmall()
                             .ghost()
-                            .text_color(rgb(TEXT))
                             .icon(IconName::ChevronLeft)
                             .tooltip("Previous local folder")
                             .disabled(back.is_none())
@@ -2073,9 +2065,7 @@ impl FileTransferView {
                     )
                     .child(
                         Button::new("local-parent")
-                            .xsmall()
                             .ghost()
-                            .text_color(rgb(TEXT))
                             .icon(IconName::ArrowUp)
                             .tooltip("Parent folder")
                             .disabled(parent.is_none())
@@ -2087,7 +2077,6 @@ impl FileTransferView {
                     )
                     .child(
                         Input::new(&self.local_path_input)
-                            .xsmall()
                             .appearance(false)
                             .aria_label("Local folder path")
                             .flex_1()
@@ -2096,11 +2085,11 @@ impl FileTransferView {
             )
             .child(self.table_header(FileSide::Local, cx))
             .child(if self.local_loading {
-                empty_message("Loading local files…").into_any_element()
+                crate::ui::empty_state("Loading local files…", cx).into_any_element()
             } else if let Some(error) = &self.local_error {
-                empty_message(error.clone()).into_any_element()
+                crate::ui::empty_state(error.clone(), cx).into_any_element()
             } else if self.local_entries.is_empty() {
-                empty_message("This folder is empty").into_any_element()
+                crate::ui::empty_state("This folder is empty", cx).into_any_element()
             } else {
                 uniform_list(
                     "local-files",
@@ -2138,19 +2127,12 @@ impl FileTransferView {
             .id(("remote-file", index))
             .debug_selector(move || format!("remote-file-{index}"))
             .w_full()
-            .h(px(26.))
             .px_2()
             .gap_2()
             .items_center()
             .cursor_pointer()
-            .bg(rgb(if selected {
-                SELECTED
-            } else if index % 2 == 1 {
-                ROW_ALT
-            } else {
-                PANEL
-            }))
-            .text_xs()
+            .bg(theme::row_background(selected, index, cx))
+            .text_sm()
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, _, window, cx| {
@@ -2226,8 +2208,11 @@ impl FileTransferView {
                 } else {
                     IconName::File
                 })
-                .small()
-                .text_color(rgb(if is_dir { 0x69b8ef } else { MUTED })),
+                .text_color(if is_dir {
+                    theme::accent(cx)
+                } else {
+                    theme::muted(cx)
+                }),
             )
             .child(
                 div()
@@ -2236,15 +2221,20 @@ impl FileTransferView {
                     .text_ellipsis()
                     .child(entry.name.clone()),
             )
-            .child(div().w(px(70.)).text_color(rgb(MUTED)).child(if is_dir {
-                "—".into()
-            } else {
-                format_size(entry.size as u64)
-            }))
+            .child(
+                div()
+                    .w(px(70.))
+                    .text_color(theme::muted(cx))
+                    .child(if is_dir {
+                        "—".into()
+                    } else {
+                        format_size(entry.size as u64)
+                    }),
+            )
             .child(
                 div()
                     .w(px(92.))
-                    .text_color(rgb(MUTED))
+                    .text_color(theme::muted(cx))
                     .child(if entry.modified == 0 {
                         "—".into()
                     } else {
@@ -2281,13 +2271,7 @@ impl FileTransferView {
             .gap_2()
             .items_center()
             .cursor_pointer()
-            .bg(rgb(if selected {
-                SELECTED
-            } else if index % 2 == 1 {
-                ROW_ALT
-            } else {
-                PANEL
-            }))
+            .bg(theme::row_background(selected, index, cx))
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, _, window, cx| {
@@ -2358,9 +2342,9 @@ impl FileTransferView {
                     .w(px(42.))
                     .h(px(42.))
                     .flex_none()
-                    .rounded_sm()
+                    .rounded(theme::radius_small(cx))
                     .overflow_hidden()
-                    .bg(rgb(ROW_ALT))
+                    .bg(theme::surface(cx))
                     .child(if let Some(thumbnail) = thumbnail {
                         img(thumbnail)
                             .size_full()
@@ -2371,7 +2355,7 @@ impl FileTransferView {
                             .size_full()
                             .items_center()
                             .justify_center()
-                            .child(Icon::new(IconName::File).small().text_color(rgb(MUTED)))
+                            .child(Icon::new(IconName::File).text_color(theme::muted(cx)))
                             .into_any_element()
                     }),
             )
@@ -2383,8 +2367,8 @@ impl FileTransferView {
                     .child(div().text_sm().text_ellipsis().child(entry.name.clone()))
                     .child(
                         div()
-                            .text_xs()
-                            .text_color(rgb(MUTED))
+                            .text_sm()
+                            .text_color(theme::muted(cx))
                             .child(format!("{} · {}×{}", date, entry.width, entry.height)),
                     ),
             )
@@ -2400,50 +2384,44 @@ impl FileTransferView {
             .h_full()
             .min_w_0()
             .min_h_0()
-            .bg(rgb(PANEL))
+            .bg(theme::card(cx))
             .child(
                 h_flex()
-                    .h(px(28.))
                     .px_2()
                     .gap_2()
                     .items_center()
                     .font_semibold()
                     .text_sm()
-                    .child(Icon::new(IconName::File).small())
+                    .child(Icon::new(IconName::File))
                     .child("Remote")
                     .child(div().flex_1())
                     .child(
                         Button::new("photos-files")
-                            .xsmall()
                             .ghost()
-                            .text_color(rgb(MUTED))
+                            .text_color(theme::muted(cx))
                             .icon(IconName::Folder)
                             .label("Files")
                             .on_click(cx.listener(|this, _, _, cx| this.show_files(cx))),
                     )
                     .child(
                         Button::new("photos-photos")
-                            .xsmall()
                             .ghost()
-                            .text_color(rgb(TEXT))
                             .icon(IconName::GalleryVerticalEnd)
                             .label("Photos"),
                     ),
             )
             .child(
                 h_flex()
-                    .h(px(27.))
+                    .py_1()
                     .px_2()
                     .gap_2()
                     .items_center()
                     .border_b_1()
-                    .border_color(rgb(LINE))
+                    .border_color(theme::line(cx))
                     .text_xs()
                     .child(
                         Button::new("photo-albums")
-                            .xsmall()
                             .ghost()
-                            .text_color(rgb(TEXT))
                             .label(
                                 self.remote
                                     .photo_album
@@ -2471,9 +2449,7 @@ impl FileTransferView {
                     .child(div().flex_1())
                     .child(
                         Button::new("photo-prev")
-                            .xsmall()
                             .ghost()
-                            .text_color(rgb(TEXT))
                             .icon(IconName::ChevronLeft)
                             .disabled(
                                 !available
@@ -2502,9 +2478,7 @@ impl FileTransferView {
                     ))
                     .child(
                         Button::new("photo-next")
-                            .xsmall()
                             .ghost()
-                            .text_color(rgb(TEXT))
                             .icon(IconName::ChevronRight)
                             .disabled(
                                 !available
@@ -2523,14 +2497,14 @@ impl FileTransferView {
                     ),
             )
             .child(if !available {
-                empty_message("Photos is unavailable on this TrollVNC connection")
+                crate::ui::empty_state("Photos is unavailable on this TrollVNC connection", cx)
                     .into_any_element()
             } else if self.remote.photo_busy && self.remote.photo_entries.is_empty() {
-                empty_message("Loading Photos…").into_any_element()
+                crate::ui::empty_state("Loading Photos…", cx).into_any_element()
             } else if let Some(error) = &self.remote.photo_error {
-                empty_message(error.clone()).into_any_element()
+                crate::ui::empty_state(error.clone(), cx).into_any_element()
             } else if self.remote.photo_entries.is_empty() {
-                empty_message("No photos in this view").into_any_element()
+                crate::ui::empty_state("No photos in this view", cx).into_any_element()
             } else {
                 uniform_list(
                     "photos",
@@ -2568,31 +2542,27 @@ impl FileTransferView {
             .h_full()
             .min_w_0()
             .min_h_0()
-            .bg(rgb(PANEL))
+            .bg(theme::card(cx))
             .child(
                 h_flex()
-                    .h(px(28.))
                     .px_2()
                     .gap_2()
                     .items_center()
                     .font_semibold()
                     .text_sm()
-                    .child(Icon::new(IconName::Folder).small())
+                    .child(Icon::new(IconName::Folder))
                     .child("Remote")
                     .child(div().flex_1())
                     .child(
                         Button::new("files-files")
-                            .xsmall()
                             .ghost()
-                            .text_color(rgb(TEXT))
                             .icon(IconName::Folder)
                             .label("Files"),
                     )
                     .child(
                         Button::new("files-photos")
-                            .xsmall()
                             .ghost()
-                            .text_color(rgb(MUTED))
+                            .text_color(theme::muted(cx))
                             .icon(IconName::GalleryVerticalEnd)
                             .label("Photos")
                             .disabled(!self.remote.can_photos)
@@ -2600,9 +2570,7 @@ impl FileTransferView {
                     )
                     .child(
                         Button::new("remote-new-folder")
-                            .xsmall()
                             .ghost()
-                            .text_color(rgb(TEXT))
                             .icon(IconName::Plus)
                             .label("New folder")
                             .disabled(
@@ -2616,7 +2584,6 @@ impl FileTransferView {
                                 this.new_folder_side = Some(FileSide::Remote);
                                 this.new_folder_input.update(cx, |input, cx| {
                                     input.set_value("", window, cx);
-                                    input.focus(window, cx);
                                 });
                                 cx.notify();
                             })),
@@ -2624,17 +2591,15 @@ impl FileTransferView {
             )
             .child(
                 h_flex()
-                    .h(px(27.))
+                    .py_1()
                     .px_2()
                     .gap_2()
                     .items_center()
                     .border_b_1()
-                    .border_color(rgb(LINE))
+                    .border_color(theme::line(cx))
                     .child(
                         Button::new("remote-back")
-                            .xsmall()
                             .ghost()
-                            .text_color(rgb(TEXT))
                             .icon(IconName::ChevronLeft)
                             .tooltip("Previous remote folder")
                             .disabled(back.is_none() || !available)
@@ -2646,9 +2611,7 @@ impl FileTransferView {
                     )
                     .child(
                         Button::new("remote-parent")
-                            .xsmall()
                             .ghost()
-                            .text_color(rgb(TEXT))
                             .icon(IconName::ArrowUp)
                             .tooltip("Parent folder")
                             .disabled(parent.is_none() || !available)
@@ -2660,7 +2623,6 @@ impl FileTransferView {
                     )
                     .child(
                         Input::new(&self.remote_path_input)
-                            .xsmall()
                             .appearance(false)
                             .aria_label("Remote folder path")
                             .flex_1()
@@ -2673,7 +2635,7 @@ impl FileTransferView {
                     || self.remote.listing
                     || self.remote.error.is_some()
                 {
-                    empty_message(message).into_any_element()
+                    crate::ui::empty_state(message, cx).into_any_element()
                 } else {
                     uniform_list(
                         "remote-files",
@@ -2752,7 +2714,6 @@ impl FileTransferView {
                 QueueAction::Download { .. } | QueueAction::PhotoExport { .. }
             );
         h_flex()
-            .h(px(26.))
             .px_2()
             .gap_2()
             .items_center()
@@ -2767,14 +2728,13 @@ impl FileTransferView {
             .child(
                 div()
                     .w(px(170.))
-                    .text_color(rgb(MUTED))
+                    .text_color(theme::muted(cx))
                     .text_ellipsis()
                     .child(status),
             )
             .when(retry, |row| {
                 row.child(
                     Button::new(("retry-job", index))
-                        .xsmall()
                         .ghost()
                         .label("Retry")
                         .disabled(retry_blocked)
@@ -2820,15 +2780,13 @@ impl FileTransferView {
                             .py_1()
                             .rounded_b_lg()
                             .border_1()
-                            .border_color(rgb(LINE))
-                            .bg(rgb(PANEL))
+                            .border_color(theme::line(cx))
+                            .bg(theme::card(cx))
                             .shadow_lg()
                             .child(
                                 Button::new("file-exit-fullscreen")
                                     .debug_selector(|| "file-exit-fullscreen".into())
-                                    .xsmall()
                                     .ghost()
-                                    .text_color(rgb(TEXT))
                                     .icon(IconName::Minimize)
                                     .label("Exit full screen")
                                     .tooltip("Exit full screen (⇧⌘F)")
@@ -2843,14 +2801,14 @@ impl FileTransferView {
                             .px_6()
                             .py_1()
                             .rounded_b_md()
-                            .bg(rgb(PANEL))
-                            .text_color(rgb(MUTED))
+                            .bg(theme::card(cx))
+                            .text_color(theme::muted(cx))
                             .cursor_pointer()
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.fullscreen_toolbar_open = true;
                                 cx.notify();
                             }))
-                            .child(Icon::new(IconName::ChevronDown).small())
+                            .child(Icon::new(IconName::ChevronDown))
                             .into_any_element()
                     }),
             )
@@ -2859,6 +2817,7 @@ impl FileTransferView {
 
 impl Render for FileTransferView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_component_dialog(window, cx);
         let fullscreen = window.is_fullscreen();
         let caps = self.remote.caps.unwrap_or_default();
         let upload_enabled = self.allow_upload
@@ -2919,9 +2878,8 @@ impl Render for FileTransferView {
             .debug_selector(|| "file-transfer-drop-target".into())
             .size_full()
             .relative()
-            .bg(rgb(BG))
-            .text_color(rgb(TEXT))
-            .drag_over::<ExternalPaths>(|style, _, _, _| style.bg(rgb(0x202f43)))
+            .bg(theme::surface(cx))
+            .drag_over::<ExternalPaths>(|style, _, _, cx| style.bg(theme::selected(cx)))
             .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
                 if this.upload_external_files(paths.0.to_vec(), cx) {
                     this.focus.focus(window, cx);
@@ -2952,18 +2910,15 @@ impl Render for FileTransferView {
             })
             .child(
                 h_flex()
-                    .h(px(32.))
                     .px_2()
                     .gap_1()
                     .items_center()
                     .border_b_1()
-                    .border_color(rgb(LINE))
-                    .bg(rgb(PANEL))
+                    .border_color(theme::line(cx))
+                    .bg(theme::card(cx))
                     .child(if self.photo_mode {
                         Button::new("upload-to-photos")
-                            .xsmall()
                             .ghost()
-                            .text_color(rgb(TEXT))
                             .icon(IconName::ArrowUp)
                             .label(if photo_upload_count > 1 {
                                 format!("Upload to Photos ({photo_upload_count})")
@@ -2975,9 +2930,7 @@ impl Render for FileTransferView {
                             .into_any_element()
                     } else {
                         Button::new("upload")
-                            .xsmall()
                             .ghost()
-                            .text_color(rgb(TEXT))
                             .icon(IconName::ArrowUp)
                             .label("Upload")
                             .disabled(!upload_enabled)
@@ -2987,9 +2940,7 @@ impl Render for FileTransferView {
                     })
                     .child(if self.photo_mode {
                         Button::new("download-photo")
-                            .xsmall()
                             .ghost()
-                            .text_color(rgb(TEXT))
                             .icon(IconName::ArrowDown)
                             .label(if self.photo_selected_ids.len() > 1 {
                                 format!("Download ({})", self.photo_selected_ids.len())
@@ -3001,9 +2952,7 @@ impl Render for FileTransferView {
                             .into_any_element()
                     } else {
                         Button::new("download")
-                            .xsmall()
                             .ghost()
-                            .text_color(rgb(TEXT))
                             .icon(IconName::ArrowDown)
                             .label("Download")
                             .disabled(!download_enabled)
@@ -3014,9 +2963,7 @@ impl Render for FileTransferView {
                     .when(self.photo_mode && self.remote.can_photo_delete, |this| {
                         this.child(
                             Button::new("delete-selected-photos")
-                                .xsmall()
                                 .ghost()
-                                .text_color(rgb(TEXT))
                                 .icon(IconName::Delete)
                                 .label(if self.photo_selected_ids.len() > 1 {
                                     format!("Delete ({})", self.photo_selected_ids.len())
@@ -3039,9 +2986,7 @@ impl Render for FileTransferView {
                         |this| {
                             this.child(
                                 Button::new("delete-local-selected")
-                                    .xsmall()
                                     .ghost()
-                                    .text_color(rgb(TEXT))
                                     .icon(IconName::Delete)
                                     .label(format!(
                                         "Delete local ({})",
@@ -3062,9 +3007,7 @@ impl Render for FileTransferView {
                         |this| {
                             this.child(
                                 Button::new("delete-remote-selected")
-                                    .xsmall()
                                     .ghost()
-                                    .text_color(rgb(TEXT))
                                     .icon(IconName::Delete)
                                     .label(format!(
                                         "Delete remote ({})",
@@ -3079,9 +3022,7 @@ impl Render for FileTransferView {
                     )
                     .child(
                         Button::new("refresh")
-                            .xsmall()
                             .ghost()
-                            .text_color(rgb(TEXT))
                             .icon(IconName::Replace)
                             .label("Refresh")
                             .on_click(cx.listener(|this, _, _, cx| {
@@ -3101,9 +3042,7 @@ impl Render for FileTransferView {
                     .when(active, |this| {
                         this.child(
                             Button::new("cancel-transfer")
-                                .xsmall()
                                 .ghost()
-                                .text_color(rgb(TEXT))
                                 .icon(IconName::Close)
                                 .label("Cancel")
                                 .on_click(cx.listener(|this, _, _, cx| {
@@ -3117,9 +3056,7 @@ impl Render for FileTransferView {
                     .child(div().flex_1())
                     .child(
                         Button::new("transfers-toggle")
-                            .xsmall()
                             .ghost()
-                            .text_color(rgb(TEXT))
                             .icon(if self.transfers_open {
                                 IconName::ChevronDown
                             } else {
@@ -3139,7 +3076,7 @@ impl Render for FileTransferView {
                     .min_h_0()
                     .items_stretch()
                     .child(self.render_local_pane(cx))
-                    .child(div().w(px(1.)).h_full().bg(rgb(LINE)))
+                    .child(div().w(px(1.)).h_full().bg(theme::line(cx)))
                     .child(if self.photo_mode {
                         self.render_photos_pane(cx)
                     } else {
@@ -3151,11 +3088,11 @@ impl Render for FileTransferView {
                     v_flex()
                         .h(px(112.))
                         .border_t_1()
-                        .border_color(rgb(LINE))
-                        .bg(rgb(PANEL))
+                        .border_color(theme::line(cx))
+                        .bg(theme::card(cx))
                         .child(
                             h_flex()
-                                .h(px(27.))
+                                .py_1()
                                 .px_2()
                                 .items_center()
                                 .font_semibold()
@@ -3185,7 +3122,7 @@ impl Render for FileTransferView {
                             .min_h_0()
                             .into_any_element()
                         } else if self.remote.transfers.is_empty() {
-                            empty_message("No transfers yet").into_any_element()
+                            crate::ui::empty_state("No transfers yet", cx).into_any_element()
                         } else {
                             v_flex()
                                 .flex_1()
@@ -3230,24 +3167,20 @@ impl Render for FileTransferView {
                                             }
                                         };
                                         h_flex()
-                                            .h(px(26.))
                                             .px_2()
                                             .gap_2()
                                             .items_center()
                                             .text_xs()
-                                            .child(
-                                                Icon::new(
-                                                    if matches!(
-                                                        transfer.direction,
-                                                        TransferDirection::Upload
-                                                    ) {
-                                                        IconName::ArrowUp
-                                                    } else {
-                                                        IconName::ArrowDown
-                                                    },
-                                                )
-                                                .small(),
-                                            )
+                                            .child(Icon::new(
+                                                if matches!(
+                                                    transfer.direction,
+                                                    TransferDirection::Upload
+                                                ) {
+                                                    IconName::ArrowUp
+                                                } else {
+                                                    IconName::ArrowDown
+                                                },
+                                            ))
                                             .child(
                                                 div()
                                                     .flex_1()
@@ -3258,7 +3191,7 @@ impl Render for FileTransferView {
                                             .child(
                                                 div()
                                                     .w(px(170.))
-                                                    .text_color(rgb(MUTED))
+                                                    .text_color(theme::muted(cx))
                                                     .text_ellipsis()
                                                     .child(status),
                                             )
@@ -3270,13 +3203,13 @@ impl Render for FileTransferView {
             })
             .child(
                 h_flex()
-                    .h(px(22.))
+                    .py_1()
                     .px_2()
                     .items_center()
                     .border_t_1()
-                    .border_color(rgb(LINE))
+                    .border_color(theme::line(cx))
                     .text_xs()
-                    .text_color(rgb(MUTED))
+                    .text_color(theme::muted(cx))
                     .child(
                         div().w_full().text_ellipsis().child(
                             self.status_error
@@ -3304,33 +3237,6 @@ impl Render for FileTransferView {
             )
             .when(fullscreen, |this| {
                 this.child(self.render_fullscreen_toolbar(cx))
-            })
-            .when_some(self.details.clone(), |this, details| {
-                this.child(render_file_details(details, cx))
-            })
-            .when_some(self.pending_delete.clone(), |this, details| {
-                this.child(render_delete_confirmation(details, cx))
-            })
-            .when_some(self.new_folder_side, |this, side| {
-                this.child(render_new_folder(side, &self.new_folder_input, cx))
-            })
-            .when_some(self.pending_rename.clone(), |this, details| {
-                this.child(render_rename(details, &self.new_folder_input, cx))
-            })
-            .when_some(self.pending_conflicts.as_ref(), |this, jobs| {
-                this.child(render_conflict_confirmation(
-                    jobs.len(),
-                    self.can_replace_conflicts(jobs),
-                    cx,
-                ))
-            })
-            .when_some(self.pending_batch_delete, |this, side| {
-                let count = if side == FileSide::Local {
-                    self.local_selected_paths.len()
-                } else {
-                    self.remote_selected_names.len()
-                };
-                this.child(render_batch_delete_confirmation(count, side, cx))
             })
     }
 }
@@ -3516,7 +3422,6 @@ fn file_menu(
                         this.pending_rename = Some(rename_details.clone());
                         this.new_folder_input.update(cx, |input, cx| {
                             input.set_value(rename_details.name.clone(), window, cx);
-                            input.focus(window, cx);
                         });
                         cx.notify();
                     });
@@ -3564,347 +3469,12 @@ fn file_menu(
     }
 }
 
-fn render_delete_confirmation(
-    details: FileDetails,
-    cx: &mut Context<FileTransferView>,
-) -> AnyElement {
-    let location = if details.side == FileSide::Local {
-        "this Mac"
-    } else {
-        "TrollVNC"
-    };
-    div()
-        .id("delete-confirmation-overlay")
-        .occlude()
-        .absolute()
-        .inset_0()
-        .flex()
-        .items_center()
-        .justify_center()
-        .bg(rgba(0x000000aa))
-        .child(
-            v_flex()
-                .w(px(420.))
-                .rounded_lg()
-                .border_1()
-                .border_color(rgb(LINE))
-                .bg(rgb(PANEL))
-                .p_4()
-                .gap_3()
-                .child(
-                    div()
-                        .font_semibold()
-                        .child(format!("Delete {}?", details.name)),
-                )
-                .child(div().text_xs().text_color(rgb(MUTED)).child(format!(
-                    "Permanently remove this item from {location}. Folders must be empty."
-                )))
-                .child(
-                    h_flex()
-                        .justify_end()
-                        .gap_2()
-                        .child(
-                            Button::new("delete-cancel")
-                                .xsmall()
-                                .label("Cancel")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.pending_delete = None;
-                                    cx.notify();
-                                })),
-                        )
-                        .child(
-                            Button::new("delete-confirm")
-                                .xsmall()
-                                .label("Delete permanently")
-                                .on_click(cx.listener(|this, _, _, cx| this.confirm_delete(cx))),
-                        ),
-                ),
-        )
-        .into_any_element()
-}
-
-fn render_conflict_confirmation(
-    count: usize,
-    can_replace: bool,
-    cx: &mut Context<FileTransferView>,
-) -> AnyElement {
-    div().id("file-conflict-overlay").occlude().absolute().inset_0()
-        .flex().items_center().justify_center().bg(rgba(0x000000aa))
-        .child(v_flex().w(px(440.)).rounded_lg().border_1().border_color(rgb(LINE))
-            .bg(rgb(PANEL)).p_4().gap_3()
-            .child(div().font_semibold().child("Files with the same name"))
-            .child(div().text_xs().text_color(rgb(MUTED)).child(format!("Some of the {count} selected files already exist at the destination. Choose how to handle those files.")))
-            .child(h_flex().justify_end().gap_2()
-                .child(Button::new("conflict-cancel").xsmall().label("Cancel")
-                    .on_click(cx.listener(|this, _, _, cx| { this.pending_conflicts = None; cx.notify(); })))
-                .child(Button::new("conflict-skip").xsmall().label("Skip")
-                    .on_click(cx.listener(|this, _, _, cx| this.resolve_conflicts(CollisionPolicy::Skip, cx))))
-                .child(Button::new("conflict-rename").xsmall().label("Rename")
-                    .on_click(cx.listener(|this, _, _, cx| this.resolve_conflicts(CollisionPolicy::Rename, cx))))
-                .child(Button::new("conflict-replace").xsmall().label("Replace")
-                    .disabled(!can_replace)
-                    .on_click(cx.listener(|this, _, _, cx| this.resolve_conflicts(CollisionPolicy::Replace, cx)))))
-        ).into_any_element()
-}
-
-fn render_batch_delete_confirmation(
-    count: usize,
-    side: FileSide,
-    cx: &mut Context<FileTransferView>,
-) -> AnyElement {
-    let location = if side == FileSide::Local {
-        "this Mac"
-    } else {
-        "TrollVNC"
-    };
-    div()
-        .id("batch-delete-overlay")
-        .occlude()
-        .absolute()
-        .inset_0()
-        .flex()
-        .items_center()
-        .justify_center()
-        .bg(rgba(0x000000aa))
-        .child(
-            v_flex()
-                .w(px(420.))
-                .rounded_lg()
-                .border_1()
-                .border_color(rgb(LINE))
-                .bg(rgb(PANEL))
-                .p_4()
-                .gap_3()
-                .child(
-                    div()
-                        .font_semibold()
-                        .child(format!("Delete {count} items from {location}?")),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(MUTED))
-                        .child("Items will be deleted one at a time. Folders must be empty."),
-                )
-                .child(
-                    h_flex()
-                        .justify_end()
-                        .gap_2()
-                        .child(
-                            Button::new("batch-delete-cancel")
-                                .xsmall()
-                                .label("Cancel")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.pending_batch_delete = None;
-                                    cx.notify();
-                                })),
-                        )
-                        .child(
-                            Button::new("batch-delete-confirm")
-                                .xsmall()
-                                .label("Delete permanently")
-                                .on_click(
-                                    cx.listener(|this, _, _, cx| this.confirm_batch_delete(cx)),
-                                ),
-                        ),
-                ),
-        )
-        .into_any_element()
-}
-
-fn render_new_folder(
-    side: FileSide,
-    input: &Entity<InputState>,
-    cx: &mut Context<FileTransferView>,
-) -> AnyElement {
-    let location = if side == FileSide::Local {
-        "This Mac"
-    } else {
-        "TrollVNC"
-    };
-    div()
-        .id("new-folder-overlay")
-        .occlude()
-        .absolute()
-        .inset_0()
-        .flex()
-        .items_center()
-        .justify_center()
-        .bg(rgba(0x000000aa))
-        .child(
-            v_flex()
-                .w(px(420.))
-                .rounded_lg()
-                .border_1()
-                .border_color(rgb(LINE))
-                .bg(rgb(PANEL))
-                .p_4()
-                .gap_3()
-                .child(
-                    div()
-                        .font_semibold()
-                        .child(format!("New folder · {location}")),
-                )
-                .child(Input::new(input).aria_label("New folder name").w_full())
-                .child(
-                    h_flex()
-                        .justify_end()
-                        .gap_2()
-                        .child(
-                            Button::new("new-folder-cancel")
-                                .xsmall()
-                                .label("Cancel")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.new_folder_side = None;
-                                    cx.notify();
-                                })),
-                        )
-                        .child(
-                            Button::new("new-folder-create")
-                                .xsmall()
-                                .label("Create")
-                                .on_click(cx.listener(|this, _, _, cx| this.create_folder(cx))),
-                        ),
-                ),
-        )
-        .into_any_element()
-}
-
-fn render_rename(
-    details: FileDetails,
-    input: &Entity<InputState>,
-    cx: &mut Context<FileTransferView>,
-) -> AnyElement {
-    div()
-        .id("rename-overlay")
-        .occlude()
-        .absolute()
-        .inset_0()
-        .flex()
-        .items_center()
-        .justify_center()
-        .bg(rgba(0x000000aa))
-        .child(
-            v_flex()
-                .w(px(420.))
-                .rounded_lg()
-                .border_1()
-                .border_color(rgb(LINE))
-                .bg(rgb(PANEL))
-                .p_4()
-                .gap_3()
-                .child(
-                    div()
-                        .font_semibold()
-                        .child(format!("Rename {}", details.name)),
-                )
-                .child(Input::new(input).aria_label("New name").w_full())
-                .child(
-                    h_flex()
-                        .justify_end()
-                        .gap_2()
-                        .child(
-                            Button::new("rename-cancel")
-                                .xsmall()
-                                .label("Cancel")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.pending_rename = None;
-                                    cx.notify();
-                                })),
-                        )
-                        .child(
-                            Button::new("rename-confirm")
-                                .xsmall()
-                                .label("Rename")
-                                .on_click(cx.listener(|this, _, _, cx| this.rename_item(cx))),
-                        ),
-                ),
-        )
-        .into_any_element()
-}
-
-fn render_file_details(details: FileDetails, cx: &mut Context<FileTransferView>) -> AnyElement {
-    let side = match details.side {
-        FileSide::Local => "This Mac",
-        FileSide::Remote => "TrollVNC",
-    };
-    div()
-        .id("file-info-overlay")
-        .occlude()
-        .absolute()
-        .inset_0()
-        .flex()
-        .items_center()
-        .justify_center()
-        .bg(rgba(0x000000aa))
-        .on_click(cx.listener(|this, _, _, cx| {
-            this.details = None;
-            cx.notify();
-        }))
-        .child(
-            v_flex()
-                .id("file-info-card")
-                .w(px(450.))
-                .max_w(relative(0.9))
-                .rounded_lg()
-                .border_1()
-                .border_color(rgb(LINE))
-                .bg(rgb(PANEL))
-                .shadow_lg()
-                .p_4()
-                .gap_3()
-                .on_click(|_, _, cx| cx.stop_propagation())
-                .child(
-                    div()
-                        .font_semibold()
-                        .text_sm()
-                        .child(format!("{} · Info", details.name)),
-                )
-                .child(info_row("Location", side))
-                .child(info_row(
-                    "Type",
-                    if details.is_dir { "Folder" } else { "File" },
-                ))
-                .child(info_row("Path", details.path))
-                .child(info_row(
-                    "Size",
-                    details.size.map_or_else(
-                        || "—".into(),
-                        |size| format!("{} ({} bytes)", format_size(size), size),
-                    ),
-                ))
-                .child(info_row(
-                    "Modified",
-                    details.modified.map_or_else(
-                        || "—".into(),
-                        |time| {
-                            DateTime::<Local>::from(time)
-                                .format("%Y-%m-%d %H:%M:%S")
-                                .to_string()
-                        },
-                    ),
-                ))
-                .child(
-                    h_flex().justify_end().child(
-                        Button::new("file-info-close")
-                            .xsmall()
-                            .label("Close")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.details = None;
-                                cx.notify();
-                            })),
-                    ),
-                ),
-        )
-        .into_any_element()
-}
-
-fn info_row(label: &'static str, value: impl Into<SharedString>) -> impl IntoElement {
+fn info_row(cx: &App, label: &'static str, value: impl Into<SharedString>) -> impl IntoElement {
     h_flex()
         .gap_2()
         .items_start()
-        .text_xs()
-        .child(div().w(px(76.)).text_color(rgb(MUTED)).child(label))
+        .text_sm()
+        .child(div().w(px(76.)).text_color(theme::muted(cx)).child(label))
         .child(div().flex_1().min_w_0().child(value.into()))
 }
 
@@ -3916,21 +3486,26 @@ impl FileTransferView {
             self.remote_sort
         };
         let label = |column, name: &str| {
-            if sort.column == column {
-                format!("{} {}", name, if sort.ascending { "↑" } else { "↓" })
-            } else {
-                name.to_owned()
-            }
+            h_flex().items_center().gap_1().child(name.to_owned()).when(
+                sort.column == column,
+                |row| {
+                    row.child(Icon::new(if sort.ascending {
+                        IconName::SortAscending
+                    } else {
+                        IconName::SortDescending
+                    }))
+                },
+            )
         };
         h_flex()
-            .h(px(23.))
+            .py_1()
             .px_2()
             .gap_2()
             .items_center()
             .border_b_1()
-            .border_color(rgb(LINE))
+            .border_color(theme::line(cx))
             .text_xs()
-            .text_color(rgb(MUTED))
+            .text_color(theme::muted(cx))
             .child(div().w(px(14.)))
             .child(
                 div()
@@ -4073,17 +3648,6 @@ fn remote_parent(path: &str) -> Option<String> {
     })
 }
 
-fn empty_message(message: impl Into<SharedString>) -> impl IntoElement {
-    div()
-        .flex_1()
-        .flex()
-        .items_center()
-        .justify_center()
-        .text_xs()
-        .text_color(rgb(MUTED))
-        .child(message.into())
-}
-
 fn read_local_dir(path: &Path) -> Result<Vec<LocalEntry>, String> {
     let entries = std::fs::read_dir(path).map_err(|error| error.to_string())?;
     let mut files = entries
@@ -4188,11 +3752,60 @@ mod tests {
         assert_eq!(std::fs::read(&source).unwrap(), b"source");
         assert_eq!(std::fs::read(&target).unwrap(), b"target");
     }
-    use gpui::{AppContext, Modifiers, TestAppContext, px, size};
+    use gpui::{AppContext, Focusable, Modifiers, TestAppContext, px, size};
     use gpui_component::input::InputState;
     use rv_session::{FileTransferSnapshot, PhotoEntry, SessionHandle};
     use vnc::tight::{TightFileCaps, TightFileEntry};
 
+    #[gpui::test]
+    fn folder_dialog_restores_file_shortcut_focus(cx: &mut TestAppContext) {
+        let directory = tempfile::tempdir().unwrap();
+        let memory = test_memory();
+        memory.folders.borrow_mut().local = Some(directory.path().into());
+        let (session, _peer) = SessionHandle::test_pair();
+        cx.update(gpui_component::init);
+        let mut view = None;
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let entity = cx.new(|cx| {
+                FileTransferView::new(
+                    "test".into(),
+                    session.file_client(),
+                    true,
+                    memory,
+                    window,
+                    cx,
+                )
+            });
+            view = Some(entity.clone());
+            gpui_component::Root::new(
+                cx.new(|_| crate::file_transfer_window::dialogs::TransferShell(entity)),
+                window,
+                cx,
+            )
+        });
+        let view = view.unwrap();
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.focus.focus(window, cx);
+                view.new_folder_side = Some(FileSide::Local);
+                cx.notify();
+            })
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.update(|window, cx| {
+            view.read_with(cx, |view, cx| {
+                assert!(view.new_folder_input.focus_handle(cx).is_focused(window));
+            })
+        });
+        view.update(cx, |view, cx| view.dismiss_component_dialog(3, cx));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.update(|window, cx| {
+            view.read_with(cx, |view, _| {
+                assert!(view.component_dialog.is_none());
+                assert!(view.focus.is_focused(window));
+            })
+        });
+    }
     #[gpui::test]
     fn reopening_transfer_view_restores_folders_and_photos_mode(cx: &mut TestAppContext) {
         let directory = tempfile::tempdir().unwrap();
@@ -4215,7 +3828,11 @@ mod tests {
                 )
             });
             first = Some(view.clone());
-            gpui_component::Root::new(view, window, cx)
+            gpui_component::Root::new(
+                cx.new(|_| crate::file_transfer_window::dialogs::TransferShell(view)),
+                window,
+                cx,
+            )
         });
         let first = first.unwrap();
         cx.update(|window, cx| {
@@ -4354,6 +3971,7 @@ mod tests {
                 photo_thumbs: HashMap::new(),
                 allow_upload: true,
                 details: None,
+                component_dialog: None,
                 pending_delete: None,
                 pending_rename: None,
                 new_folder_side: None,
@@ -4364,7 +3982,11 @@ mod tests {
                 _subscriptions: Vec::new(),
             });
             view_entity = Some(view.clone());
-            gpui_component::Root::new(view, window, cx)
+            gpui_component::Root::new(
+                cx.new(|_| crate::file_transfer_window::dialogs::TransferShell(view)),
+                window,
+                cx,
+            )
         });
         cx.simulate_resize(size(px(760.), px(440.)));
         cx.update(|window, cx| {
@@ -4508,6 +4130,7 @@ mod tests {
                 photo_thumbs: HashMap::new(),
                 allow_upload: true,
                 details: None,
+                component_dialog: None,
                 pending_delete: None,
                 pending_rename: None,
                 new_folder_side: None,
@@ -4518,7 +4141,11 @@ mod tests {
                 _subscriptions: Vec::new(),
             });
             view_entity = Some(view.clone());
-            gpui_component::Root::new(view, window, cx)
+            gpui_component::Root::new(
+                cx.new(|_| crate::file_transfer_window::dialogs::TransferShell(view)),
+                window,
+                cx,
+            )
         });
         cx.simulate_resize(size(px(760.), px(440.)));
         cx.update(|window, cx| window.draw(cx).clear(cx));
@@ -4726,6 +4353,7 @@ mod tests {
                 photo_thumbs: HashMap::new(),
                 allow_upload: true,
                 details: None,
+                component_dialog: None,
                 pending_delete: None,
                 pending_rename: None,
                 new_folder_side: None,
@@ -4736,7 +4364,11 @@ mod tests {
                 _subscriptions: Vec::new(),
             });
             view_entity = Some(view.clone());
-            gpui_component::Root::new(view, window, cx)
+            gpui_component::Root::new(
+                cx.new(|_| crate::file_transfer_window::dialogs::TransferShell(view)),
+                window,
+                cx,
+            )
         });
         cx.simulate_resize(size(px(760.), px(440.)));
         cx.update(|window, cx| window.draw(cx).clear(cx));

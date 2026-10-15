@@ -2,7 +2,43 @@ use gpui::{AssetSource, Result, SharedString};
 use gpui_component::IconNamed;
 use std::borrow::Cow;
 
-const ICONS: [(&str, &[u8]); 13] = [
+const ICONS: [(&str, &[u8]); 21] = [
+    (
+        "rv-icons/trash.svg",
+        include_bytes!("../../../assets/icons/trash.svg"),
+    ),
+    (
+        "rv-icons/pencil.svg",
+        include_bytes!("../../../assets/icons/pencil.svg"),
+    ),
+    (
+        "rv-icons/shopping-bag.svg",
+        include_bytes!("../../../assets/icons/shopping-bag.svg"),
+    ),
+    (
+        "rv-icons/receipt-text.svg",
+        include_bytes!("../../../assets/icons/receipt-text.svg"),
+    ),
+    (
+        "rv-icons/clock.svg",
+        include_bytes!("../../../assets/icons/clock.svg"),
+    ),
+    (
+        "rv-icons/archive.svg",
+        include_bytes!("../../../assets/icons/archive.svg"),
+    ),
+    (
+        "rv-icons/tags.svg",
+        include_bytes!("../../../assets/icons/tags.svg"),
+    ),
+    (
+        "rv-icons/smartphone.svg",
+        include_bytes!("../../../assets/icons/smartphone.svg"),
+    ),
+    (
+        "rv-icons/message-circle.svg",
+        include_bytes!("../../../assets/icons/message-circle.svg"),
+    ),
     (
         "rv-icons/home.svg",
         include_bytes!("../../../assets/icons/home.svg"),
@@ -46,10 +82,6 @@ const ICONS: [(&str, &[u8]); 13] = [
     (
         "rv-icons/monitor.svg",
         include_bytes!("../../../assets/icons/monitor.svg"),
-    ),
-    (
-        "rv-icons/wrench.svg",
-        include_bytes!("../../../assets/icons/wrench.svg"),
     ),
     (
         "rv-icons/cloud.svg",
@@ -122,7 +154,6 @@ mod tests {
             assert!(Assets.list("rv-icons/").unwrap().contains(&path));
         }
         for icon in [
-            FunctionIcon::Wrench,
             FunctionIcon::Cloud,
             FunctionIcon::Mail,
             FunctionIcon::LogOut,
@@ -139,12 +170,23 @@ mod tests {
 
 #[derive(Clone)]
 pub enum FunctionIcon {
+    Edit,
+    Trash,
+    Products,
+    Orders,
+    All,
+    Favorite,
+    Recent,
+    Archive,
+    Tags,
+    Smartphone,
+    Refresh,
+    Chat,
     User,
     LogOut,
     Mail,
     Shield,
     Monitor,
-    Wrench,
     Cloud,
     Folder,
     Play,
@@ -153,12 +195,23 @@ pub enum FunctionIcon {
 impl IconNamed for FunctionIcon {
     fn path(self) -> SharedString {
         match self {
+            Self::Edit => "rv-icons/pencil.svg",
+            Self::Trash => "rv-icons/trash.svg",
+            Self::Products => "rv-icons/shopping-bag.svg",
+            Self::Orders => "rv-icons/receipt-text.svg",
+            Self::All => "icons/layout-dashboard.svg",
+            Self::Favorite => "icons/star.svg",
+            Self::Recent => "rv-icons/clock.svg",
+            Self::Archive => "rv-icons/archive.svg",
+            Self::Tags => "rv-icons/tags.svg",
+            Self::Smartphone => "rv-icons/smartphone.svg",
+            Self::Refresh => "rv-icons/rotate-cw.svg",
+            Self::Chat => "rv-icons/message-circle.svg",
             Self::User => "icons/user.svg",
             Self::LogOut => "rv-icons/log-out.svg",
             Self::Mail => "rv-icons/mail.svg",
             Self::Shield => "rv-icons/shield.svg",
             Self::Monitor => "rv-icons/monitor.svg",
-            Self::Wrench => "rv-icons/wrench.svg",
             Self::Cloud => "rv-icons/cloud.svg",
             Self::Folder => "icons/folder.svg",
             Self::Play => "icons/play.svg",

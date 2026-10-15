@@ -1,3 +1,4 @@
 /target
+/tempdir/
 **/*.rs.bk
 .DS_Store

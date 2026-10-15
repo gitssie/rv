@@ -1,9 +1,7 @@
 use super::*;
 use crate::assets::AppActionIcon;
-use gpui_component::{
-    button::ButtonCustomVariant,
-    popover::{Popover, PopoverState},
-};
+use gpui_component::menu::{DropdownMenu, PopupMenuItem};
+use gpui_component::popover::{Popover, PopoverState};
 use rv_core::{AppShortcut, move_app_shortcut};
 use rv_session::{AppCapabilities, AppCommand, AppEvent, RemoteApp};
 use std::collections::{HashMap, HashSet};
@@ -92,6 +90,8 @@ pub(super) struct AppToolbar {
     icons: HashMap<String, Arc<AppIconImage>>,
     fallback_icons: HashMap<String, Arc<AppIconImage>>,
     requested: HashSet<String>,
+    home_icon_ids: Vec<String>,
+    pub(super) cache_paths: Option<rv_core::StorePaths>,
     busy: HashSet<String>,
     foreground: Option<String>,
     pub picker_open: bool,
@@ -101,6 +101,10 @@ pub(super) struct AppToolbar {
 }
 
 impl AppToolbar {
+    pub(in crate::session_window) fn home_foreground(&self) -> Option<String> {
+        self.foreground.clone()
+    }
+
     pub fn new(
         shortcuts: Vec<AppShortcut>,
         _window: &mut Window,
@@ -121,6 +125,8 @@ impl AppToolbar {
             icons: HashMap::new(),
             fallback_icons: bundled_app_icons(),
             requested: HashSet::new(),
+            home_icon_ids: vec![],
+            cache_paths: None,
             busy: HashSet::new(),
             foreground: None,
             picker_open: false,
@@ -249,13 +255,11 @@ pub(super) fn app_icon(image: Option<Arc<AppIconImage>>, size: f32) -> Div {
         })
         .when(image.is_none(), |el| {
             // Unknown Apps use a graphic placeholder, never a letter tile.
-            el.bg(rgb(0x42536c))
-                .flex()
+            el.flex()
                 .items_center()
                 .justify_center()
                 .text_sm()
-                .text_color(rgb(0xe4edf7))
-                .child(Icon::new(IconName::LayoutDashboard).small())
+                .child(Icon::new(IconName::LayoutDashboard))
         })
 }
 
@@ -282,20 +286,14 @@ fn app_action_button(
     label: &'static str,
     enabled: bool,
     menu: WeakEntity<PopoverState>,
-    cx: &App,
+    _cx: &App,
     handler: impl Fn(&mut App) + 'static,
 ) -> Button {
     let handler = Rc::new(handler);
     let keyboard_handler = handler.clone();
     let click_menu = menu.clone();
     Button::new(id)
-        .custom(
-            ButtonCustomVariant::new(cx)
-                .foreground(theme::toolbar_fg())
-                .hover(rgb(0x2a343f).into())
-                .active(rgb(0x35404e).into()),
-        )
-        .size(px(28.))
+        .ghost()
         .icon(Icon::new(icon))
         .accessibility_label(label)
         .debug_selector(move || id.into())
@@ -322,6 +320,20 @@ fn app_action_button(
 impl SessionView {
     pub(super) fn apply_app_event(&mut self, event: AppEvent, cx: &mut Context<Self>) {
         match event {
+            AppEvent::Profile(profile) => {
+                if let Some(book) = self.address_book.as_ref().and_then(WeakEntity::upgrade) {
+                    book.update(cx, |book, cx| {
+                        book.import_app_profile(&profile.app_id, &profile.data, cx)
+                    });
+                }
+            }
+            AppEvent::DeviceInfo(info) => {
+                if let Some(id) = self.req.connection_id
+                    && let Some(book) = self.address_book.as_ref().and_then(WeakEntity::upgrade)
+                {
+                    book.update(cx, |book, cx| book.remember_device_info(id, &info, cx));
+                }
+            }
             AppEvent::Notifications(snapshot) => {
                 if let Some(a) = &self.assistant {
                     a.update(cx, |a, cx| a.receive_notifications(snapshot.clone(), cx));
@@ -337,6 +349,9 @@ impl SessionView {
             AppEvent::UnlockArmed(attempt, armed) => self.unlock_armed(attempt, armed, cx),
             AppEvent::Karing(response) => self.apply_karing_response(response, cx),
             AppEvent::Capabilities(caps) => {
+                if !caps.control || !caps.clipboard_write {
+                    self.clipboard_transfer.disconnected();
+                }
                 if !caps.control || caps.zx_control.is_none() {
                     self.cancel_karing(cx);
                     self.karing.disconnected();
@@ -363,13 +378,29 @@ impl SessionView {
                 self.apps.loading = false;
                 self.apps.error = None;
             }
-            AppEvent::Foreground(id) => self.apps.foreground = id,
+            AppEvent::Foreground(id) => {
+                self.apps.foreground = id;
+                self.notify_home(cx);
+            }
             AppEvent::Icon {
                 bundle_id,
                 width,
                 height,
                 bgra,
             } => {
+                if let Some(paths) = self.apps.cache_paths.clone() {
+                    let bundle = bundle_id.clone();
+                    let pixels = bgra.clone();
+                    cx.background_executor()
+                        .spawn(async move {
+                            if let Err(error) =
+                                crate::app_icons::save(&paths, &bundle, width, height, &pixels)
+                            {
+                                tracing::warn!(%bundle, %error, "App icon cache write failed");
+                            }
+                        })
+                        .detach();
+                }
                 if let Some(buf) = ImageBuffer::<Rgba<u8>, _>::from_raw(width, height, bgra) {
                     let icon = AppIconImage::new(Arc::new(RenderImage::new(SmallVec::from_elem(
                         image::Frame::new(buf),
@@ -389,6 +420,11 @@ impl SessionView {
                         }
                         self.apps.requested.remove(&evict);
                     }
+                    if let Some(book) = self.address_book.as_ref().and_then(WeakEntity::upgrade) {
+                        book.update(cx, |book, cx| {
+                            book.remember_app_icon(bundle_id.clone(), icon.original.clone(), cx)
+                        });
+                    }
                     if let Some(old) = self.apps.icons.insert(bundle_id, icon) {
                         old.drop_images(cx);
                     }
@@ -396,6 +432,7 @@ impl SessionView {
             }
             AppEvent::Finished(command) => {
                 if let AppCommand::WriteClipboard { token, .. } = &command {
+                    self.clipboard_transfer_finished(token, cx);
                     self.status = "Clipboard written".into();
                     if self.assistant_clipboard.as_ref() == Some(token) {
                         self.assistant_clipboard = None;
@@ -416,6 +453,7 @@ impl SessionView {
                     return;
                 }
                 if let AppCommand::WriteClipboard { token, .. } = &command {
+                    self.clipboard_transfer.failed(token);
                     self.status = format!("Clipboard write failed: {message}").into();
                     if self.assistant_clipboard.as_ref() == Some(token) {
                         self.assistant_clipboard = None;
@@ -516,6 +554,7 @@ impl SessionView {
             );
         }
         ids.extend(self.environment_icon_ids());
+        ids.extend(self.apps.home_icon_ids.iter().cloned());
         ids.extend(
             self.notifications
                 .snapshot
@@ -537,7 +576,11 @@ impl SessionView {
         self.handle.app(AppCommand::List);
         cx.notify();
     }
-    pub(super) fn request_app_icons(&mut self, cx: &Context<Self>) {
+    pub(crate) fn request_home_app_icons(&mut self, bundles: Vec<String>, cx: &mut Context<Self>) {
+        self.apps.home_icon_ids = bundles;
+        self.request_app_icons(cx);
+    }
+    pub(super) fn request_app_icons(&mut self, cx: &mut Context<Self>) {
         if !self.apps.caps.as_ref().is_some_and(|c| c.icons) {
             return;
         }
@@ -546,7 +589,39 @@ impl SessionView {
             if self.apps.installed.iter().any(|a| a.bundle_id == id)
                 && self.apps.requested.insert(id.clone())
             {
-                self.handle.app(AppCommand::Icon(id));
+                let paths = self.apps.cache_paths.clone();
+                if let Some(paths) = paths {
+                    cx.spawn(async move |this, cx| {
+                        let bundle = id.clone();
+                        let cached = cx
+                            .background_executor()
+                            .spawn(async move { crate::app_icons::load(&paths, &bundle) })
+                            .await;
+                        let _ = this.update(cx, |this, cx| {
+                            if !this.apps.requested.contains(&id)
+                                || !this.apps.caps.as_ref().is_some_and(|caps| caps.icons)
+                            {
+                                return;
+                            }
+                            if let Some(image) = cached {
+                                if let Some(book) =
+                                    this.address_book.as_ref().and_then(WeakEntity::upgrade)
+                                {
+                                    book.update(cx, |book, cx| {
+                                        book.remember_app_icon(id.clone(), image.clone(), cx)
+                                    });
+                                }
+                                this.apps.icons.insert(id, AppIconImage::new(image));
+                                cx.notify();
+                            } else {
+                                this.handle.app(AppCommand::Icon(id));
+                            }
+                        });
+                    })
+                    .detach();
+                } else {
+                    self.handle.app(AppCommand::Icon(id));
+                }
             }
         }
     }
@@ -603,82 +678,43 @@ impl SessionView {
         }
     }
     pub(super) fn render_keyboard_shortcuts(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let entity = cx.entity();
-        Popover::new("keyboard-shortcuts")
-            .bg(theme::toolbar())
-            .text_color(theme::toolbar_fg())
-            .border_color(theme::toolbar_line())
-            .p_1()
-            .rounded_md()
-            .anchor(Anchor::TopLeft)
-            .trigger(
-                Button::new("keyboard-menu")
-                    .debug_selector(|| "keyboard-menu".into())
-                    .ghost()
-                    .bg(theme::toolbar())
-                    .size(px(28.))
-                    .icon(IconName::SquareTerminal)
-                    .tooltip("键盘快捷操作")
-                    .text_color(theme::toolbar_fg()),
-            )
-            .content(move |_, _, cx| {
-                entity.update(cx, |this, cx| {
-                    v_flex()
-                        .w(px(160.))
-                        .gap_0p5()
-                        .child(menu_item(
-                            "compact-cad",
-                            IconName::SquareTerminal,
-                            "Ctrl + Alt + Del",
-                            cx.listener(|this, _, _, _| this.send_cad()),
-                        ))
-                        .children(
-                            [
-                                ("Ctrl", XK_CONTROL_L),
-                                ("Alt", XK_ALT_L),
-                                ("Win", rv_core::XK_SUPER_L),
-                                ("Tab", rv_core::XK_TAB),
-                                ("Esc", rv_core::XK_ESCAPE),
-                                ("Caps", rv_core::XK_CAPS_LOCK),
-                            ]
-                            .into_iter()
-                            .map(|(label, key)| {
-                                Button::new(label)
-                                    .debug_selector(move || format!("keyboard-key-{label}"))
-                                    .ghost()
-                                    .small()
-                                    .h(px(26.))
-                                    .w_full()
-                                    .px_2()
-                                    .justify_start()
-                                    .text_color(theme::toolbar_fg())
-                                    .child(
-                                        h_flex()
-                                            .gap_2()
-                                            .items_center()
-                                            .child(
-                                                div()
-                                                    .w(px(15.))
-                                                    .text_center()
-                                                    .text_size(px(14.))
-                                                    .text_color(theme::toolbar_muted())
-                                                    .child(match label {
-                                                        "Ctrl" => "⌃",
-                                                        "Alt" => "⌥",
-                                                        "Win" => "⌘",
-                                                        "Tab" => "⇥",
-                                                        "Esc" => "⎋",
-                                                        _ => "⇪",
-                                                    }),
-                                            )
-                                            .child(div().text_size(px(12.)).child(label)),
-                                    )
-                                    .disabled(this.phase != Phase::Connected || this.view_only())
-                                    .on_click(cx.listener(move |this, _, _, _| this.tap_key(key)))
+        let entity = cx.entity().downgrade();
+        let live = self.phase == Phase::Connected && !self.view_only();
+        let focus = self.focus.clone();
+        Button::new("keyboard-menu")
+            .debug_selector(|| "keyboard-menu".into())
+            .ghost()
+            .icon(IconName::SquareTerminal)
+            .accessibility_label("按键")
+            .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
+                let cad = entity.clone();
+                let mut menu = menu
+                    .action_context(focus.clone())
+                    .item(
+                        PopupMenuItem::new("Ctrl + Alt + Del")
+                            .icon(IconName::SquareTerminal)
+                            .disabled(!live)
+                            .on_click(move |_, _, cx| {
+                                let _ = cad.update(cx, |this, _| this.send_cad());
                             }),
-                        )
-                        .into_any_element()
-                })
+                    )
+                    .separator();
+                for (label, key) in [
+                    ("Ctrl", XK_CONTROL_L),
+                    ("Alt", XK_ALT_L),
+                    ("Win", rv_core::XK_SUPER_L),
+                    ("Tab", rv_core::XK_TAB),
+                    ("Esc", rv_core::XK_ESCAPE),
+                    ("Caps", rv_core::XK_CAPS_LOCK),
+                ] {
+                    let entity = entity.clone();
+                    menu = menu.item(PopupMenuItem::new(label).disabled(!live).on_click(
+                        move |_, _, cx| {
+                            let _ = entity.update(cx, |this, _| this.tap_key(key));
+                        },
+                    ));
+                }
+                menu
             })
     }
     pub(super) fn render_app_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -690,7 +726,6 @@ impl SessionView {
             .flex_shrink(1.)
             .items_center()
             .gap_1()
-            .child(toolbar_sep())
             .child(
                 h_flex()
                     .id("app-shortcuts-strip")
@@ -727,11 +762,10 @@ impl SessionView {
                                     });
                                 }
                             })
-                            .bg(theme::toolbar())
-                            .text_color(theme::toolbar_fg())
-                            .border_color(theme::toolbar_line())
+                            .bg(theme::card(cx))
+                            .border_color(theme::line(cx))
                             .p_1()
-                            .rounded_md()
+                            .rounded(theme::radius(cx))
                             .trigger(ShortcutTrigger(
                                 div()
                                     .id(SharedString::from(format!("app-shortcut-{id}")))
@@ -741,13 +775,12 @@ impl SessionView {
                                         format!("shortcut-{}", shortcut.bundle_id)
                                     })
                                     .w(px(30.))
-                                    .h(px(32.))
                                     .flex()
                                     .items_center()
                                     .justify_center()
-                                    .rounded_md()
+                                    .rounded(theme::radius(cx))
                                     .cursor_pointer()
-                                    .hover(|s| s.bg(rgb(0x35404e)))
+                                    .hover(|s| s.bg(theme::hover(cx)))
                                     .child(
                                         app_icon(self.apps.icon_for(&id), 24.).opacity(if busy {
                                             0.6
@@ -762,7 +795,7 @@ impl SessionView {
                                                 .bottom_0()
                                                 .size(px(3.))
                                                 .rounded_full()
-                                                .bg(rgb(0x8abfff)),
+                                                .bg(theme::accent(cx)),
                                         )
                                     })
                                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -852,17 +885,11 @@ impl SessionView {
                     .child(
                         Popover::new("app-picker-popover")
                             .anchor(Anchor::TopRight)
-                            .appearance(false)
                             .trigger(
                                 Button::new("add-app-shortcut")
-                                    .custom(
-                                        ButtonCustomVariant::new(cx)
-                                            .foreground(theme::toolbar_muted())
-                                            .hover(rgb(0x2a343f).into())
-                                            .active(rgb(0x35404e).into()),
-                                    )
+                                    .ghost()
                                     .icon(IconName::Plus)
-                                    .text_color(theme::toolbar_muted()),
+                                    .text_color(theme::muted(cx)),
                             )
                             .open(self.apps.picker_open)
                             .on_open_change(move |open, window, cx| {
@@ -906,19 +933,11 @@ impl SessionView {
         } else {
             None
         };
-        v_flex()
+        crate::ui::tool_panel(cx)
             .id("app-picker")
             .debug_selector(|| "app-picker".into())
             .occlude()
             .w(px(360.))
-            .p_3()
-            .gap_2()
-            .rounded_lg()
-            .bg(theme::toolbar())
-            .border_1()
-            .border_color(theme::toolbar_line())
-            .shadow_lg()
-            .text_color(theme::toolbar_fg())
             .child(
                 h_flex()
                     .items_center()
@@ -926,17 +945,16 @@ impl SessionView {
                     .child(
                         div()
                             .flex_1()
-                            .text_size(px(11.))
-                            .text_color(theme::toolbar_muted())
+                            .text_xs()
+                            .text_color(theme::muted(cx))
                             .child("快捷启动"),
                     )
                     .when(self.apps.caps.as_ref().is_some_and(|c| c.list), |row| {
                         row.child(
                             Button::new("refresh-apps")
                                 .ghost()
-                                .small()
                                 .icon(IconName::Redo)
-                                .text_color(theme::toolbar_muted())
+                                .text_color(theme::muted(cx))
                                 .disabled(self.apps.loading)
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.refresh_apps(cx);
@@ -945,7 +963,7 @@ impl SessionView {
                     }),
             )
             .when_some(self.apps.error.clone(), |el, error| {
-                el.child(div().text_xs().text_color(rgb(0xff9c9c)).child(error))
+                el.child(div().text_xs().text_color(theme::danger(cx)).child(error))
             })
             .when_some(message, |el, message| {
                 el.child(
@@ -953,7 +971,7 @@ impl SessionView {
                         .py_4()
                         .text_center()
                         .text_xs()
-                        .text_color(theme::toolbar_muted())
+                        .text_color(theme::muted(cx))
                         .child(message),
                 )
             })
@@ -980,9 +998,9 @@ impl SessionView {
                             .gap_2()
                             .items_center()
                             .justify_center()
-                            .rounded_md()
+                            .rounded(theme::radius(cx))
                             .cursor_pointer()
-                            .hover(|s| s.bg(rgb(0x35404e)))
+                            .hover(|s| s.bg(theme::hover(cx)))
                             .child(app_icon(self.apps.icon_for(&app.bundle_id), 38.))
                             .child(
                                 div()
@@ -998,8 +1016,8 @@ impl SessionView {
                                         .absolute()
                                         .top_1()
                                         .right_1()
-                                        .text_color(rgb(0x8abfff))
-                                        .child(Icon::new(IconName::Check).small()),
+                                        .text_color(theme::accent(cx))
+                                        .child(Icon::new(IconName::Check)),
                                 )
                             })
                             .on_click(cx.listener(move |this, _, _, cx| {
@@ -1152,7 +1170,7 @@ mod tests {
         ] {
             open_app_actions(cx);
             let row = cx.debug_bounds("app-actions").unwrap();
-            assert!(row.size.width <= px(100.) && row.size.height <= px(32.));
+            assert!(row.size.width <= px(120.) && row.size.height <= px(40.));
             let bounds = cx.debug_bounds(selector).unwrap();
             cx.simulate_click(bounds.center(), Modifiers::default());
             let sent = commands(&mut peer);
@@ -1355,6 +1373,61 @@ mod tests {
         );
     }
     #[gpui::test]
+    fn cached_bundle_artwork_skips_phone_request_and_missing_artwork_is_requested_once(
+        cx: &mut TestAppContext,
+    ) {
+        let (view, cx, mut peer) = setup(cx, false);
+        enable(&view, cx);
+        let dir = tempfile::tempdir().unwrap();
+        let paths = rv_core::StorePaths::in_dir(dir.path().into());
+        crate::app_icons::save(&paths, "cached.bundle", 1, 1, &[1, 2, 3, 255]).unwrap();
+        commands(&mut peer);
+        view.update(cx, |view, cx| {
+            view.apps.cache_paths = Some(paths);
+            view.apps.caps.as_mut().unwrap().icons = true;
+            view.apps.installed = ["cached.bundle", "missing.bundle"]
+                .map(|id| RemoteApp {
+                    bundle_id: id.into(),
+                    name: id.into(),
+                    can_launch: true,
+                    can_terminate: true,
+                })
+                .to_vec();
+            view.request_home_app_icons(
+                vec![
+                    "cached.bundle".into(),
+                    "missing.bundle".into(),
+                    "missing.bundle".into(),
+                ],
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.apps
+                    .icons
+                    .get("cached.bundle")
+                    .unwrap()
+                    .original
+                    .as_bytes(0)
+                    .unwrap(),
+                &[1, 2, 3, 255]
+            )
+        });
+        let icons: Vec<_> = commands(&mut peer)
+            .into_iter()
+            .filter(|command| matches!(command, SessionCommand::App(AppCommand::Icon(_))))
+            .collect();
+        assert_eq!(icons.len(), 1);
+        assert!(
+            matches!(&icons[0], SessionCommand::App(AppCommand::Icon(id)) if id == "missing.bundle")
+        );
+        view.update(cx, |view, cx| view.request_app_icons(cx));
+        cx.run_until_parked();
+        assert!(commands(&mut peer).is_empty());
+    }
+    #[gpui::test]
     fn offscreen_app_refresh_retries_failed_icons(cx: &mut TestAppContext) {
         let (view, cx, mut peer) = setup(cx, false);
         enable(&view, cx);
@@ -1421,7 +1494,7 @@ mod tests {
         assert!(commands(&mut peer).is_empty());
         cx.simulate_resize(size(px(640.), px(400.)));
         cx.update(|window, cx| window.draw(cx).clear(cx));
-        for selector in ["app-plus", "disconnect-control"] {
+        for selector in ["app-plus", "function-menu-toggle"] {
             let bounds = cx.debug_bounds(selector).unwrap();
             assert!(
                 bounds.right() <= px(640.),

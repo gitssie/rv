@@ -17,7 +17,6 @@ impl WorkAssistant {
                     .child(
                         Button::new("assistant-notifications-filter")
                             .outline()
-                            .small()
                             .label(if self.vinted_only {
                                 "仅 Vinted"
                             } else {
@@ -31,7 +30,6 @@ impl WorkAssistant {
                     .child(
                         Button::new("assistant-notifications-refresh")
                             .outline()
-                            .small()
                             .label("刷新")
                             .disabled(!enabled)
                             .on_click(cx.listener(|_, _, _, cx| {
@@ -41,7 +39,6 @@ impl WorkAssistant {
                     .child(
                         Button::new("assistant-notifications-subscribe")
                             .ghost()
-                            .small()
                             .label(if self.notifications_enabled {
                                 "暂停推送"
                             } else {
@@ -93,7 +90,7 @@ impl WorkAssistant {
                 v_flex()
                     .gap_1()
                     .p_2()
-                    .rounded_md()
+                    .rounded(theme::radius(cx))
                     .border_1()
                     .border_color(theme::line(cx))
                     .child(div().text_xs().text_color(theme::muted(cx)).child(format!(

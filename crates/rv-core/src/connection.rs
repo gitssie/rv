@@ -184,6 +184,15 @@ pub struct TransferFolders {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Connection {
     pub id: ConnectionId,
+    /// Real identifier reported by the phone; never generated from an endpoint.
+    #[serde(default)]
+    pub guid: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub os_version: Option<String>,
+    #[serde(default)]
+    pub current_bundle_id: Option<String>,
     pub name: String,
     pub host: String,
     pub port: u16,
@@ -236,6 +245,10 @@ impl Connection {
         };
         Self {
             id: ConnectionId::new(),
+            guid: None,
+            model: None,
+            os_version: None,
+            current_bundle_id: None,
             name,
             host,
             port,

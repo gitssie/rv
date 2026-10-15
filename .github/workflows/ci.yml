@@ -30,6 +30,10 @@ jobs:
         run: rustup component add rustfmt
       - name: Check formatting
         run: cargo fmt --all -- --check
+      - name: Check UI style policy
+        run: |
+          python3 scripts/check-ui-style.py --self-test
+          python3 scripts/check-ui-style.py
 
   check:
     name: ${{ matrix.name }}

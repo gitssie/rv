@@ -49,6 +49,7 @@ const PHOTO_POLL_MAX: Duration = Duration::from_millis(200);
 #[derive(Debug, Clone)]
 pub enum SessionEvent {
     Status(String),
+    ControlState(bool),
     Connected { width: u16, height: u16 },
     FrameReady { generation: u64 },
     Clipboard(String),
@@ -107,6 +108,13 @@ impl SessionHandle {
     }
 
     pub fn spawn(request: ConnectRequest) -> Self {
+        Self::spawn_worker(request, false)
+    }
+    /// Runs only ZXTouch HTTP/2. Never opens the VNC port or requests frames.
+    pub fn spawn_control(request: ConnectRequest) -> Self {
+        Self::spawn_worker(request, true)
+    }
+    fn spawn_worker(request: ConnectRequest, control_only: bool) -> Self {
         let framebuffer = Arc::new(Mutex::new(Framebuffer::default()));
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let (event_tx, event_rx) = mpsc::channel();
@@ -114,14 +122,18 @@ impl SessionHandle {
         let file_state = Arc::new(Mutex::new(FileTransferSnapshot::default()));
         let worker_file_state = file_state.clone();
         let thread = thread::Builder::new()
-            .name("rv-vnc".into())
+            .name(if control_only { "rv-zxtouch" } else { "rv-vnc" }.into())
             .spawn(move || {
                 let rt = tokio::runtime::Builder::new_multi_thread()
                     .worker_threads(2)
                     .enable_all()
                     .build()
                     .expect("tokio runtime");
-                rt.block_on(run(request, fb, cmd_rx, event_tx, worker_file_state));
+                if control_only {
+                    rt.block_on(crate::phone_control::run(request, cmd_rx, event_tx));
+                } else {
+                    rt.block_on(run(request, fb, cmd_rx, event_tx, worker_file_state));
+                }
             })
             .expect("spawn vnc thread");
         Self {

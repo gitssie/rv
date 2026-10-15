@@ -10,7 +10,7 @@ use crate::theme;
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::{
-    Disableable, Sizable, StyledExt,
+    Disableable, StyledExt,
     button::{Button, ButtonVariants},
     h_flex,
     input::{InputEvent, InputState, TextareaState},
@@ -333,7 +333,6 @@ impl Render for WorkAssistant {
             .debug_selector(|| "work-assistant".into())
             .size_full()
             .bg(theme::card(cx))
-            .text_color(theme::ink(cx))
             .text_sm()
             .track_focus(&self.focus)
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
@@ -366,8 +365,6 @@ impl Render for WorkAssistant {
                         Button::new("assistant-close")
                             .debug_selector(|| "assistant-close".into())
                             .ghost()
-                            .small()
-                            .size(px(24.))
                             .icon(gpui_component::IconName::Close)
                             .tooltip("收起助手")
                             .on_click(cx.listener(|this, _, _, cx| {
@@ -377,46 +374,34 @@ impl Render for WorkAssistant {
                     ),
             )
             .child(
-                h_flex()
-                    .px_3()
-                    .gap_3()
-                    .border_b_1()
-                    .border_color(theme::line(cx))
+                gpui_component::tab::TabBar::new("assistant-tabs")
+                    .underline()
+                    .selected_index(match self.tab {
+                        Tab::Drafts => 0,
+                        Tab::Templates => 1,
+                        Tab::Notifications => 2,
+                    })
                     .children(
                         [
-                            (Tab::Drafts, "商品草稿", "assistant-tab-drafts"),
-                            (Tab::Templates, "常用文案", "assistant-tab-templates"),
-                            (Tab::Notifications, "通知", "assistant-tab-notifications"),
+                            ("商品草稿", "assistant-tab-drafts"),
+                            ("常用文案", "assistant-tab-templates"),
+                            ("通知", "assistant-tab-notifications"),
                         ]
-                        .map(|(tab, label, id)| {
-                            div()
-                                .border_b_2()
-                                .border_color(if self.tab == tab {
-                                    theme::accent(cx)
-                                } else {
-                                    gpui::transparent_black()
-                                })
-                                .child(
-                                    Button::new(id)
-                                        .debug_selector(move || id.into())
-                                        .ghost()
-                                        .small()
-                                        .h(px(30.))
-                                        .text_color(if self.tab == tab {
-                                            theme::accent(cx)
-                                        } else {
-                                            theme::muted(cx)
-                                        })
-                                        .label(label)
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.tab = tab;
-                                            this.confirm_delete = false;
-                                            this.confirm_template_delete = false;
-                                            cx.notify();
-                                        })),
-                                )
+                        .map(|(label, id)| {
+                            gpui_component::tab::Tab::new()
+                                .child(div().debug_selector(move || id.into()).child(label))
                         }),
-                    ),
+                    )
+                    .on_click(cx.listener(|this, index: &usize, _, cx| {
+                        this.tab = match index {
+                            1 => Tab::Templates,
+                            2 => Tab::Notifications,
+                            _ => Tab::Drafts,
+                        };
+                        this.confirm_delete = false;
+                        this.confirm_template_delete = false;
+                        cx.notify();
+                    })),
             )
             .child(
                 v_flex()
@@ -475,7 +460,6 @@ impl Render for WorkAssistant {
                         el.child(
                             Button::new("assistant-reload")
                                 .outline()
-                                .small()
                                 .label("重新载入（放弃未保存修改）")
                                 .disabled(self.busy || self.save_busy)
                                 .on_click(cx.listener(|this, _, window, cx| {

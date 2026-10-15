@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpui::*;
@@ -16,9 +15,13 @@ use crate::actions::*;
 use crate::session_window;
 use crate::theme;
 
+mod chat;
 mod connections;
 mod dialogs;
+mod home;
 mod layout;
+mod notifications;
+mod settings;
 mod sidebar;
 mod toolbar;
 
@@ -53,35 +56,26 @@ enum ViewMode {
     List,
 }
 
-#[derive(Clone, PartialEq, Eq)]
-enum SidebarFilter {
-    All,
-    Recents,
-    Label(String),
-}
-
-impl SidebarFilter {
-    fn title(&self) -> String {
-        match self {
-            Self::All => "全部连接".into(),
-            Self::Recents => "最近使用".into(),
-            Self::Label(l) => l.clone(),
-        }
-    }
-}
-
 #[derive(Clone)]
 enum Modal {
     None,
     Connection,
     DeleteConfirm { id: ConnectionId, name: String },
-    Preferences,
+    App,
+    AppDelete,
+    Shop,
+    Chat,
+    PhoneControl(ConnectionId),
 }
 
 const DEFAULT_ZXTOUCH_PORT: u16 = 6000;
 
 pub struct AddressBookApp {
     book: AddressBook,
+    home: home::HomeState,
+    chat: chat::ChatState,
+    settings: settings::SettingsState,
+    window_controls: crate::window_controls::WindowControls,
     read_only: bool,
     search: Entity<InputState>,
     name_input: Entity<InputState>,
@@ -92,7 +86,6 @@ pub struct AddressBookApp {
     zxtouch_port_input: Entity<InputState>,
     collapsed: bool,
     view_mode: ViewMode,
-    filter: SidebarFilter,
     selected: Option<ConnectionId>,
     remember_password: bool,
     encryption: EncryptionMode,
@@ -104,6 +97,9 @@ pub struct AddressBookApp {
     editing: Option<ConnectionId>,
     modal: Modal,
     status: SharedString,
+    notified_status: Option<SharedString>,
+    notification_close_task: Option<Task<()>>,
+    password_hint_task: Option<Task<()>>,
     credential_busy: bool,
     connection_error: Option<SharedString>,
     focus: FocusHandle,
@@ -114,18 +110,8 @@ impl AddressBookApp {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let mut status: SharedString = "Ready".into();
         let mut read_only = false;
-        let book = match rv_core::StorePaths::default_dir()
-            .and_then(AddressBook::load_or_quarantine)
-        {
-            Ok((book, warnings)) => {
-                for w in &warnings {
-                    tracing::warn!("{w}");
-                }
-                if let Some(w) = warnings.first() {
-                    status = w.clone().into();
-                }
-                book
-            }
+        let book = match rv_core::StorePaths::default_dir().and_then(AddressBook::load) {
+            Ok(book) => book,
             Err(e) => {
                 tracing::warn!("address book unavailable: {e}");
                 read_only = true;
@@ -150,7 +136,7 @@ impl AddressBookApp {
 
         let search = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("搜索连接…")
+                .placeholder("搜索名称、标签、备注…")
                 .clean_on_escape()
         });
         let name_input = cx.new(|cx| InputState::new(window, cx).placeholder("例如：办公 Mac"));
@@ -200,8 +186,15 @@ impl AddressBookApp {
         let focus = cx.focus_handle();
         focus.focus(window, cx);
 
-        Self {
+        let home = home::HomeState::new(book.paths(), window, cx);
+        let chat = chat::ChatState::new(window, cx);
+        let settings = settings::SettingsState::new(window, cx);
+        let mut app = Self {
             book,
+            home,
+            chat,
+            settings,
+            window_controls: Default::default(),
             read_only,
             search,
             name_input,
@@ -212,7 +205,6 @@ impl AddressBookApp {
             zxtouch_port_input,
             collapsed: false,
             view_mode: ViewMode::Grid,
-            filter: SidebarFilter::All,
             selected: None,
             remember_password: true,
             encryption: EncryptionMode::LetServerChoose,
@@ -224,11 +216,77 @@ impl AddressBookApp {
             editing: None,
             modal: Modal::None,
             status,
+            notified_status: None,
+            notification_close_task: None,
+            password_hint_task: None,
             credential_busy: false,
             connection_error: None,
             focus,
             _subscriptions: subscriptions,
+        };
+        app.subscribe_home(cx);
+        app.subscribe_settings(window, cx);
+        app.subscribe_chat(window, cx);
+        app
+    }
+
+    pub(crate) fn remember_device_info(
+        &mut self,
+        id: ConnectionId,
+        info: &serde_json::Value,
+        cx: &mut Context<Self>,
+    ) {
+        if self.read_only {
+            return;
         }
+        let Some(original) = self.book.get(id).cloned() else {
+            return;
+        };
+        let mut device = original.clone();
+        let field = |key: &str| {
+            info[key]
+                .as_str()
+                .filter(|s| !s.trim().is_empty() && s.len() <= 1024)
+                .map(str::to_owned)
+        };
+        device.model = field("model");
+        device.os_version = field("os_version");
+        if info["guid_status"] == "available"
+            && info["guid_source"] == "MobileGestalt.UniqueDeviceID"
+        {
+            device.guid = field("guid")
+                .filter(|s| s.len() <= 128 && s.bytes().all(|c| c.is_ascii_hexdigit() || c == b'-'))
+                .map(|s| s.to_lowercase());
+        }
+        self.book.upsert(device);
+        if let Err(error) = self.book.save() {
+            self.book.upsert(original);
+            self.status = format!("设备信息保存失败：{error}").into();
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn sync_phone_backups(
+        &mut self,
+        device: ConnectionId,
+        bundle: &str,
+        result: &serde_json::Value,
+        cx: &mut Context<Self>,
+    ) {
+        if self.read_only {
+            return;
+        }
+        match rv_core::workspace::WorkspaceStore::open(self.book.paths())
+            .and_then(|mut store| store.sync_backups(device, bundle, result))
+        {
+            Ok(report) if report.missing_idfv > 0 => {
+                self.status =
+                    format!("{} 份备份未提供 IDFV，未生成卡片", report.missing_idfv).into()
+            }
+            Ok(_) => {}
+            Err(error) => self.status = format!("备份同步失败：{error}").into(),
+        }
+        self.reload_home(cx);
     }
 
     fn persist(&mut self) {
@@ -357,34 +415,20 @@ impl AddressBookApp {
             connection.remember_password = remember;
         }
         self.book.save()?;
+        self.home.controls.remove(&id);
+        self.home.control_loading.remove(&id);
         cx.notify();
         Ok(Some(id))
     }
 
     fn set_status(&mut self, text: impl Into<SharedString>, cx: &mut Context<Self>) {
         self.status = text.into();
+        self.notified_status = None;
         cx.notify();
     }
 
     fn query(&self, cx: &App) -> String {
         self.search.read(cx).value().to_string()
-    }
-
-    fn visible(&self, cx: &App) -> Vec<Connection> {
-        let q = self.query(cx);
-        match &self.filter {
-            SidebarFilter::All => self.book.filtered(&q, None),
-            SidebarFilter::Recents => {
-                let matching: HashSet<ConnectionId> =
-                    self.book.filtered(&q, None).iter().map(|c| c.id).collect();
-                self.book
-                    .recents(20)
-                    .into_iter()
-                    .filter(|c| matching.contains(&c.id))
-                    .collect()
-            }
-            SidebarFilter::Label(label) => self.book.filtered(&q, Some(label)),
-        }
     }
 
     fn open_editor(
@@ -426,25 +470,28 @@ impl AddressBookApp {
             .update(cx, |s, cx| s.set_value(server, window, cx));
         self.username_input
             .update(cx, |s, cx| s.set_value(username, window, cx));
-        self.password_input
-            .update(cx, |s, cx| s.set_value("", window, cx));
+        self.password_input.update(cx, |input, cx| {
+            input.set_value("", window, cx);
+            input.set_placeholder("密码（可选）", window, cx);
+        });
         self.labels_input
             .update(cx, |s, cx| s.set_value(labels, window, cx));
         self.modal = Modal::Connection;
-        let first = if conn.is_some() {
-            &self.name_input
-        } else {
-            &self.server_input
-        };
-        first.update(cx, |s, cx| s.focus(window, cx));
+        self.refresh_password_hint(window, cx);
         cx.notify();
     }
 
     fn on_new(&mut self, _: &NewConnection, window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings.page.is_some() {
+            return;
+        }
         self.open_editor(None, window, cx);
     }
 
     fn on_properties(&mut self, _: &OpenProperties, window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings.page.is_some() {
+            return;
+        }
         let Some(conn) = self.selected.and_then(|id| self.book.get(id).cloned()) else {
             self.set_status("Select a connection first", cx);
             return;
@@ -453,11 +500,15 @@ impl AddressBookApp {
     }
 
     fn on_duplicate(&mut self, _: &DuplicateSelected, _: &mut Window, cx: &mut Context<Self>) {
+        if self.settings.page.is_some() {
+            return;
+        }
         let Some(conn) = self.selected.and_then(|id| self.book.get(id).cloned()) else {
             return;
         };
         let mut copy = conn;
         copy.id = ConnectionId::new();
+        copy.guid = None;
         copy.name = format!("{} copy", copy.name);
         copy.last_connected = None;
         copy.remember_password = false;
@@ -540,7 +591,7 @@ impl AddressBookApp {
                     if remember && !password.is_empty() {
                         paths.save_password(id, &password)?;
                     }
-                    if remember && password.is_empty() && connect {
+                    if remember && password.is_empty() {
                         paths.load_password(id)
                     } else {
                         Ok((!password.is_empty()).then_some(password))
@@ -570,6 +621,7 @@ impl AddressBookApp {
         cx: &mut Context<Self>,
     ) {
         let req = ConnectRequest::from_connection(&conn, password);
+        self.start_phone_control(&conn, req.clone(), window, cx);
         if connect {
             conn.last_connected = Some(unix_now());
         }
@@ -580,14 +632,6 @@ impl AddressBookApp {
         let saved_name = conn.name.clone();
         self.book.upsert(conn);
         self.persist();
-        if let SidebarFilter::Label(label) = &self.filter
-            && !self
-                .selected
-                .and_then(|id| self.book.get(id))
-                .is_some_and(|c| c.labels.contains(label))
-        {
-            self.filter = SidebarFilter::All;
-        }
         if connect {
             self.launch(req, cx);
         } else {
@@ -597,10 +641,14 @@ impl AddressBookApp {
     }
 
     fn on_connect(&mut self, _: &ConnectSelected, window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings.page.is_some() && matches!(self.modal, Modal::None) {
+            return;
+        }
         match self.modal.clone() {
             Modal::Connection => self.submit_connect(true, window, cx),
             Modal::DeleteConfirm { id, .. } => self.confirm_delete(id, cx),
-            Modal::Preferences => self.close_modal(cx),
+            Modal::AppDelete => self.confirm_app_delete(cx),
+            Modal::App | Modal::Shop | Modal::Chat | Modal::PhoneControl(_) => {}
             Modal::None => {
                 let Some(id) = self.selected else {
                     self.set_status("Select a connection to connect", cx);
@@ -612,6 +660,9 @@ impl AddressBookApp {
     }
 
     fn connect_id(&mut self, id: ConnectionId, cx: &mut Context<Self>) {
+        if self.focus_phone(id, cx) {
+            return;
+        }
         if self.credential_busy {
             return;
         }
@@ -676,6 +727,7 @@ impl AddressBookApp {
             menu_key: prefs.menu_key.clone(),
             hide_shots: prefs.hide_screenshots,
             thumb_path: req.connection_id.map(|id| self.book.paths().thumb_path(id)),
+            app_icon_cache: Some(self.book.paths().clone()),
             address_book: Some(cx.entity().downgrade()),
             transfer_folders,
             app_shortcuts: req
@@ -739,11 +791,7 @@ impl AddressBookApp {
                 }
                 self.persist();
                 self.status = "Connection removed".into();
-                if let SidebarFilter::Label(label) = &self.filter
-                    && !self.book.labels().contains(label)
-                {
-                    self.filter = SidebarFilter::All;
-                }
+                self.reload_home(cx);
             }
             Err(e) => {
                 self.status = format!("Delete failed: {e}").into();
@@ -753,16 +801,26 @@ impl AddressBookApp {
         cx.notify();
     }
 
+    pub(crate) fn dismiss_phone_control(&mut self, id: ConnectionId, cx: &mut Context<Self>) {
+        if matches!(self.modal, Modal::PhoneControl(current) if current == id) {
+            self.close_modal(cx);
+        }
+    }
+
     fn close_modal(&mut self, cx: &mut Context<Self>) {
-        if self.credential_busy {
+        if self.credential_busy || self.home.deletion.as_ref().is_some_and(|d| d.busy) {
             return;
         }
+        self.home.deletion = None;
         self.modal = Modal::None;
         cx.notify();
     }
 
     fn on_close_modal(&mut self, _: &CloseModal, window: &mut Window, cx: &mut Context<Self>) {
         if matches!(self.modal, Modal::None) {
+            if self.settings.page.is_some() {
+                self.close_settings(window, cx);
+            }
             return;
         }
         self.close_modal(cx);
@@ -770,10 +828,15 @@ impl AddressBookApp {
     }
 
     fn on_delete(&mut self, _: &DeleteSelected, window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings.page.is_some() {
+            return;
+        }
         match self.modal.clone() {
             Modal::DeleteConfirm { id, .. } => self.confirm_delete(id, cx),
             Modal::None => {
-                if self.search.focus_handle(cx).is_focused(window) {
+                if self.search.focus_handle(cx).is_focused(window)
+                    || self.home.device_search.focus_handle(cx).is_focused(window)
+                {
                     return;
                 }
                 let Some(id) = self.selected else {
@@ -786,12 +849,14 @@ impl AddressBookApp {
         }
     }
 
-    fn on_prefs(&mut self, _: &OpenPreferences, _: &mut Window, cx: &mut Context<Self>) {
-        self.modal = Modal::Preferences;
-        cx.notify();
+    fn on_prefs(&mut self, _: &OpenPreferences, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_settings(window, cx);
     }
 
     fn on_toggle_view(&mut self, _: &ToggleViewMode, _: &mut Window, cx: &mut Context<Self>) {
+        if self.settings.page.is_some() {
+            return;
+        }
         self.view_mode = match self.view_mode {
             ViewMode::Grid => ViewMode::List,
             ViewMode::List => ViewMode::Grid,
@@ -800,12 +865,17 @@ impl AddressBookApp {
     }
 
     fn on_toggle_sidebar(&mut self, _: &ToggleSidebar, _: &mut Window, cx: &mut Context<Self>) {
+        if self.settings.page.is_some() {
+            return;
+        }
         self.collapsed = !self.collapsed;
         cx.notify();
     }
 
     fn on_focus_search(&mut self, _: &FocusSearch, window: &mut Window, cx: &mut Context<Self>) {
-        self.search.update(cx, |s, cx| s.focus(window, cx));
+        if self.settings.page.is_none() {
+            self.search.update(cx, |s, cx| s.focus(window, cx));
+        }
     }
 
     fn select(&mut self, id: ConnectionId, window: &mut Window, cx: &mut Context<Self>) {
@@ -829,6 +899,7 @@ fn unix_now() -> i64 {
 }
 
 /// Human-friendly age of a unix timestamp.
+#[cfg(test)]
 fn relative_time(ts: i64) -> String {
     let delta = (unix_now() - ts).max(0);
     match delta {

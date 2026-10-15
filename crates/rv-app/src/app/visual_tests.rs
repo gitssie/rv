@@ -167,7 +167,7 @@ fn export_management_previews() {
                                 name: "测试 iPhone".into(),
                             }
                         }
-                        4 => app.modal = Modal::Preferences,
+                        4 => app.open_settings(window, cx),
                         _ => {}
                     }
                 });
@@ -231,4 +231,79 @@ fn export_connection_port_preview() {
                 .join("../../docs/connection-editor-zxtouch-default.png"),
         )
         .unwrap();
+}
+
+#[test]
+#[ignore = "manual macOS Metal settings screenshots"]
+fn export_settings_previews() {
+    use rv_core::workspace::{ProxyMode, SocksProxy, WorkspaceStore};
+    let platform = gpui_platform::current_platform(true);
+    let mut cx = HeadlessAppContext::with_platform(
+        platform.text_system(),
+        Arc::new(crate::assets::Assets),
+        gpui_platform::current_headless_renderer,
+    );
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        crate::bind_keys(cx);
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let paths = StorePaths::in_dir(dir.path().to_owned());
+    AddressBook::load(paths.clone()).unwrap().save().unwrap();
+    WorkspaceStore::open(&paths)
+        .unwrap()
+        .save_proxy(&SocksProxy {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "法国出口".into(),
+            host: "192.168.1.20".into(),
+            port: 1080,
+            username: "proxy_user".into(),
+            password: "preview".into(),
+            mode: ProxyMode::Exclusive,
+        })
+        .unwrap();
+    let output = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tempdir/design");
+    std::fs::create_dir_all(&output).unwrap();
+    for (name, theme, width, proxy) in [
+        (
+            "rv-settings-general-implemented.png",
+            ThemePref::Dark,
+            1100.,
+            false,
+        ),
+        (
+            "rv-settings-proxy-implemented.png",
+            ThemePref::Dark,
+            1100.,
+            true,
+        ),
+        ("rv-settings-proxy-compact.png", ThemePref::Dark, 800., true),
+        ("rv-settings-proxy-light.png", ThemePref::Light, 1100., true),
+    ] {
+        let mut book = AddressBook::load(paths.clone()).unwrap();
+        book.prefs_mut().theme = theme;
+        let window = cx
+            .open_window(size(px(width), px(720.)), |window, cx| {
+                let app =
+                    cx.new(|cx| AddressBookApp::with_book(book, false, "Ready".into(), window, cx));
+                app.update(cx, |app, cx| {
+                    app.open_settings(window, cx);
+                    if proxy {
+                        app.open_proxy_manager(window, cx);
+                    }
+                });
+                let shell = cx.new(|_| WindowRoot::new(app));
+                cx.new(|cx| Root::new(shell, window, cx))
+            })
+            .unwrap();
+        for _ in 0..2 {
+            cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+                .unwrap();
+            cx.run_until_parked();
+        }
+        cx.capture_screenshot(window.into())
+            .unwrap()
+            .save(output.join(name))
+            .unwrap();
+    }
 }

@@ -4,7 +4,7 @@ use crate::actions::*;
 use gpui::*;
 use gpui_component::menu::PopupMenuItem;
 use rv_core::ConnectionId;
-pub(super) fn connection_menu(
+pub(in crate::app) fn connection_menu(
     book: Entity<AddressBookApp>,
     id: ConnectionId,
 ) -> impl Fn(

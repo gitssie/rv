@@ -8,11 +8,13 @@ use std::time::Duration;
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::{
-    Disableable as _, Icon, IconName, Selectable as _, Sizable, StyledExt, TitleBar,
+    Disableable as _, Icon, IconName, Selectable as _, StyledExt, TitleBar,
     button::{Button, ButtonVariants as _},
     checkbox::Checkbox,
     h_flex,
     input::{Input, InputEvent, InputState},
+    menu::{PopupMenu, PopupMenuItem},
+    popover::Popover,
     v_flex,
 };
 use image::{ImageBuffer, Rgba};
@@ -35,6 +37,7 @@ pub struct SessionOptions {
     pub menu_key: String,
     pub hide_shots: bool,
     pub thumb_path: Option<PathBuf>,
+    pub app_icon_cache: Option<rv_core::StorePaths>,
     pub address_book: Option<WeakEntity<AddressBookApp>>,
     pub transfer_folders: TransferFolders,
     pub app_shortcuts: Vec<rv_core::AppShortcut>,
@@ -60,18 +63,37 @@ pub fn open(req: ConnectRequest, title: String, session: SessionOptions, cx: &mu
         let mut window_options = TitleBar::window_options();
         window_options.window_bounds = Some(WindowBounds::Windowed(Bounds {
             origin: point(px(72.), px(64.)),
-            size: size(px(1280.), px(800.)),
+            size: theme::control_window_size(),
         }));
         window_options.window_min_size = Some(size(px(640.), px(400.)));
         window_options.titlebar = Some(TitlebarOptions {
             title: Some(title.clone().into()),
             appears_transparent: true,
-            traffic_light_position: Some(point(px(9.), px(9.))),
+            traffic_light_position: Some(point(px(9.), px(12.))),
         });
-        let _ = cx.open_window(window_options, move |window, cx| {
+        let owner = session.address_book.clone();
+        let device = req.connection_id;
+        let created = Rc::new(RefCell::new(None));
+        let captured = created.clone();
+        let result = cx.open_window(window_options, move |window, cx| {
             let view = cx.new(|cx| SessionView::new(req, title, session, window, cx));
-            cx.new(|cx| gpui_component::Root::new(view, window, cx))
+            *captured.borrow_mut() = Some(view.downgrade());
+            cx.new(|cx| {
+                gpui_component::Root::new(cx.new(|cx| SessionShell::new(view, cx)), window, cx)
+            })
         });
+        if let Ok(handle) = result
+            && let Some(view) = created.borrow_mut().take()
+        {
+            let _ = view.update(cx, |view, _| view.home_window = Some(handle));
+            if let Some(device) = device
+                && let Some(owner) = owner
+            {
+                let _ = owner.update(cx, |book, cx| {
+                    book.register_phone_window(device, view, handle, cx)
+                });
+            }
+        }
     })
     .detach();
 }
@@ -101,15 +123,45 @@ fn password_error(message: &str) -> bool {
     .any(|reason| message.contains(reason))
 }
 
+struct SessionShell {
+    view: Entity<SessionView>,
+    _updates: Subscription,
+}
+impl SessionShell {
+    fn new(view: Entity<SessionView>, cx: &mut Context<Self>) -> Self {
+        // Dialog builders read live operation state, so their layer must update with the session.
+        let updates = cx.observe(&view, |_, _, cx| cx.notify());
+        Self {
+            view,
+            _updates: updates,
+        }
+    }
+}
+impl Render for SessionShell {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .size_full()
+            .relative()
+            .child(self.view.clone())
+            .children(gpui_component::Root::render_dialog_layer(window, cx))
+            .children(gpui_component::Root::render_notification_layer(window, cx))
+    }
+}
+
 pub struct SessionView {
     functions: functions_ui::FunctionUi,
     assistant: Option<Entity<crate::work_assistant::WorkAssistant>>,
     assistant_open: bool,
+    unlock_dialog_open: bool,
     assistant_subscription: Option<Subscription>,
     assistant_batch: Option<crate::photo_transfer::PhotoBatch>,
     assistant_clipboard: Option<String>,
     assistant_progress: String,
     req: ConnectRequest,
+    requested_environment: Option<String>,
+    home_window: Option<WindowHandle<gpui_component::Root>>,
+    control_only: bool,
+    pending_home_delete: Option<rv_core::workspace::AppId>,
     handle: SessionHandle,
     title: SharedString,
     status: SharedString,
@@ -121,6 +173,8 @@ pub struct SessionView {
     hide_shots: bool,
     thumb_path: Option<PathBuf>,
     show_menu: bool,
+    session_menu: Option<Entity<PopupMenu>>,
+    window_controls: crate::window_controls::WindowControls,
     info_open: bool,
     buttons: u8,
     wheel_accum: Point<f32>,
@@ -150,6 +204,7 @@ pub struct SessionView {
     image_box: Rc<Cell<Bounds<Pixels>>>,
     keys: Keyboard,
     command_paste_pressed: bool,
+    clipboard_transfer: clipboard_ui::ClipboardTransfer,
     focus: FocusHandle,
     canvas_hovered: bool,
     pointer_in_window: bool,
@@ -177,19 +232,60 @@ impl SessionView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        Self::with_transport(req, title, options, handle, false, None, window, cx)
+    }
+
+    pub(crate) fn new_control(
+        req: ConnectRequest,
+        options: SessionOptions,
+        environment_apps: Vec<rv_core::AppShortcut>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let title = req.display_name().to_string();
+        let handle = SessionHandle::spawn_control(req.clone());
+        Self::with_transport(
+            req,
+            title,
+            options,
+            handle,
+            true,
+            Some(environment_apps),
+            window,
+            cx,
+        )
+    }
+
+    fn with_transport(
+        req: ConnectRequest,
+        title: String,
+        options: SessionOptions,
+        handle: SessionHandle,
+        control_only: bool,
+        environment_apps: Option<Vec<rv_core::AppShortcut>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let focus = cx.focus_handle();
-        focus.focus(window, cx);
-        let cursor_subscriptions = vec![
-            cx.observe_window_activation(window, Self::update_local_cursor),
-            cx.on_focus(&focus, window, Self::update_local_cursor),
-            cx.on_blur(&focus, window, Self::update_local_cursor),
-        ];
+        if !control_only {
+            focus.focus(window, cx);
+        }
+        let cursor_subscriptions = if control_only {
+            vec![]
+        } else {
+            vec![
+                cx.observe_window_activation(window, Self::update_local_cursor),
+                cx.on_focus(&focus, window, Self::update_local_cursor),
+                cx.on_blur(&focus, window, Self::update_local_cursor),
+            ]
+        };
         let SessionOptions {
             scale,
             pin_toolbar,
             menu_key,
             hide_shots,
             thumb_path,
+            app_icon_cache,
             address_book,
             transfer_folders,
             app_shortcuts,
@@ -226,22 +322,25 @@ impl SessionView {
         })
         .detach();
 
-        let apps = apps_ui::AppToolbar::new(app_shortcuts, window, cx);
+        let mut apps = apps_ui::AppToolbar::new(app_shortcuts, window, cx);
+        apps.cache_paths = app_icon_cache;
         let unlock = unlock_ui::UnlockUI::new(window, cx);
-        let environment_apps = req
-            .connection_id
-            .and_then(|id| {
-                address_book
-                    .as_ref()
-                    .and_then(WeakEntity::upgrade)
-                    .map(|book| book.read(cx).environment_apps(id))
-            })
-            .unwrap_or_default();
+        let environment_apps = environment_apps.unwrap_or_else(|| {
+            req.connection_id
+                .and_then(|id| {
+                    address_book
+                        .as_ref()
+                        .and_then(WeakEntity::upgrade)
+                        .map(|book| book.read(cx).environment_apps(id))
+                })
+                .unwrap_or_default()
+        });
         let functions = functions_ui::FunctionUi::new(environment_apps, window, cx);
         Self {
             functions,
             assistant: None,
             assistant_open: false,
+            unlock_dialog_open: false,
             assistant_subscription: None,
             assistant_batch: None,
             assistant_clipboard: None,
@@ -253,6 +352,10 @@ impl SessionView {
             recovery: reconnect::Recovery::default(),
             screenshot_busy: false,
             req,
+            requested_environment: None,
+            home_window: None,
+            control_only,
+            pending_home_delete: None,
             handle,
             title: title.into(),
             status: "Connecting…".into(),
@@ -264,6 +367,8 @@ impl SessionView {
             hide_shots,
             thumb_path,
             show_menu: false,
+            session_menu: None,
+            window_controls: Default::default(),
             info_open: false,
             buttons: 0,
             wheel_accum: point(0.0, 0.0),
@@ -285,6 +390,7 @@ impl SessionView {
             image_box: Rc::new(Cell::new(Bounds::default())),
             keys: Keyboard::new(),
             command_paste_pressed: false,
+            clipboard_transfer: clipboard_ui::ClipboardTransfer::default(),
             focus,
             canvas_hovered: false,
             pointer_in_window: true,
@@ -293,10 +399,35 @@ impl SessionView {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_control_test_handle(
+        req: ConnectRequest,
+        options: SessionOptions,
+        handle: SessionHandle,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::with_transport(
+            req,
+            "test control".into(),
+            options,
+            handle,
+            true,
+            Some(vec![]),
+            window,
+            cx,
+        )
+    }
+    #[cfg(test)]
+    pub(crate) fn pump_control_test(&mut self, cx: &mut Context<Self>) {
+        self.pump(cx);
+    }
+
     fn update_local_cursor(&mut self, window: &mut Window, _: &mut Context<Self>) {
         if !window.is_window_active() || !self.focus.is_focused(window) {
             // The V key-up may go to another control or application.
             self.command_paste_pressed = false;
+            self.clipboard_transfer.cancel_paste();
         }
         // RFB does not reliably say whether the server paints a pointer into
         // the framebuffer. Automatic therefore favors a visible local cursor;
@@ -412,10 +543,29 @@ impl SessionView {
                 SessionEvent::Apps(event) => self.apply_app_event(event, cx),
                 SessionEvent::Functions(event) => self.apply_function_event(event, cx),
                 SessionEvent::Status(s) => self.status = s.into(),
+                SessionEvent::ControlState(online) => {
+                    if !online {
+                        self.functions.cancel_cloud_preparations();
+                        self.clipboard_transfer.disconnected();
+                    }
+                    self.phase = if online {
+                        Phase::Connected
+                    } else {
+                        Phase::Connecting
+                    };
+                    self.status = if online {
+                        "ZXTouch 已连接"
+                    } else {
+                        "ZXTouch 正在重连…"
+                    }
+                    .into();
+                    self.notify_home(cx);
+                }
                 SessionEvent::Connected { width, height } => {
                     self.fb_w = width;
                     self.fb_h = height;
                     self.phase = Phase::Connected;
+                    self.notify_home(cx);
                     self.recovery.connected();
                     self.status = format!("{width}×{height}").into();
                     self.error = None;
@@ -426,7 +576,20 @@ impl SessionView {
                             match book.update(cx, |book, cx| {
                                 book.save_retried_password(&self.req, self.remember_password, cx)
                             }) {
-                                Ok(Some(id)) => self.req.connection_id = Some(id),
+                                Ok(Some(id)) => {
+                                    self.req.connection_id = Some(id);
+                                    if let Some(handle) = self.home_window {
+                                        let view = cx.entity().downgrade();
+                                        let book = book.downgrade();
+                                        cx.defer(move |cx| {
+                                            if let Some(book) = book.upgrade() {
+                                                book.update(cx, |book, cx| {
+                                                    book.register_phone_window(id, view, handle, cx)
+                                                });
+                                            }
+                                        });
+                                    }
+                                }
                                 Ok(None) => {}
                                 Err(error) => {
                                     self.status =
@@ -443,8 +606,10 @@ impl SessionView {
                 }
                 SessionEvent::FrameReady { generation } => frame = Some(generation),
                 SessionEvent::Clipboard(text) => {
-                    cx.write_to_clipboard(ClipboardItem::new_string(text));
-                    self.status = "Clipboard received".into();
+                    if !self.clipboard_transfer.is_outbound_echo(&text) {
+                        cx.write_to_clipboard(ClipboardItem::new_string(text));
+                        self.status = "Clipboard received".into();
+                    }
                 }
                 SessionEvent::Bell => self.status = "Bell".into(),
                 SessionEvent::Error(e) => {
@@ -460,6 +625,7 @@ impl SessionView {
                     self.unlock.disconnected();
                     self.functions.disconnected();
                     self.assistant_clipboard = None;
+                    self.clipboard_transfer.disconnected();
                     self.assistant_batch = None;
                     self.assistant_feedback(
                         "手机已断线，草稿仍保存在本地；待确认导入不会自动重试".into(),
@@ -473,6 +639,7 @@ impl SessionView {
                     self.karing.disconnected();
                     self.command_paste_pressed = false;
                     self.phase = Phase::Ended;
+                    self.notify_home(cx);
                     self.buttons = 0;
                     self.save_thumb();
                 }
@@ -488,6 +655,7 @@ impl SessionView {
                 self.start_reconnect(cx);
             }
         }
+        self.tick_home_environment(cx);
         self.tick_unlock(cx);
         self.sync_assistant(cx);
         let file_revision = self.handle.file_client().revision();
@@ -667,18 +835,7 @@ impl SessionView {
     }
 
     fn send_clipboard(&mut self, cx: &App) {
-        if self.view_only() || self.phase != Phase::Connected {
-            return;
-        }
-        if let Some(item) = cx.read_from_clipboard()
-            && let Some(text) = item.text()
-        {
-            self.handle.app(rv_session::AppCommand::WriteClipboard {
-                token: uuid::Uuid::new_v4().to_string(),
-                text,
-            });
-            self.status = "Clipboard request sent".into();
-        }
+        self.begin_clipboard_transfer(false, cx);
     }
 
     fn toggle_fullscreen(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -779,7 +936,9 @@ impl SessionView {
                     self.close_function_editor(window, cx);
                 } else {
                     self.functions.open = false;
-                    self.clear_function_text(window, cx);
+                    if !self.functions.selected.is_some_and(|spec| spec.task == 31) {
+                        self.clear_function_text(window, cx);
+                    }
                     self.focus.focus(window, cx);
                     cx.notify();
                 }
@@ -811,8 +970,7 @@ impl SessionView {
             "key down"
         );
         if key.eq_ignore_ascii_case(&self.menu_key) {
-            self.show_menu = !self.show_menu;
-            cx.notify();
+            self.set_session_menu(!self.show_menu, window, cx);
             self.consume_key(window, cx);
             return;
         }
@@ -823,28 +981,15 @@ impl SessionView {
             return;
         }
         let mods = event.keystroke.modifiers;
-        // A device-control capabilities reply identifies a TrollVNC peer.
-        // iOS uses Command-V. Emit a complete chord so subsequent Ctrl
-        // shortcuts still see Control, even while the physical V is held.
         if key.eq_ignore_ascii_case("v")
+            && self.apps.caps.is_some()
             && (self.command_paste_pressed
-                || (self.apps.caps.is_some()
-                    && mods.control
-                    && !mods.alt
-                    && !mods.shift
-                    && !mods.platform))
+                || ((mods.control ^ mods.platform) && !mods.alt && !mods.shift))
         {
             if !self.command_paste_pressed && !event.is_held {
                 self.command_paste_pressed = true;
-                let mut events = self.keys.set_modifiers(false, false, true);
-                events.extend(self.keys.key_down("v", Some("v"), false, false));
-                events.extend(self.keys.key_up("v"));
-                events.extend(self.keys.set_modifiers(false, false, false));
-                events.extend(
-                    self.keys
-                        .set_modifiers(mods.control, mods.alt, mods.platform),
-                );
-                self.send_keys(events);
+                self.begin_clipboard_transfer(true, cx);
+                cx.notify();
             }
             self.consume_key(window, cx);
             return;
@@ -916,179 +1061,61 @@ impl SessionView {
 
     fn render_toolbar(
         &self,
-        fullscreen: bool,
-        width: Pixels,
+        _fullscreen: bool,
+        _width: Pixels,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let live = self.phase == Phase::Connected && !self.view_only();
-        let compact = width < px(1120.);
         h_flex()
+            .debug_selector(|| "session-toolbar".into())
             .h(theme::toolbar_height())
+            .min_w_0()
             .w_full()
             .px_2()
-            .gap_0p5()
+            .gap_1()
             .items_center()
-            .bg(theme::toolbar())
-            .text_color(theme::toolbar_fg())
-            .child(tool_btn(
-                cx,
-                "pin",
-                if self.pin_toolbar {
-                    IconName::Star
-                } else {
-                    IconName::StarOff
-                },
-                if self.pin_toolbar {
-                    "Unpin toolbar (auto-hide)"
-                } else {
-                    "Pin toolbar"
-                },
-                cx.listener(|this, _, _, cx| {
-                    this.pin_toolbar = !this.pin_toolbar;
-                    this.toolbar_open = this.pin_toolbar;
-                    cx.notify();
-                }),
-            ))
-            .child(tool_btn(
-                cx,
-                "full",
-                if fullscreen {
-                    IconName::Minimize
-                } else {
-                    IconName::Maximize
-                },
-                if fullscreen {
-                    "Exit full screen (⇧⌘F)"
-                } else {
-                    "Full screen (⇧⌘F)"
-                },
-                cx.listener(|this, _, window, cx| this.toggle_fullscreen(window, cx)),
-            ))
+            .bg(theme::card(cx))
+            .child(self.render_home(cx))
+            .child(self.render_unlock_button(cx))
+            .child(self.render_screenshot(cx))
+            .child(self.render_app_toolbar(cx))
             .child(
-                Button::new("scale")
-                    .ghost()
-                    .text_color(theme::toolbar_fg())
-                    .small()
-                    .px_2()
-                    .h(px(28.))
-                    .label(match self.scale {
-                        ScaleMode::Actual => "100%",
-                        ScaleMode::Fit => "Fit",
-                        ScaleMode::Stretch => "Stretch",
-                    })
-                    .tooltip("Scaling: click to cycle")
+                crate::ui::icon_button("clip", IconName::Copy, "发送剪贴板")
                     .on_click(cx.listener(|this, _, _, cx| {
-                        let next = this.scale.cycle();
-                        this.set_scale(next, cx);
-                    })),
-            )
-            .child(toolbar_sep())
-            .child(self.render_keyboard_shortcuts(cx))
-            .child(toolbar_sep())
-            .child(
-                tool_btn(
-                    cx,
-                    "clip",
-                    IconName::Copy,
-                    "Send clipboard to remote",
-                    cx.listener(|this, _, _, cx| {
                         this.send_clipboard(cx);
                         cx.notify();
-                    }),
-                )
-                .disabled(!live),
+                    }))
+                    .text_color(self.clipboard_transfer.color(cx))
+                    .disabled(!live || self.clipboard_transfer.busy()),
             )
-            .child(toolbar_sep())
-            .child(
-                tool_btn(
-                    cx,
-                    "files",
-                    IconName::Folder,
-                    "File transfer window",
-                    cx.listener(|this, _, _, cx| {
-                        this.open_file_transfer(cx);
-                    }),
-                )
-                .disabled(self.phase != Phase::Connected),
-            )
-            .child(
-                Button::new("quick-upload")
-                    .ghost()
-                    .size(px(28.))
-                    .icon(IconName::ArrowUp)
-                    .text_color(theme::toolbar_muted())
-                    .tooltip("Upload one file to the current remote folder")
-                    .disabled(
-                        !live || {
-                            let files = self.handle.file_client().snapshot();
-                            !files.caps.is_some_and(|caps| caps.upload)
-                                || files.listed_path.as_deref() != Some(files.remote_path.as_str())
-                        },
-                    )
-                    .on_click(cx.listener(|this, _, _, cx| this.quick_upload(cx))),
-            )
-            .child(toolbar_sep())
-            .child(self.render_home(cx))
-            .child(self.render_screenshot(cx))
-            .child(self.render_unlock_button(cx))
-            .child(self.render_app_toolbar(cx))
-            .child(self.render_notification_button(cx))
             .child(div().flex_1())
-            .child(self.render_function_button(compact, cx))
-            // Keep the assistant implementation while its UI entry is disabled.
-            .when(false, |toolbar| {
-                toolbar.child(
-                    Button::new("work-assistant-toggle")
-                        .debug_selector(|| "work-assistant-toggle".into())
-                        .ghost()
-                        .small()
-                        .h(px(28.))
-                        .icon(IconName::PanelRight)
-                        .label("助手")
-                        .when(self.assistant_open, |b| b.bg(rgb(0x2a3a50)))
-                        .text_color(theme::toolbar_fg())
-                        .on_click(
-                            cx.listener(|this, _, window, cx| this.toggle_assistant(window, cx)),
-                        ),
-                )
-            })
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(theme::toolbar_muted())
-                    .text_ellipsis()
-                    .max_w(px(if compact { 70. } else { 260. }))
-                    .child(self.status.clone()),
-            )
-            .child(
-                Button::new("info")
+            .child(self.render_function_button(true, cx))
+    }
+
+    fn render_session_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        Popover::new("session-settings-popover")
+            .open(self.show_menu)
+            .appearance(false)
+            .overlay_closable(false)
+            .anchor(Anchor::TopRight)
+            .trigger(
+                Button::new("session-settings")
                     .ghost()
-                    .size(px(28.))
-                    .text_color(theme::toolbar_fg())
-                    .icon(IconName::Info)
-                    .selected(self.info_open)
-                    .tooltip("Connection info")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.notifications.open = false;
-                        this.info_open = !this.info_open;
-                        cx.notify();
-                    })),
+                    .icon(IconName::Settings)
+                    .debug_selector(|| "session-settings".into())
+                    .accessibility_label("设置"),
             )
-            .child(
-                div()
-                    .debug_selector(|| "disconnect-control".into())
-                    .flex_shrink_0()
-                    .child(
-                        Button::new("disc")
-                            .ghost()
-                            .size(px(28.))
-                            .icon(IconName::WindowClose)
-                            .text_color(theme::danger(cx))
-                            .tooltip("Disconnect")
-                            .disabled(matches!(self.phase, Phase::Disconnecting | Phase::Ended))
-                            .on_click(cx.listener(|this, _, _, cx| this.disconnect(cx))),
-                    ),
-            )
+            .on_open_change(cx.listener(|this, open: &bool, window, cx| {
+                this.set_session_menu(*open, window, cx);
+            }))
+            .content({
+                let menu = self.session_menu.clone();
+                move |_, _, _| {
+                    div()
+                        .debug_selector(|| "session-menu".into())
+                        .children(menu.clone())
+                }
+            })
     }
 
     /// Auto-hide toolbar: a small handle at the top edge that grows into the
@@ -1119,6 +1146,7 @@ impl SessionView {
                             .rounded_b_lg()
                             .shadow_lg()
                             .overflow_hidden()
+                            .h(theme::toolbar_height())
                             .child(self.render_toolbar(fullscreen, width, cx))
                             .into_any_element()
                     } else {
@@ -1126,205 +1154,179 @@ impl SessionView {
                             .px_6()
                             .py_1()
                             .rounded_b_md()
-                            .bg(theme::toolbar())
-                            .text_color(theme::toolbar_muted())
+                            .bg(theme::card(cx))
+                            .text_color(theme::muted(cx))
                             .cursor_pointer()
-                            .child(
-                                Icon::new(IconName::ChevronDown)
-                                    .small()
-                                    .text_color(theme::toolbar_muted()),
-                            )
+                            .child(Icon::new(IconName::ChevronDown).text_color(theme::muted(cx)))
                             .into_any_element()
                     }),
             )
     }
 
-    fn render_menu(&self, fullscreen: bool, cx: &mut Context<Self>) -> impl IntoElement {
-        let live = self.phase == Phase::Connected && !self.view_only();
-        let scale = self.scale;
-        div()
-            .absolute()
-            .top_3()
-            .left_0()
-            .right_0()
-            .flex()
-            .justify_center()
-            .child(
-                v_flex()
-                    .id("session-menu")
-                    .occlude()
-                    .w(px(280.))
-                    .p_1()
-                    .gap_0p5()
-                    .rounded_lg()
-                    .bg(theme::toolbar())
-                    .border_1()
-                    .border_color(theme::toolbar_line())
-                    .shadow_lg()
-                    .text_color(theme::toolbar_fg())
-                    .child(
-                        h_flex()
-                            .px_2()
-                            .py_1()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(theme::toolbar_muted())
-                                    .child(format!("{} menu", self.menu_key.to_ascii_uppercase())),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(theme::toolbar_muted())
-                                    .child("Esc to close"),
-                            ),
-                    )
-                    .child(menu_item(
-                        "m-full",
-                        if fullscreen {
-                            IconName::Minimize
-                        } else {
-                            IconName::Maximize
-                        },
-                        if fullscreen {
-                            "Exit full screen"
-                        } else {
-                            "Full screen"
-                        },
-                        cx.listener(|this, _, window, cx| {
-                            this.show_menu = false;
-                            this.toggle_fullscreen(window, cx);
-                        }),
-                    ))
-                    .child(
-                        h_flex()
-                            .px_2()
-                            .py_1()
-                            .gap_1()
-                            .items_center()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .w(px(64.))
-                                    .text_color(theme::toolbar_muted())
-                                    .child("Scaling"),
-                            )
-                            .children([ScaleMode::Fit, ScaleMode::Actual, ScaleMode::Stretch].map(
-                                |mode| {
-                                    Button::new(SharedString::from(format!("m-scale-{mode:?}")))
-                                        .xsmall()
-                                        .when(scale == mode, |b| b.primary())
-                                        .when(scale != mode, |b| {
-                                            b.ghost().text_color(theme::toolbar_fg())
-                                        })
-                                        .label(mode.label())
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.set_scale(mode, cx);
-                                        }))
-                                },
-                            )),
-                    )
-                    .child(
-                        menu_item(
-                            "m-cad",
-                            IconName::SquareTerminal,
-                            "Send Ctrl+Alt+Del",
-                            cx.listener(|this, _, _, cx| {
-                                this.show_menu = false;
-                                this.send_cad();
-                                cx.notify();
-                            }),
-                        )
-                        .disabled(!live),
-                    )
-                    .child(
-                        menu_item(
-                            "m-clip",
-                            IconName::Copy,
-                            "Send clipboard",
-                            cx.listener(|this, _, _, cx| {
-                                this.show_menu = false;
-                                this.send_clipboard(cx);
-                                cx.notify();
-                            }),
-                        )
-                        .disabled(!live),
-                    )
-                    .child(
-                        menu_item(
-                            "m-files",
-                            IconName::Folder,
-                            "File transfer window",
-                            cx.listener(|this, _, _, cx| {
-                                this.show_menu = false;
-                                this.open_file_transfer(cx);
-                                cx.notify();
-                            }),
-                        )
-                        .disabled(self.phase != Phase::Connected),
-                    )
-                    .child(menu_item(
-                        "m-info",
-                        IconName::Info,
-                        if self.info_open {
-                            "Hide connection info"
-                        } else {
-                            "Connection info"
-                        },
-                        cx.listener(|this, _, _, cx| {
-                            this.show_menu = false;
-                            this.notifications.open = false;
-                            this.info_open = !this.info_open;
-                            cx.notify();
-                        }),
-                    ))
-                    .child(menu_item(
-                        "m-pin",
-                        if self.pin_toolbar {
-                            IconName::StarOff
-                        } else {
-                            IconName::Star
-                        },
-                        if self.pin_toolbar {
-                            "Auto-hide toolbar"
-                        } else {
-                            "Pin toolbar"
-                        },
-                        cx.listener(|this, _, _, cx| {
-                            this.show_menu = false;
-                            this.pin_toolbar = !this.pin_toolbar;
-                            this.toolbar_open = this.pin_toolbar;
-                            cx.notify();
-                        }),
-                    ))
-                    .child(div().h(px(1.)).my_1().bg(theme::toolbar_line()))
-                    .child(
-                        if matches!(self.phase, Phase::Disconnecting | Phase::Ended) {
-                            menu_item(
-                                "m-close",
-                                IconName::WindowClose,
-                                "Close window",
-                                cx.listener(|this, _, window, cx| this.close_window(window, cx)),
-                            )
-                        } else {
-                            menu_item(
-                                "m-disc",
-                                IconName::WindowClose,
-                                "Disconnect",
-                                cx.listener(|this, _, _, cx| {
-                                    this.show_menu = false;
-                                    this.disconnect(cx);
-                                }),
-                            )
-                            .text_color(theme::danger(cx))
-                        },
-                    ),
-            )
+    fn session_menu_item(
+        &self,
+        label: impl Into<SharedString>,
+        icon: IconName,
+        handler: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+        cx: &Context<Self>,
+    ) -> PopupMenuItem {
+        let entity = cx.entity().downgrade();
+        PopupMenuItem::new(label)
+            .icon(icon)
+            .on_click(move |_, window, cx| {
+                let _ = entity.update(cx, |this, cx| {
+                    this.show_menu = false;
+                    this.session_menu = None;
+                    handler(this, window, cx);
+                    cx.notify();
+                });
+            })
     }
 
-    fn render_info(&self) -> impl IntoElement {
+    fn set_session_menu(&mut self, open: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_menu = open;
+        if !open {
+            self.session_menu = None;
+            cx.notify();
+            return;
+        }
+        self.functions.open = false;
+        self.notifications.open = false;
+        self.info_open = false;
+        let live = self.phase == Phase::Connected && !self.view_only();
+        let fullscreen = window.is_fullscreen();
+        let mut items = vec![
+            self.session_menu_item(
+                if fullscreen { "退出全屏" } else { "全屏" },
+                if fullscreen {
+                    IconName::Minimize
+                } else {
+                    IconName::Maximize
+                },
+                |this, window, cx| this.toggle_fullscreen(window, cx),
+                cx,
+            ),
+            PopupMenuItem::separator(),
+        ];
+        for (mode, label) in [
+            (ScaleMode::Fit, "适应窗口"),
+            (ScaleMode::Actual, "100%"),
+            (ScaleMode::Stretch, "拉伸"),
+        ] {
+            items.push(
+                self.session_menu_item(
+                    label,
+                    IconName::Maximize,
+                    move |this, _, cx| this.set_scale(mode, cx),
+                    cx,
+                )
+                .checked(self.scale == mode),
+            );
+        }
+        items.push(PopupMenuItem::separator());
+        items.push(
+            self.session_menu_item(
+                "Ctrl + Alt + Del",
+                IconName::SquareTerminal,
+                |this, _, _| this.send_cad(),
+                cx,
+            )
+            .disabled(!live),
+        );
+        items.push(
+            self.session_menu_item(
+                "发送剪贴板",
+                IconName::Copy,
+                |this, _, cx| this.send_clipboard(cx),
+                cx,
+            )
+            .disabled(!live),
+        );
+        items.push(
+            self.session_menu_item(
+                "文件传输",
+                IconName::Folder,
+                |this, _, cx| this.open_file_transfer(cx),
+                cx,
+            )
+            .disabled(self.phase != Phase::Connected),
+        );
+        let files = self.handle.file_client().snapshot();
+        let can_upload = live
+            && files.caps.is_some_and(|caps| caps.upload)
+            && files.listed_path.as_deref() == Some(files.remote_path.as_str());
+        items.push(
+            self.session_menu_item(
+                "上传文件",
+                IconName::ArrowUp,
+                |this, _, cx| this.quick_upload(cx),
+                cx,
+            )
+            .disabled(!can_upload),
+        );
+        items.push(self.session_menu_item(
+            "助手",
+            IconName::SquareTerminal,
+            |this, window, cx| this.toggle_assistant(window, cx),
+            cx,
+        ));
+        items.push(self.session_menu_item(
+            "连接信息",
+            IconName::Info,
+            |this, _, _| this.info_open = !this.info_open,
+            cx,
+        ));
+        items.push(
+            self.session_menu_item(
+                "固定工具栏",
+                IconName::Star,
+                |this, _, _| {
+                    this.pin_toolbar = !this.pin_toolbar;
+                    this.toolbar_open = this.pin_toolbar;
+                },
+                cx,
+            )
+            .checked(self.pin_toolbar),
+        );
+        items.push(PopupMenuItem::separator());
+        items.push(
+            if matches!(self.phase, Phase::Disconnecting | Phase::Ended) {
+                self.session_menu_item(
+                    "关闭窗口",
+                    IconName::WindowClose,
+                    |this, window, cx| this.close_window(window, cx),
+                    cx,
+                )
+            } else {
+                self.session_menu_item(
+                    "断开连接",
+                    IconName::WindowClose,
+                    |this, _, cx| this.disconnect(cx),
+                    cx,
+                )
+            },
+        );
+        let menu = PopupMenu::build(window, cx, |menu, _, _| {
+            items.into_iter().fold(
+                menu.action_context(self.focus.clone())
+                    .check_side(gpui_component::Side::Right),
+                |menu, item| menu.item(item),
+            )
+        });
+        cx.subscribe_in(&menu, window, |this, _, _: &DismissEvent, _, cx| {
+            this.show_menu = false;
+            this.session_menu = None;
+            cx.notify();
+        })
+        .detach();
+        menu.focus_handle(cx).focus(window, cx);
+        self.session_menu = Some(menu);
+        cx.notify();
+    }
+
+    fn render_info(&self, cx: &App) -> impl IntoElement {
         let rows: Vec<(&str, String)> = vec![
+            ("设备", self.title.to_string()),
             ("Server", self.host()),
             (
                 "Desktop",
@@ -1346,31 +1348,23 @@ impl SessionView {
                 },
             ),
         ];
-        v_flex()
+        crate::ui::tool_panel(cx)
             .id("session-info")
             .occlude()
             .absolute()
             .top_3()
             .right_3()
-            .p_3()
-            .gap_1()
-            .rounded_md()
-            .bg(theme::toolbar())
-            .border_1()
-            .border_color(theme::toolbar_line())
-            .shadow_lg()
-            .text_color(theme::toolbar_fg())
             .children(rows.into_iter().map(|(k, v)| {
                 h_flex()
                     .gap_3()
                     .text_xs()
-                    .child(div().w(px(70.)).text_color(theme::toolbar_muted()).child(k))
+                    .child(div().w(px(70.)).text_color(theme::muted(cx)).child(k))
                     .child(div().child(v))
             }))
             .child(
                 div()
                     .text_xs()
-                    .text_color(theme::toolbar_muted())
+                    .text_color(theme::muted(cx))
                     .mt_1()
                     .child(format!(
                         "{} for the session menu",
@@ -1389,12 +1383,12 @@ impl SessionView {
                 .child(
                     Icon::new(IconName::Loader)
                         .size_10()
-                        .text_color(theme::toolbar_muted()),
+                        .text_color(theme::muted(cx)),
                 )
                 .child(
                     div()
                         .text_sm()
-                        .text_color(theme::toolbar_muted())
+                        .text_color(theme::muted(cx))
                         .child(self.status.clone()),
                 )
                 .into_any_element();
@@ -1514,11 +1508,30 @@ impl Drop for SessionView {
 
 impl Render for SessionView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_unlock_dialog(window, cx);
         self.fill_received_verification_code(window, cx);
+        self.sync_function_notifications(window, cx);
+        self.sync_function_result_editor(window, cx);
+        if self.control_only {
+            let size = window.viewport_size();
+            return div()
+                .size_full()
+                .relative()
+                .when(self.functions.open, |el| {
+                    el.child(self.render_functions(
+                        f32::from(size.width) - 32.,
+                        f32::from(size.height) - 80.,
+                        cx,
+                    ))
+                })
+                .into_any_element();
+        }
         self.update_local_cursor(window, cx);
+        self.finish_keyboard_paste(window, cx);
         let width = window.viewport_size().width;
         let height = window.viewport_size().height;
         let fullscreen = window.is_fullscreen();
+        self.window_controls.sync(window, theme::is_dark(cx));
         let show_pinned = self.pin_toolbar;
         let remote_keyboard_active = self.phase == Phase::Connected
             && !self.unlock.blocks_input()
@@ -1530,7 +1543,6 @@ impl Render for SessionView {
         v_flex()
             .size_full()
             .bg(theme::desktop())
-            .text_color(theme::toolbar_fg())
             .key_context("Session")
             .track_focus(&self.focus)
             .child({
@@ -1572,40 +1584,42 @@ impl Render for SessionView {
                 this.toolbar_open = this.pin_toolbar;
                 cx.notify();
             }))
-            .on_action(cx.listener(|this, _: &SessionMenu, _, cx| {
-                this.show_menu = !this.show_menu;
-                cx.notify();
+            .on_action(cx.listener(|this, _: &SessionMenu, window, cx| {
+                this.set_session_menu(!this.show_menu, window, cx);
             }))
-            .when(!fullscreen, |this| {
-                this.child(
-                    TitleBar::new().child(
+            .child(
+                TitleBar::new()
+                    .h(theme::toolbar_height())
+                    .bg(theme::card(cx))
+                    .border_color(theme::line(cx))
+                    .child(
                         h_flex()
-                            .w_full()
+                            .h_full()
+                            .flex_1()
+                            .min_w_0()
                             .px_2()
                             .items_center()
-                            .justify_between()
+                            .child(div().text_sm().text_ellipsis().child(self.title.clone()))
+                            .child(div().flex_1())
+                            .child(self.render_keyboard_shortcuts(cx))
                             .child(
-                                div()
-                                    .font_semibold()
-                                    .text_color(theme::ink(cx))
-                                    .text_ellipsis()
-                                    .child(self.title.clone()),
+                                crate::ui::icon_button("files", IconName::Folder, "文件传输")
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.open_file_transfer(cx)),
+                                    )
+                                    .disabled(self.phase != Phase::Connected),
                             )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(theme::muted(cx))
-                                    .child(self.host()),
-                            ),
+                            .child(self.render_notification_button(cx))
+                            .child(self.render_session_settings(cx)),
                     ),
-                )
-            })
+            )
             .when(show_pinned, |this| {
                 this.child(self.render_toolbar(fullscreen, width, cx))
             })
             .child(
                 div()
                     .id("stage")
+                    .debug_selector(|| "session-stage".into())
                     .flex_1()
                     .min_h_0()
                     .relative()
@@ -1619,7 +1633,7 @@ impl Render for SessionView {
                                     && width >= px(1100.)
                                     && self.scale == ScaleMode::Fit,
                                 |canvas| {
-                                    canvas.mr(px(if self.function_editor_visible() {
+                                    canvas.mr(px(if self.function_uses_two_panels() {
                                         772.
                                     } else {
                                         408.
@@ -1704,19 +1718,12 @@ impl Render for SessionView {
                     .when(!show_pinned && self.phase != Phase::Ended, |this| {
                         this.child(self.render_floating_toolbar(fullscreen, width, cx))
                     })
-                    .when(self.info_open, |this| this.child(self.render_info()))
-                    .when(self.show_menu, |this| {
-                        this.child(self.render_menu(fullscreen, cx))
-                    })
+                    .when(self.info_open, |this| this.child(self.render_info(cx)))
                     .when(self.functions.open, |this| {
                         this.child(self.render_functions(
                             f32::from(width),
                             f32::from(height)
-                                - if fullscreen {
-                                    0.
-                                } else {
-                                    f32::from(gpui_component::TITLE_BAR_HEIGHT)
-                                }
+                                - f32::from(theme::toolbar_height())
                                 - if show_pinned {
                                     f32::from(theme::toolbar_height())
                                 } else {
@@ -1733,11 +1740,9 @@ impl Render for SessionView {
                             || (self.recovery.visible
                                 && matches!(self.phase, Phase::Connecting | Phase::Disconnecting)),
                         |this| this.child(self.render_recovery(cx)),
-                    )
-                    .when(self.unlock.editing(), |this| {
-                        this.child(self.render_unlock_setting(window, cx))
-                    }),
+                    ),
             )
+            .into_any_element()
     }
 }
 
@@ -1786,59 +1791,6 @@ fn dest_rect(
             ((box_w - dw) * 0.5, (box_h - dh) * 0.5, dw, dh)
         }
     }
-}
-
-fn toolbar_sep() -> impl IntoElement {
-    div()
-        .w(px(1.))
-        .h(px(18.))
-        .mx_0p5()
-        .bg(theme::toolbar_line())
-}
-
-fn tool_btn(
-    cx: &App,
-    id: &'static str,
-    icon: impl Into<Icon>,
-    tip: impl Into<SharedString>,
-    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-) -> Button {
-    let tip = tip.into();
-    Button::new(id)
-        .custom(
-            gpui_component::button::ButtonCustomVariant::new(cx)
-                .foreground(theme::toolbar_fg())
-                .hover(rgb(0x2a343f).into())
-                .active(rgb(0x35404e).into()),
-        )
-        .size(px(28.))
-        .accessibility_label(tip.clone())
-        .icon(icon.into().size(px(15.)))
-        // The toolbar is always dark; the ghost variant would otherwise use
-        // the theme foreground, which is near-black in light mode.
-        .text_color(theme::toolbar_fg())
-        .tooltip(tip)
-        .on_click(on_click)
-}
-
-fn menu_item(
-    id: &'static str,
-    icon: impl Into<Icon>,
-    label: impl Into<SharedString>,
-    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-) -> Button {
-    Button::new(id)
-        .ghost()
-        .small()
-        .h(px(26.))
-        .px_2()
-        .text_size(px(12.))
-        .w_full()
-        .justify_start()
-        .text_color(theme::toolbar_fg())
-        .icon(icon.into().size(px(15.)))
-        .label(label)
-        .on_click(on_click)
 }
 
 /// Platform IME client that refuses composition and committed text.
@@ -2103,6 +2055,7 @@ mod tests {
 
 mod apps_ui;
 mod assistant_bridge;
+mod clipboard_ui;
 mod controls_ui;
 mod functions_ui;
 mod karing_ui;

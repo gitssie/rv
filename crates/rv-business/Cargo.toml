@@ -1,0 +1,28 @@
+[package]
+name = "rv-business"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Host-only offline App business strategies and HTTP tasks"
+
+[lints]
+workspace = true
+
+[dependencies]
+rv-core.workspace = true
+serde_json.workspace = true
+serde.workspace = true
+uuid.workspace = true
+chrono = "0.4"
+html5ever = "0.27"
+markup5ever_rcdom = "0.3"
+sha2 = "0.10"
+libc = "0.2"
+image = { workspace = true, features = ["webp", "gif"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
+tokio.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "stream", "json", "socks"] }
+
+[dev-dependencies]
+tempfile = "3"

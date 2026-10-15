@@ -53,6 +53,7 @@ Ctrl / Alt / ⌘ are forwarded to the remote desktop while a session has focus.
 
 ```bash
 cargo fmt --all -- --check
+python3 scripts/check-ui-style.py
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 ```
@@ -197,14 +198,55 @@ python3 scripts/package-macos.py \
 ```
 
 Pass `--identity "$RV_SIGN_IDENTITY"` to sign with a Developer ID identity;
-without it the bundle is ad-hoc signed. Saved passwords are stored as AES-256-GCM
-files in `passwords/` under the RV data directory. Each save uses a random nonce,
-but the encryption key is fixed in the executable: anyone with the binary and
-password files can recover them. VNC login and six-digit screen-unlock passwords
-share the same local credential file for each connection; RV does not use any
-OS keychain. Older local password files are read and upgraded on the next save.
-Enter the screen-unlock password again if it was saved by an older keychain-based build. Editing connection
-settings leaves a saved password untouched unless a replacement is entered.
+without it the bundle is ad-hoc signed.
+
+## Local storage
+
+Device configuration, preferences, VNC passwords, screen-unlock passwords and
+backup-derived App metadata use SQLite (`rv.sqlite3` in the RV data directory).
+No old JSON configuration or password file is read or migrated. Each credential
+row contains an AES-256-GCM authenticated blob with a random nonce, bound to its
+connection ID. The application's encryption key remains fixed in the executable;
+anyone with both the binary and database can recover credentials. RV uses no OS
+keychain. Editing connection settings leaves a saved password untouched unless a
+replacement is entered.
+
+App cards come exclusively from ZXTouch snapshot backups and use the real IDFV
+as the primary key. Repeated synchronization links an existing object; baselines
+and snapshots without valid IDFV do not create cards. Shared tags/notes and
+Bundle-specific business text are searchable through SQLite FTS5. Phone GUID is
+independent of IDFV and remains unset until the phone interface supplies it.
+See [the interface alignment checklist](docs/zxtouch-interface-alignment.md).
+
+Offline App tasks run on the RV host through Bundle-specific HTTP strategies in
+`rv-business`, using encrypted account credentials read from a selected phone
+snapshot. They have no phone/session dependency and do not launch or restore an
+App. Task outcomes, credential rotations and card projections commit together in
+SQLite. An unknown refresh outcome prevents automatic replay. Phone-side profile
+and session-supplement code only serves credential extraction and explicit backup
+restoration; it never executes business requests. Current Vinted operations cover
+session checks, inbox queries, unread statistics, explicit token refresh and
+paginated product/order synchronization.
+
+Vinted owns two local cache tables: `vinted_products` and `vinted_orders`. Each
+row keeps the App IDFV, platform record ID, business JSON and retrieval time;
+orders also keep bought/sold direction. FTS5 indexes support local searches. Money,
+state flags and additional business fields stay in the JSON rather than a second
+domain model. Repeated queries update the same row, and failed pagination leaves
+the previous cache intact. Missing records are not inferred to be deleted.
+
+Shop details provide product/order browsing, search and a default-off 15-minute
+schedule. Only schedule settings persist; interval clocks exist in memory while
+RV runs. Restarting RV starts a new interval and never catches up missed runs.
+Business requests execute on the host without a phone connection.
+
+The product contract comes from observed responses in the local Vinted research.
+The Orders module supplies the native gateway route, sold/purchased filters and
+`my_orders`/`pagination` response model. Order synchronization has fixture tests;
+the live server response has not yet been verified.
+
+The existing assistant stores drafts in SQLite (`assistant.db`). Preview caches
+and user-exported screenshots remain image files.
 
 ## Layout
 
@@ -212,6 +254,7 @@ settings leaves a saved password untouched unless a replacement is entered.
 | --- | --- |
 | `rv-core` | Connection models, address book, keysyms, prefs |
 | `rv-session` | Tokio RFB session, framebuffer, VeNCrypt |
+| `rv-business` | Host-side offline HTTP tasks and Bundle strategies |
 | `rv-app` | GPUI UI |
 
 macOS is the primary target. Linux and Windows should compile via GPUI.

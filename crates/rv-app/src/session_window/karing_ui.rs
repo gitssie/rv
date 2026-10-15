@@ -1,5 +1,4 @@
 use super::*;
-use gpui_component::button::ButtonCustomVariant;
 use rv_session::{AppCommand, KaringRequest, KaringResponse, karing_component};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -62,20 +61,6 @@ impl KaringUI {
 
 pub(super) fn is_karing(id: &str, name: &str) -> bool {
     id == "com.nebula.karing" || name.eq_ignore_ascii_case("karing")
-}
-fn compact_button(id: impl Into<ElementId>, label: impl Into<SharedString>, cx: &App) -> Button {
-    Button::new(id)
-        .custom(
-            ButtonCustomVariant::new(cx)
-                .foreground(theme::toolbar_fg())
-                .hover(rgb(0x35404e).into())
-                .active(rgb(0x3b4654).into()),
-        )
-        .bg(rgb(0x29313b))
-        .small()
-        .h(px(24.))
-        .px_2()
-        .label(label)
 }
 impl SessionView {
     fn karing_allowed(&self) -> bool {
@@ -294,45 +279,39 @@ impl SessionView {
             let name = provider.name.clone();
             let selected = self.karing.selected.as_ref() == Some(&name);
             chips = chips.child(
-                compact_button(
-                    SharedString::from(format!("karing-provider-{name}")),
-                    format!("{} · {}", provider.name, provider.nodes.len()),
-                    cx,
-                )
-                .w(px(if self.karing.providers.len() > 2 {
-                    72.
-                } else {
-                    86.
-                }))
-                .overflow_hidden()
-                .when(selected, |b| b.bg(rgb(0x17463f)).text_color(rgb(0x3cd7b4)))
-                .tooltip("选择订阅作为刷新、测速的操作范围")
-                .disabled(!enabled)
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.karing.selected = Some(name.clone());
-                    cx.notify();
-                })),
+                Button::new(SharedString::from(format!("karing-provider-{name}")))
+                    .ghost()
+                    .label(format!("{} · {}", provider.name, provider.nodes.len()))
+                    .w(px(if self.karing.providers.len() > 2 {
+                        72.
+                    } else {
+                        86.
+                    }))
+                    .overflow_hidden()
+                    .selected(selected)
+                    .tooltip("选择订阅作为刷新、测速的操作范围")
+                    .disabled(!enabled)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.karing.selected = Some(name.clone());
+                        cx.notify();
+                    })),
             );
         }
         if self.karing.providers.len() > 2 {
             chips = chips.child(
-                compact_button(
-                    "karing-more",
-                    format!("+{}", self.karing.providers.len() - 2),
-                    cx,
-                )
-                .w(px(28.))
-                .px_0()
-                .debug_selector(|| "karing-more".into())
-                .disabled(!enabled)
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.karing.show_providers = !this.karing.show_providers;
-                    cx.notify();
-                })),
+                Button::new("karing-more")
+                    .ghost()
+                    .label(format!("+{}", self.karing.providers.len() - 2))
+                    .debug_selector(|| "karing-more".into())
+                    .disabled(!enabled)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.karing.show_providers = !this.karing.show_providers;
+                        cx.notify();
+                    })),
             );
         }
         if self.karing.providers.is_empty() {
-            chips = chips.child(div().text_color(theme::toolbar_muted()).child(
+            chips = chips.child(div().text_color(theme::muted(cx)).child(
                 if self.karing.nodes_loaded {
                     format!("{} 个节点", self.karing.nodes.len())
                 } else {
@@ -346,51 +325,45 @@ impl SessionView {
             .w(px(304.))
             .p_2()
             .gap_1()
-            .text_size(px(12.))
+            .text_sm()
             .child(
                 h_flex()
-                    .h(px(22.))
+                    .py_1()
                     .items_center()
                     .gap_2()
-                    .child(div().font_weight(FontWeight::SEMIBOLD).child("Karing"))
+                    .child(div().font_semibold().child("Karing"))
                     .child(div().size(px(6.)).rounded_full().bg(
                         if self.karing.reachable && self.karing_allowed() {
-                            rgb(0x3cd7b4)
+                            theme::success(cx)
                         } else {
-                            rgb(0x7e8998)
+                            theme::muted(cx)
                         },
                     ))
-                    .child(div().text_color(theme::toolbar_muted()).child(status)),
+                    .child(div().text_color(theme::muted(cx)).child(status)),
             )
             .child(
                 h_flex()
-                    .h(px(26.))
                     .items_center()
                     .gap_1()
-                    .child(
-                        div()
-                            .w(px(32.))
-                            .text_color(theme::toolbar_muted())
-                            .child("配置"),
-                    )
+                    .child(div().w(px(32.)).text_color(theme::muted(cx)).child("配置"))
                     .child(chips)
                     .child(
-                        compact_button("karing-refresh-subscription", "↻", cx)
-                            .w(px(24.))
-                            .px_0()
-                            .debug_selector(|| "karing-refresh-subscription".into())
-                            .tooltip("刷新所选订阅")
-                            .disabled(
-                                !enabled || !self.karing.provider().is_some_and(|p| p.refreshable),
-                            )
-                            .on_click(
-                                cx.listener(|this, _, _, cx| this.refresh_karing_subscription(cx)),
-                            ),
+                        crate::ui::icon_button(
+                            "karing-refresh-subscription",
+                            crate::assets::FunctionIcon::Refresh,
+                            "刷新订阅",
+                        )
+                        .debug_selector(|| "karing-refresh-subscription".into())
+                        .tooltip("刷新所选订阅")
+                        .disabled(
+                            !enabled || !self.karing.provider().is_some_and(|p| p.refreshable),
+                        )
+                        .on_click(
+                            cx.listener(|this, _, _, cx| this.refresh_karing_subscription(cx)),
+                        ),
                     )
                     .child(
-                        compact_button("karing-test", "ϟ", cx)
-                            .w(px(24.))
-                            .px_0()
+                        crate::ui::icon_button("karing-test", IconName::Network, "节点测速")
                             .debug_selector(|| "karing-test".into())
                             .tooltip("节点延迟测速")
                             .disabled(!enabled || nodes == 0)
@@ -405,24 +378,20 @@ impl SessionView {
                         .overflow_y_scroll()
                         .child(v_flex().gap_1().children(
                             self.karing.providers.clone().into_iter().map(|p| {
-                                compact_button(
-                                    SharedString::from(p.name.clone()),
-                                    p.name.clone(),
-                                    cx,
-                                )
-                                .w_full()
-                                .debug_selector({
-                                    let name = p.name.clone();
-                                    move || format!("karing-more-provider-{name}")
-                                })
-                                .disabled(!enabled)
-                                .on_click(cx.listener(
-                                    move |this, _, _, cx| {
+                                Button::new(SharedString::from(p.name.clone()))
+                                    .ghost()
+                                    .label(p.name.clone())
+                                    .w_full()
+                                    .debug_selector({
+                                        let name = p.name.clone();
+                                        move || format!("karing-more-provider-{name}")
+                                    })
+                                    .disabled(!enabled)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
                                         this.karing.selected = Some(p.name.clone());
                                         this.karing.show_providers = false;
                                         cx.notify();
-                                    },
-                                ))
+                                    }))
                             }),
                         )),
                 )
@@ -430,15 +399,10 @@ impl SessionView {
             .when_some(self.karing.current_node.clone(), |panel, node| {
                 panel.child(
                     h_flex()
-                        .h(px(22.))
+                        .py_1()
                         .items_center()
                         .gap_1()
-                        .child(
-                            div()
-                                .w(px(32.))
-                                .text_color(theme::toolbar_muted())
-                                .child("当前"),
-                        )
+                        .child(div().w(px(32.)).text_color(theme::muted(cx)).child("当前"))
                         .child(
                             div()
                                 .id("karing-current-node")
@@ -452,36 +416,33 @@ impl SessionView {
             })
             .child(
                 h_flex()
-                    .h(px(26.))
                     .items_center()
                     .gap_2()
+                    .child(div().w(px(32.)).text_color(theme::muted(cx)).child("链式"))
                     .child(
-                        div()
-                            .w(px(32.))
-                            .text_color(theme::toolbar_muted())
-                            .child("链式"),
+                        crate::ui::icon_button(
+                            "karing-chain-toggle",
+                            IconName::Network,
+                            "链式代理",
+                        )
+                        .disabled(true)
+                        .tooltip("Karing 当前管理接口未提供链式代理配置"),
                     )
+                    .child(div().flex_1().text_color(theme::muted(cx)).child("未提供"))
                     .child(
-                        compact_button("karing-chain-toggle", "○", cx)
-                            .disabled(true)
-                            .tooltip("Karing 当前管理接口未提供链式代理配置"),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .text_color(theme::toolbar_muted())
-                            .child("未提供"),
-                    )
-                    .child(
-                        compact_button("karing-chain-order", "⇅", cx)
-                            .disabled(true)
-                            .tooltip("Karing 当前管理接口未提供链式顺序修改"),
+                        crate::ui::icon_button(
+                            "karing-chain-order",
+                            IconName::ChevronsUpDown,
+                            "链式顺序",
+                        )
+                        .disabled(true)
+                        .tooltip("Karing 当前管理接口未提供链式顺序修改"),
                     ),
             )
             .child(
                 h_flex()
                     .border_t_1()
-                    .border_color(theme::toolbar_line())
+                    .border_color(theme::line(cx))
                     .pt_1()
                     .items_center()
                     .gap_1()
@@ -490,8 +451,8 @@ impl SessionView {
                             .flex_1()
                             .min_w_0()
                             .overflow_hidden()
-                            .text_size(px(11.))
-                            .text_color(theme::toolbar_muted())
+                            .text_xs()
+                            .text_color(theme::muted(cx))
                             .child(if self.karing.message.is_empty() {
                                 "等待配置".to_string()
                             } else {
@@ -499,7 +460,9 @@ impl SessionView {
                             }),
                     )
                     .child(
-                        compact_button("karing-delay-results", "结果", cx)
+                        Button::new("karing-delay-results")
+                            .ghost()
+                            .label("结果")
                             .debug_selector(|| "karing-delay-results".into())
                             .disabled(self.karing.delays.is_empty())
                             .on_click(cx.listener(|this, _, _, cx| {
@@ -508,7 +471,9 @@ impl SessionView {
                             })),
                     )
                     .child(
-                        compact_button("karing-refresh-nodes", "刷新节点", cx)
+                        Button::new("karing-refresh-nodes")
+                            .ghost()
+                            .label("刷新节点")
                             .debug_selector(|| "karing-refresh-nodes".into())
                             .disabled(!enabled)
                             .on_click(cx.listener(|this, _, _, cx| this.refresh_karing(cx))),
@@ -527,7 +492,7 @@ impl SessionView {
                                     .delays
                                     .iter()
                                     .cloned()
-                                    .map(|result| div().text_size(px(11.)).child(result)),
+                                    .map(|result| div().text_xs().child(result)),
                             ),
                         ),
                 )
@@ -701,7 +666,7 @@ mod tests {
             assert!(cx.debug_bounds("karing-current-node").is_some());
             let panel = cx.debug_bounds("karing-panel").unwrap();
             assert!(
-                panel.size.width <= px(320.) && panel.size.height <= px(170.),
+                panel.size.width <= px(320.) && panel.size.height <= px(220.),
                 "{panel:?}"
             );
         }
@@ -731,7 +696,7 @@ mod tests {
         open(cx);
         let panel = cx.debug_bounds("karing-panel").unwrap();
         assert!(
-            panel.size.width <= px(320.) && panel.size.height <= px(170.),
+            panel.size.width <= px(320.) && panel.size.height <= px(220.),
             "{panel:?}"
         );
         let initial = requests(&mut peer);

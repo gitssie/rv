@@ -1,5 +1,4 @@
 use super::*;
-use gpui_component::button::ButtonCustomVariant;
 use gpui_component::menu::{ContextMenuExt, PopupMenuItem};
 use rv_core::{UnlockCode, delete_unlock_code, load_unlock_code, save_unlock_code};
 use rv_session::{AppCommand, ScreenState};
@@ -190,6 +189,13 @@ impl SessionView {
         self.tick_unlock(cx);
         cx.notify();
     }
+    pub(super) fn prompt_unlock_setting(&mut self, cx: &mut Context<Self>) {
+        self.unlock.editing = true;
+        self.unlock.focus_pending = true;
+        self.unlock.validation = None;
+        cx.notify();
+    }
+
     fn edit_unlock_setting(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.unlock.busy || self.unlock.step != Step::Idle {
             return;
@@ -200,7 +206,6 @@ impl SessionView {
         self.unlock.validation = None;
         self.unlock.input.update(cx, |input, cx| {
             input.set_value("", window, cx);
-            input.focus(window, cx);
         });
         cx.notify();
     }
@@ -500,12 +505,12 @@ impl SessionView {
         let (icon, color, label) = match state {
             UnlockVisualState::Locked => (
                 crate::assets::AppActionIcon::Lock,
-                theme::toolbar_muted(),
+                theme::muted(cx),
                 "屏幕已锁定，点击解锁",
             ),
             UnlockVisualState::Unlocking => (
                 crate::assets::AppActionIcon::Lock,
-                rgb(0x79b8ff).into(),
+                theme::accent(cx),
                 if self.unlock.step == Step::Locking {
                     "正在锁屏"
                 } else {
@@ -514,18 +519,12 @@ impl SessionView {
             ),
             UnlockVisualState::Unlocked => (
                 crate::assets::AppActionIcon::Unlock,
-                rgb(0x82c9a0).into(),
+                theme::success(cx),
                 "屏幕已解锁，点击锁屏",
             ),
         };
         Button::new("unlock-screen")
-            .custom(
-                ButtonCustomVariant::new(cx)
-                    .foreground(color)
-                    .hover(rgb(0x2a343f).into())
-                    .active(rgb(0x35404e).into()),
-            )
-            .size(px(28.))
+            .ghost()
             .icon(Icon::new(icon))
             .loading(state == UnlockVisualState::Unlocking)
             .text_color(color)
@@ -557,107 +556,98 @@ impl SessionView {
                 )
             })
     }
-    pub(super) fn render_unlock_setting(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        if self.unlock.focus_pending {
-            self.unlock.focus_pending = false;
-            self.unlock
-                .input
-                .update(cx, |input, cx| input.focus(window, cx));
+    pub(super) fn sync_unlock_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use gpui_component::{WindowExt, dialog::DialogFooter};
+        if self.unlock_dialog_open == self.unlock.editing() {
+            return;
         }
-        div()
-            .absolute()
-            .inset_0()
-            .occlude()
-            .bg(theme::scrim())
-            .flex()
-            .items_center()
-            .justify_center()
-            .child(
-                v_flex()
-                    .id("unlock-setting")
-                    .debug_selector(|| "unlock-setting".into())
-                    .w(px(320.))
-                    .p(px(20.))
-                    .gap_4()
-                    .rounded_lg()
-                    .bg(theme::toolbar())
-                    .border_1()
-                    .border_color(theme::toolbar_line())
-                    .shadow_lg()
-                    .text_color(theme::toolbar_fg())
-                    .child(div().text_sm().font_semibold().child("设置锁屏密码"))
+        self.unlock_dialog_open = self.unlock.editing();
+        if !self.unlock_dialog_open {
+            if window.has_active_dialog(cx) {
+                window.close_dialog(cx);
+            }
+            self.focus.focus(window, cx);
+            return;
+        }
+        let owner = cx.entity();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            owner.update(cx, |this, cx| {
+                let submit = cx.entity();
+                let cancel = submit.clone();
+                let close = submit.clone();
+                dialog
+                    .title("设置锁屏密码")
+                    .max_h(relative(0.9))
+                    .keyboard(!this.unlock.busy)
+                    .close_button(!this.unlock.busy)
+                    .overlay_closable(!this.unlock.busy)
                     .child(
-                        Input::new(&self.unlock.input)
-                            .appearance(false)
-                            .h(px(44.))
-                            .bg(rgb(0x151b22))
-                            .text_color(theme::toolbar_fg())
-                            .text_size(px(16.))
-                            .rounded_md()
-                            .border_1()
-                            .border_color(
-                                if self
-                                    .unlock
-                                    .input
-                                    .read(cx)
-                                    .focus_handle(cx)
-                                    .is_focused(window)
-                                {
-                                    rgb(0x527da7).into()
-                                } else {
-                                    theme::toolbar_line()
-                                },
-                            )
-                            .disabled(self.unlock.busy),
+                        v_flex()
+                            .id("unlock-setting")
+                            .debug_selector(|| "unlock-setting".into())
+                            .gap_3()
+                            .child(Input::new(&this.unlock.input).disabled(this.unlock.busy))
+                            .children(
+                                this.unlock
+                                    .validation
+                                    .clone()
+                                    .map(|error| div().text_color(theme::danger(cx)).child(error)),
+                            ),
                     )
-                    .when_some(self.unlock.validation.clone(), |el, error| {
-                        el.child(div().text_xs().text_color(theme::danger(cx)).child(error))
-                    })
-                    .child(
-                        h_flex()
-                            .justify_end()
-                            .gap_2()
+                    .footer(
+                        DialogFooter::new()
                             .child(
                                 Button::new("unlock-cancel")
-                                    .custom(
-                                        ButtonCustomVariant::new(cx)
-                                            .foreground(theme::toolbar_muted())
-                                            .hover(rgb(0x2a343f).into())
-                                            .active(rgb(0x35404e).into()),
-                                    )
                                     .label("取消")
-                                    .disabled(self.unlock.busy)
+                                    .disabled(this.unlock.busy)
                                     .on_click(cx.listener(|this, _, window, cx| {
-                                        this.unlock.editing = false;
-                                        this.unlock.input.update(cx, |input, cx| {
-                                            input.set_value("", window, cx)
-                                        });
-                                        this.focus.focus(window, cx);
-                                        cx.notify();
+                                        this.cancel_unlock_dialog(window, cx)
                                     })),
                             )
                             .child(
                                 Button::new("unlock-save")
-                                    .custom(
-                                        ButtonCustomVariant::new(cx)
-                                            .color(rgb(0x35648b).into())
-                                            .foreground(theme::toolbar_fg())
-                                            .hover(rgb(0x40759e).into())
-                                            .active(rgb(0x2d5679).into()),
-                                    )
+                                    .primary()
                                     .label("保存并解锁")
-                                    .loading(self.unlock.busy)
-                                    .disabled(self.unlock.busy)
+                                    .loading(this.unlock.busy)
+                                    .disabled(this.unlock.busy)
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.save_unlock_setting(window, cx)
                                     })),
                             ),
-                    ),
-            )
+                    )
+                    .on_ok(move |_, window, cx| {
+                        submit.update(cx, |this, cx| this.save_unlock_setting(window, cx));
+                        false
+                    })
+                    .on_cancel(move |_, window, cx| {
+                        cancel.update(cx, |this, cx| {
+                            if this.unlock.busy {
+                                return false;
+                            }
+                            this.cancel_unlock_dialog(window, cx);
+                            true
+                        })
+                    })
+                    .on_close(move |_, window, cx| {
+                        close.update(cx, |this, cx| this.cancel_unlock_dialog(window, cx))
+                    })
+            })
+        });
+        self.unlock.focus_pending = false;
+        self.unlock
+            .input
+            .update(cx, |input, cx| input.focus(window, cx));
+    }
+    fn cancel_unlock_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.unlock.busy {
+            return;
+        }
+        self.unlock.editing = false;
+        self.unlock
+            .input
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.focus.focus(window, cx);
+        cx.notify();
     }
 }
 
@@ -665,7 +655,7 @@ impl SessionView {
 mod tests {
     use super::super::ui_tests::setup;
     use super::{Instant, ScreenState, SessionView, Step, UnlockCode, UnlockVisualState};
-    use gpui::{Entity, TestAppContext, VisualTestContext};
+    use gpui::{Entity, Focusable, TestAppContext, VisualTestContext};
     use rv_session::{AppCapabilities, AppCommand, AppEvent, SessionCommand, SessionTestPeer};
 
     fn enable(view: &Entity<SessionView>, cx: &mut VisualTestContext) {
@@ -754,6 +744,32 @@ mod tests {
             SessionCommand::App(AppCommand::CancelScreen(_))
         ));
         assert!(key_events(&sent).is_empty());
+    }
+    #[gpui::test]
+    fn unlock_dialog_restores_remote_keyboard_focus(cx: &mut TestAppContext) {
+        let (view, cx, _peer) = setup(cx, false);
+        cx.update(|window, cx| view.update(cx, |view, cx| view.edit_unlock_setting(window, cx)));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.update(|window, cx| {
+            view.read_with(cx, |view, cx| {
+                assert!(view.unlock_dialog_open);
+                assert!(
+                    view.unlock
+                        .input
+                        .read(cx)
+                        .focus_handle(cx)
+                        .is_focused(window)
+                );
+            })
+        });
+        cx.update(|window, cx| view.update(cx, |view, cx| view.cancel_unlock_dialog(window, cx)));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.update(|window, cx| {
+            view.read_with(cx, |view, _| {
+                assert!(!view.unlock_dialog_open);
+                assert!(view.focus.is_focused(window));
+            })
+        });
     }
     #[gpui::test]
     fn http_lock_and_failed_unlock_do_not_poll_or_replay(cx: &mut TestAppContext) {

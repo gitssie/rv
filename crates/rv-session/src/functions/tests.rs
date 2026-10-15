@@ -115,14 +115,50 @@ async fn next(events: &mut mpsc::Receiver<FunctionEvent>) -> FunctionEvent {
 }
 
 #[tokio::test]
+async fn resume_authorization_failure_keeps_unknown_and_allows_explicit_requery() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client = crate::phone_http::PhoneHttpClient::new("127.0.0.1", listener.local_addr().unwrap().port(), "test".into()).unwrap();
+    let (commands, rx) = mpsc::channel(8);
+    let (events, mut states) = mpsc::channel(8);
+    let actor = tokio::spawn(worker(client, rx, events));
+    assert!(matches!(next(&mut states).await, FunctionEvent::Available(true)));
+    commands.send(FunctionCommand::Resume { task: 32, operation_id: "original".into() }).await.unwrap();
+    let (socket, _) = listener.accept().await.unwrap();
+    let mut socket = TestStream::new(socket);
+    assert_eq!(packet(&mut socket).await.0, 33);
+    reply(&mut socket, json!({"error":"unauthorized"})).await;
+    assert!(matches!(next(&mut states).await, FunctionEvent::Uncertain(_)));
+    assert!(tokio::time::timeout(Duration::from_millis(1100), socket.packets.recv()).await.is_err(), "failed query must not retry in background");
+    commands.send(FunctionCommand::Resume { task: 32, operation_id: "original".into() }).await.unwrap();
+    assert_eq!(packet(&mut socket).await.0, 33);
+    reply(&mut socket, json!({"ok":true})).await;
+    let (task, query) = packet(&mut socket).await;
+    assert_eq!(task, 32);
+    assert_eq!(query, json!({"action":"result","operation_id":"original"}));
+    reply(&mut socket, json!({"operation_id":"original","status":"completed","result":{}})).await;
+    assert!(matches!(next(&mut states).await, FunctionEvent::State { task:32, record } if record["status"] == "completed"));
+    actor.abort();
+}
+
+#[tokio::test]
 async fn challenge_fetches_once_and_never_replays_login() {
-    challenge_flow(false).await;
+    challenge_flow(false, false, false).await;
 }
 #[tokio::test]
 async fn automatic_code_rejection_is_reported() {
-    challenge_flow(true).await;
+    challenge_flow(true, false, false).await;
 }
-async fn challenge_flow(reject: bool) {
+#[tokio::test]
+async fn challenge_retries_code_link_until_code_arrives() {
+    tokio::time::timeout(Duration::from_secs(12), challenge_flow(false, true, false))
+        .await.unwrap();
+}
+#[tokio::test]
+async fn challenge_manual_fetch_bypasses_retry_delay() {
+    tokio::time::timeout(Duration::from_secs(12), challenge_flow(false, true, true))
+        .await.unwrap();
+}
+async fn challenge_flow(reject: bool, delayed_code: bool, manual_retry: bool) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!(
@@ -130,7 +166,16 @@ async fn challenge_flow(reject: bool) {
         http.local_addr().unwrap().port()
     );
     let http_task = tokio::spawn(async move {
-        let (mut stream, _) = http.accept().await.unwrap();
+        if delayed_code {
+            let (mut stream, _) = http.accept().await.unwrap();
+            let mut request = [0; 4096];
+            use tokio::io::AsyncReadExt;
+            stream.read(&mut request).await.unwrap();
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}").await.unwrap();
+        }
+        let (mut stream, _) = tokio::time::timeout(
+            Duration::from_secs(if manual_retry { 2 } else { 6 }), http.accept(),
+        ).await.unwrap().unwrap();
         let mut buffer = [0; 4096];
         use tokio::io::AsyncReadExt;
         let count = stream.read(&mut buffer).await.unwrap();
@@ -183,8 +228,15 @@ async fn challenge_flow(reject: bool) {
         let (_, query) = packet(&mut socket).await;
         assert_eq!(query["action"], "result");
         reply(&mut socket,json!({"operation_id":"operation-1","method":"signInAppStore","status":"requires_verification_code","challenge":{"challenge_id":"challenge-1"}})).await;
-        socket = reconnect(&listener, socket).await;
-        let (_, submit) = packet(&mut socket).await;
+        let submit = loop {
+            socket = reconnect(&listener, socket).await;
+            let (_, request) = packet(&mut socket).await;
+            if delayed_code && request["action"] == "result" {
+                reply(&mut socket,json!({"operation_id":"operation-1","method":"signInAppStore","status":"requires_verification_code","challenge":{"challenge_id":"challenge-1"}})).await;
+            } else {
+                break request;
+            }
+        };
         assert_eq!(submit["action"], "submit_code");
         assert_eq!(submit["code"], "012345");
         if reject {
@@ -220,6 +272,15 @@ async fn challenge_flow(reject: bool) {
         .unwrap();
     loop {
         match next(&mut states).await {
+            FunctionEvent::CodeFetchWaiting { .. } if manual_retry => {
+                commands.send(FunctionCommand::FetchCode).await.unwrap();
+            }
+            FunctionEvent::CodeFetched(code) if manual_retry => {
+                commands.send(FunctionCommand::SubmitCode {
+                    operation_id: "operation-1".into(),
+                    challenge_id: "challenge-1".into(), code,
+                }).await.unwrap();
+            }
             FunctionEvent::Error(e) if reject => {
                 assert!(e.contains("code_rejected"));
                 break;
@@ -523,6 +584,52 @@ async fn absent_cloud_never_submits_logout_or_falls_back_to_store() {
     );
     peer.await.unwrap();
     actor.abort();
+}
+
+#[tokio::test]
+async fn query_followup_rechecks_bound_account_before_exactly_one_mutation() {
+    for matching in [false, true] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (commands, rx) = mpsc::channel(8);
+        let (events, mut states) = mpsc::channel(32);
+        let actor = tokio::spawn(worker(
+            crate::phone_http::PhoneHttpClient::new("127.0.0.1", listener.local_addr().unwrap().port(), "a".repeat(64)).unwrap(),
+            rx, events,
+        ));
+        let peer = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut socket = TestStream::new(socket);
+            assert_eq!(packet(&mut socket).await.0, 33);
+            reply(&mut socket, json!({"version":1,"op":0,"id":0,"status":0})).await;
+            assert_eq!(packet(&mut socket).await.1["method"], "queryAccountState");
+            let current = if matching { "original@example.test" } else { "changed@example.test" };
+            reply(&mut socket, json!({"operation_id":"read","status":"completed","result":{
+                "icloud":{"status":"signed_in","account":{"apple_id":current}},
+                "identity":{"status":"signed_in","account":{"apple_id":current}}
+            }})).await;
+            if matching {
+                socket = reconnect(&listener, socket).await;
+                assert_eq!(packet(&mut socket).await, (31, json!({"action":"invoke","method":"stopUsingAppleID",
+                    "params":{"apple_id":"original@example.test","bundle_id":"fr.vinted"}})));
+                reply(&mut socket, json!({"operation_id":"stop","method":"stopUsingAppleID","status":"completed","result":{"outcome":"succeeded"}})).await;
+            }
+            let mut line = String::new();
+            assert_eq!(socket.read_line(&mut line).await.unwrap(), 0);
+            assert!(tokio::time::timeout(Duration::from_millis(300), listener.accept()).await.is_err(), "unexpected mutation or replay");
+        });
+        assert!(matches!(next(&mut states).await, FunctionEvent::Available(true)));
+        commands.send(FunctionCommand::InvokeForAccount {
+            id:"authorization-stop".into(), text:"App=fr.vinted".into(), apple_id:"original@example.test".into(),
+        }).await.unwrap();
+        let event = next(&mut states).await;
+        if matching {
+            assert!(matches!(event, FunctionEvent::State {record,..} if record["operation_id"] == "stop"));
+        } else {
+            assert!(matches!(event, FunctionEvent::Error(message) if message.contains("账户已改变")));
+        }
+        peer.await.unwrap();
+        actor.abort();
+    }
 }
 
 #[tokio::test]
@@ -925,4 +1032,57 @@ async fn independent_function_finishes_while_another_socket_waits() {
     }
     drop(runtime);
     server.abort();
+}
+
+#[tokio::test]
+async fn cloud_login_resolves_fresh_store_account_before_invoking() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client = crate::phone_http::PhoneHttpClient::new(
+        "127.0.0.1", listener.local_addr().unwrap().port(), "a".repeat(64),
+    ).unwrap();
+    let (commands, rx) = mpsc::channel(8);
+    let (events, mut states) = mpsc::channel(32);
+    let actor = tokio::spawn(worker(client, rx, events));
+    let peer = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut socket = TestStream::new(socket);
+        socket = reconnect(&listener, socket).await;
+        let (_, query) = packet(&mut socket).await;
+        assert_eq!(query["method"], "queryAccountState");
+        reply(&mut socket, json!({
+            "operation_id":"account-read", "status":"completed", "result": {
+                "app_store":{"status":"signed_in","account":{"apple_id":"fresh@test","authenticated":true}},
+                "icloud":{"status":"not_signed_in","account":null},
+                "identity":{"status":"signed_in","account":{"apple_id":"unrelated@test"}}
+            }
+        })).await;
+        socket = reconnect(&listener, socket).await;
+        let (_, invoke) = packet(&mut socket).await;
+        assert_eq!(invoke["method"], "enableICloud");
+        assert_eq!(invoke["params"], json!({
+            "apple_id":"fresh@test", "password":"test-password", "device_passcode":"001234"
+        }));
+        reply(&mut socket, json!({
+            "operation_id":"cloud-login", "method":"enableICloud", "status":"completed",
+            "result":{"outcome":"succeeded"}
+        })).await;
+    });
+    assert!(matches!(next(&mut states).await, FunctionEvent::Available(true)));
+    // Missing local configuration must not even start a phone mutation.
+    commands.send(FunctionCommand::Invoke {
+        id:"cloud-login".into(), text:"test-password".into(),
+    }).await.unwrap();
+    assert!(matches!(next(&mut states).await, FunctionEvent::Error(error) if error.contains("锁屏密码")));
+    commands.send(FunctionCommand::Invoke {
+        id:"cloud-login".into(), text:"密码=test-password\n设备密码=001234".into(),
+    }).await.unwrap();
+    loop {
+        match next(&mut states).await {
+            FunctionEvent::State {record, ..} if record["status"] == "completed" => break,
+            FunctionEvent::Error(error) | FunctionEvent::Uncertain(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
+    peer.await.unwrap();
+    actor.abort();
 }

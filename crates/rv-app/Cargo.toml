@@ -17,6 +17,7 @@ workspace = true
 uuid.workspace = true
 rv-core.workspace = true
 rv-session.workspace = true
+rv-business.workspace = true
 serde_json.workspace = true
 directories.workspace = true
 anyhow.workspace = true
@@ -27,12 +28,12 @@ tracing-subscriber.workspace = true
 chrono = "0.4"
 gpui = { git = "https://github.com/zed-industries/zed" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit"] }
-gpui-component = { git = "https://github.com/longbridge/gpui-component" }
+gpui-component = { git = "https://github.com/longbridge/gpui-component", features = ["tree-sitter"] }
 gpui-component-assets = { git = "https://github.com/longbridge/gpui-component" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3", default-features = false, features = ["NSApplication", "NSCursor", "NSImage"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["NSApplication", "NSAppearance", "NSCursor", "NSImage", "NSWindow", "NSView", "NSButton", "NSControl", "NSResponder", "NSPasteboard"] }
 objc2-foundation = { version = "0.3", default-features = false, features = ["NSArray", "NSData", "NSString"] }
 raw-window-handle = "0.6"
 

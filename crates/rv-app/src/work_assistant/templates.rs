@@ -5,7 +5,7 @@ use gpui_component::{
     input::{Input, Textarea},
     menu::{DropdownMenu, PopupMenuItem},
 };
-use widgets::{field, primary, selection_menu};
+use widgets::{field, selection_menu};
 impl WorkAssistant {
     pub(super) fn template_dirty(&self, cx: &App) -> bool {
         self.template.name != self.template_name.read(cx).value().as_ref()
@@ -111,8 +111,6 @@ impl WorkAssistant {
                             Button::new("template-picker")
                                 .debug_selector(|| "template-picker".into())
                                 .outline()
-                                .small()
-                                .h(px(28.))
                                 .w_full()
                                 .min_w_0()
                                 .child(div().flex_1().min_w_0().text_ellipsis().child(
@@ -122,7 +120,7 @@ impl WorkAssistant {
                                         self.template.name.clone()
                                     },
                                 ))
-                                .child(gpui_component::Icon::new(IconName::ChevronDown).small())
+                                .child(gpui_component::Icon::new(IconName::ChevronDown))
                                 .disabled(
                                     self.busy
                                         || self.template_dirty(cx)
@@ -159,8 +157,6 @@ impl WorkAssistant {
                         Button::new("template-new")
                             .debug_selector(|| "template-new".into())
                             .outline()
-                            .small()
-                            .size(px(28.))
                             .icon(IconName::Plus)
                             .tooltip("新增文案")
                             .disabled(self.busy || self.template_dirty(cx))
@@ -175,7 +171,6 @@ impl WorkAssistant {
                         Button::new("template-discard")
                             .debug_selector(|| "template-discard".into())
                             .ghost()
-                            .small()
                             .label("放弃修改")
                             .disabled(self.busy)
                             .on_click(cx.listener(|this, _, window, cx| {
@@ -184,12 +179,8 @@ impl WorkAssistant {
                     ),
                 )
             })
-            .child(field("名称", Input::new(&self.template_name).small(), cx))
-            .child(field(
-                "分类",
-                Input::new(&self.template_category).small(),
-                cx,
-            ))
+            .child(field("名称", Input::new(&self.template_name), cx))
+            .child(field("分类", Input::new(&self.template_category), cx))
             .child(field(
                 "文案内容",
                 Textarea::new(&self.template_content)
@@ -201,7 +192,9 @@ impl WorkAssistant {
                 h_flex()
                     .gap_2()
                     .child(
-                        primary("template-save", "保存文案", cx)
+                        Button::new("template-save")
+                            .primary()
+                            .label("保存文案")
                             .debug_selector(|| "template-save".into())
                             .disabled(
                                 self.busy
@@ -214,7 +207,6 @@ impl WorkAssistant {
                     .child(
                         Button::new("template-send")
                             .outline()
-                            .small()
                             .label("发送到剪贴板")
                             .disabled(!self.writable || !self.connected)
                             .on_click(cx.listener(|this, _, _, cx| {
@@ -227,8 +219,6 @@ impl WorkAssistant {
                     Button::new("template-apply")
                         .debug_selector(|| "template-apply".into())
                         .outline()
-                        .small()
-                        .h(px(28.))
                         .label("用作当前商品描述")
                         .disabled(
                             self.draft.is_none()
@@ -250,7 +240,6 @@ impl WorkAssistant {
                         Button::new("template-delete")
                             .danger()
                             .outline()
-                            .small()
                             .label("删除文案…")
                             .disabled(self.busy)
                             .on_click(cx.listener(|this, _, _, cx| {
@@ -267,7 +256,6 @@ impl WorkAssistant {
                         .child("删除当前文案？")
                         .child(
                             Button::new("template-delete-cancel")
-                                .small()
                                 .label("取消")
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.confirm_template_delete = false;
@@ -277,7 +265,6 @@ impl WorkAssistant {
                         .child(
                             Button::new("template-delete-confirm")
                                 .danger()
-                                .small()
                                 .label("删除")
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.delete_template(window, cx)

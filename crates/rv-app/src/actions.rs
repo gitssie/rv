@@ -14,6 +14,7 @@ actions!(
         FocusSearch,
         CloseModal,
         QuitApp,
+        HomeFullscreen,
         SessionFullscreen,
         SessionScaleCycle,
         SessionCad,

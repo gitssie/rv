@@ -1,6 +1,6 @@
 //! Read-only probe of the installed phone's HTTP/2 Karing proxy.
 //! Reuses RV's local saved credentials; never prints tokens or configuration secrets.
-use rv_core::{ConnectRequest, Connection, StorePaths};
+use rv_core::{ConnectRequest, StorePaths};
 use rv_session::{AppEvent, SessionEvent, SessionHandle, phone_http::PhoneHttpClient};
 use serde_json::Value;
 use std::time::{Duration, Instant};
@@ -11,14 +11,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .nth(1)
         .ok_or("usage: live_karing_config_probe HOST")?;
     let paths = StorePaths::default_dir()?;
-    let book: Value = serde_json::from_slice(&std::fs::read(&paths.address_book)?)?;
-    let saved = book["connections"]
-        .as_array()
-        .ok_or("missing address book")?
+    let book = rv_core::AddressBook::load(paths.clone())?;
+    let connection = book
+        .connections()
         .iter()
-        .find(|c| c["host"].as_str() == Some(&host))
-        .ok_or("save this phone in RV first")?;
-    let connection: Connection = serde_json::from_value(saved.clone())?;
+        .find(|c| c.host == host)
+        .ok_or("save this phone in RV first")?
+        .clone();
     let mut request =
         ConnectRequest::from_connection(&connection, paths.load_password(connection.id)?);
     // A shared probe must not displace the user's existing viewer.

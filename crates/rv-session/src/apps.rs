@@ -25,6 +25,8 @@ pub struct AppCapabilities {
     pub notifications: bool,
     pub clipboard_write: bool,
     pub photo_tasks: bool,
+    pub device_info: bool,
+    pub app_profile: bool,
     pub zx_control: Option<ControlEndpoint>,
 }
 
@@ -45,6 +47,12 @@ pub enum AppCommand {
     Terminate(String),
     Restart(String),
     Foreground,
+    DeviceInfo,
+    ReadProfile {
+        app_id: rv_core::workspace::AppId,
+        bundle: String,
+        backup: String,
+    },
     Icon(String),
     ScreenState(u32),
     PrepareUnlock(u32),
@@ -56,7 +64,10 @@ pub enum AppCommand {
     Home,
     SubscribeNotifications(bool),
     Notifications,
-    WriteClipboard { token: String, text: String },
+    WriteClipboard {
+        token: String,
+        text: String,
+    },
 }
 
 impl AppCommand {
@@ -87,6 +98,8 @@ impl AppCommand {
             Self::Terminate(_) => 3,
             Self::Restart(_) => 4,
             Self::Foreground => 5,
+            Self::DeviceInfo => 25,
+            Self::ReadProfile { .. } => 0,
             Self::Icon(_) => 6,
             Self::ScreenState(_) => 7,
             Self::PrepareUnlock(_) => 8,
@@ -129,6 +142,8 @@ pub enum AppEvent {
     ScreenProgress(u32, crate::ScreenProgress),
     List(Vec<RemoteApp>),
     Foreground(Option<String>),
+    DeviceInfo(Value),
+    Profile(crate::AppProfileResponse),
     Icon {
         bundle_id: String,
         width: u32,
@@ -173,6 +188,7 @@ pub(crate) struct AppRuntime {
     control_connecting: bool,
     screen_operation: Option<crate::screen_control::ScreenOperation>,
     karing_operations: Vec<crate::karing::KaringOperation>,
+    profile_operations: Vec<crate::app_profile::ProfileOperation>,
 }
 
 impl AppRuntime {
@@ -190,6 +206,7 @@ impl AppRuntime {
             control_connecting: false,
             screen_operation: None,
             karing_operations: Vec::new(),
+            profile_operations: Vec::new(),
         }
     }
     fn supported(&self, cmd: &AppCommand) -> bool {
@@ -210,6 +227,10 @@ impl AppRuntime {
                 AppCommand::Terminate(_) => self.caps.terminate,
                 AppCommand::Restart(_) => self.caps.restart,
                 AppCommand::Foreground => self.caps.foreground,
+                AppCommand::DeviceInfo => self.caps.device_info && self.caps.zx_control.is_some(),
+                AppCommand::ReadProfile { .. } => {
+                    self.caps.app_profile && self.caps.zx_control.is_some() && self.allowed
+                }
                 AppCommand::Icon(_) => self.caps.icons,
                 AppCommand::ScreenState(_) => self.caps.unlock || self.caps.lock,
                 AppCommand::LockScreen(_) => self.caps.lock,
@@ -217,6 +238,35 @@ impl AppRuntime {
             }
     }
     pub fn command(&mut self, command: AppCommand, send: &impl Fn(AppEvent)) {
+        if let AppCommand::ReadProfile {
+            app_id,
+            bundle,
+            backup,
+        } = &command
+        {
+            if !self.supported(&command)
+                || !self.control_ready
+                || !self.profile_operations.is_empty()
+                || !valid_bundle_id(bundle)
+                || !backup.starts_with("snapshot:")
+            {
+                send(AppEvent::Failed {
+                    command,
+                    message: "手机账号资料读取不可用或正在执行".into(),
+                });
+                return;
+            }
+            if let Some(client) = self.http_client.clone() {
+                self.profile_operations
+                    .push(crate::app_profile::ProfileOperation::start(
+                        client,
+                        app_id.clone(),
+                        bundle.clone(),
+                        backup.clone(),
+                    ));
+            }
+            return;
+        }
         if matches!(command, AppCommand::CancelKaring) {
             self.karing_operations.clear();
             return;
@@ -339,6 +389,56 @@ impl AppRuntime {
         }
     }
     pub async fn advance(&mut self, client: &VncClient, send: &impl Fn(AppEvent)) {
+        self.advance_transport(Some(client), send).await;
+    }
+    pub(crate) async fn advance_http(&mut self, send: &impl Fn(AppEvent)) {
+        self.advance_transport(None, send).await;
+    }
+    pub(crate) fn configure_http(
+        &mut self,
+        caps: AppCapabilities,
+        client: crate::phone_http::PhoneHttpClient,
+        send: &impl Fn(AppEvent),
+    ) {
+        self.caps = caps;
+        self.http_client = Some(client.clone());
+        self.control = Some(ControlChannel::start_with_client(client));
+        self.control_connecting = true;
+        send(AppEvent::Capabilities(self.caps.clone()));
+        for command in [
+            AppCommand::DeviceInfo,
+            AppCommand::List,
+            AppCommand::Foreground,
+        ] {
+            self.command(command, send);
+        }
+    }
+    pub(crate) fn http_ready(&self) -> bool {
+        self.control_ready
+    }
+    async fn advance_transport(&mut self, client: Option<&VncClient>, send: &impl Fn(AppEvent)) {
+        self.profile_operations
+            .retain_mut(|operation| match operation.result.try_recv() {
+                Ok(Ok(response)) => {
+                    send(AppEvent::Profile(response));
+                    false
+                }
+                Ok(Err(message)) => {
+                    send(AppEvent::Failed {
+                        command: operation.command.clone(),
+                        message,
+                    });
+                    false
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => true,
+                Err(_) => {
+                    send(AppEvent::Failed {
+                        command: operation.command.clone(),
+                        message: "账号资料读取已停止".into(),
+                    });
+                    false
+                }
+            });
         self.karing_operations
             .retain_mut(|operation| match operation.result.try_recv() {
                 Ok(Ok(response)) => {
@@ -388,7 +488,7 @@ impl AppRuntime {
                 ControlEvent::Unavailable => {
                     // A transport failure does not revoke negotiated capabilities.
                     // The channel restores itself; other HTTP streams own their outcome.
-                    self.control_unavailable();
+                    self.control_unavailable(send);
                 }
                 ControlEvent::Reply(reply) => self.reply(reply, send),
             }
@@ -428,14 +528,14 @@ impl AppRuntime {
         let Some(command) = self.queue.pop_front() else {
             return;
         };
-        let independent = matches!(command.op(), 1..=6 | 12 | 16);
+        let independent = matches!(command.op(), 1..=6 | 12 | 16 | 25);
         if independent
             && (self.control_connecting
                 || (self.control_ready
                     && self
                         .pending
                         .values()
-                        .any(|(cmd, _)| matches!(cmd.op(), 1..=6 | 12 | 16))))
+                        .any(|(cmd, _)| matches!(cmd.op(), 1..=6 | 12 | 16 | 25))))
         {
             self.queue.push_front(command);
             return;
@@ -478,11 +578,13 @@ impl AppRuntime {
             } else {
                 Err("ZXTouch control is unavailable; check the connection settings and phone service".into())
             }
-        } else {
+        } else if let Some(client) = client {
             client
                 .input(X11Event::Device(request))
                 .await
                 .map_err(|error| error.to_string())
+        } else {
+            Err("此操作需要远程画面连接".into())
         };
         match sent {
             Ok(()) => {
@@ -524,7 +626,7 @@ impl AppRuntime {
                 if self.control.is_none()
                     && let Some((host, port)) = &self.control_host
                     && let Some(mut endpoint) = caps.zx_control.clone()
-                    && endpoint.version == 2
+                    && matches!(endpoint.version, 2 | 3)
                     && endpoint.port > 0
                     && endpoint.token.len() == 64
                     && endpoint.token.bytes().all(|byte| byte.is_ascii_hexdigit())
@@ -554,6 +656,9 @@ impl AppRuntime {
                 }
                 if self.caps.foreground {
                     self.command(AppCommand::Foreground, send);
+                }
+                if self.caps.device_info && self.caps.zx_control.is_some() {
+                    self.command(AppCommand::DeviceInfo, send);
                 }
             }
             return;
@@ -648,6 +753,12 @@ impl AppRuntime {
                     };
                     send(AppEvent::Foreground(id));
                 }
+                AppCommand::DeviceInfo => {
+                    if !value.is_object() {
+                        return Err("Invalid device information".into());
+                    }
+                    send(AppEvent::DeviceInfo(value.clone()));
+                }
                 AppCommand::Icon(bundle_id) => {
                     if let Some(encoded) = value["png"].as_str() {
                         if encoded.len() > 350000 {
@@ -704,7 +815,18 @@ impl AppRuntime {
     pub(crate) fn http_client(&self) -> Option<crate::phone_http::PhoneHttpClient> {
         self.http_client.clone()
     }
-    fn control_unavailable(&mut self) {
+    fn control_unavailable(&mut self, send: &impl Fn(AppEvent)) {
+        let queued = std::mem::take(&mut self.queue);
+        for command in queued {
+            if command.mutates() {
+                send(AppEvent::Failed {
+                    command,
+                    message: "ZXTouch 连接中断；排队操作未发送，请恢复后重新操作".into(),
+                });
+            } else {
+                self.queue.push_back(command);
+            }
+        }
         self.control_ready = false;
         self.control_connecting = true;
     }
@@ -741,10 +863,30 @@ mod tests {
             token: "a".repeat(64),
         });
         runtime.control_ready = true;
-        runtime.control_unavailable();
+        runtime.control_unavailable(&|_| {});
         assert!(!runtime.control_ready && runtime.control_connecting);
         assert!(runtime.caps.list && runtime.caps.launch && runtime.caps.http_screen_control);
         assert!(runtime.caps.zx_control.is_some());
+    }
+    #[test]
+    fn lost_control_discards_queued_mutations_and_retains_reads() {
+        let mut runtime = AppRuntime::new(true);
+        runtime.queue.extend([
+            AppCommand::Launch("fr.vinted".into()),
+            AppCommand::Restart("fr.vinted".into()),
+            AppCommand::DeviceInfo,
+        ]);
+        let failed = RefCell::new(vec![]);
+        runtime.control_unavailable(&|event| {
+            if let AppEvent::Failed { command, .. } = event {
+                failed.borrow_mut().push(command);
+            }
+        });
+        assert_eq!(failed.borrow().len(), 2);
+        assert_eq!(
+            runtime.queue.into_iter().collect::<Vec<_>>(),
+            vec![AppCommand::DeviceInfo]
+        );
     }
     #[test]
     fn http_control_loss_disables_karing_but_preserves_legacy_vnc_screen_control() {

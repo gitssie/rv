@@ -166,7 +166,7 @@ impl WorkAssistant {
                                     .id(SharedString::from(format!("image-drag-{id}")))
                                     .size(px(48.))
                                     .relative()
-                                    .rounded_md()
+                                    .rounded(theme::radius(cx))
                                     .overflow_hidden()
                                     .border_1()
                                     .border_color(theme::line(cx))
@@ -205,7 +205,6 @@ impl WorkAssistant {
                                     .child(
                                         Button::new(SharedString::from(format!("remove-{id}")))
                                             .ghost()
-                                            .xsmall()
                                             .icon(IconName::Close)
                                             .tooltip("移除本地图片")
                                             .disabled(busy)
@@ -218,9 +217,6 @@ impl WorkAssistant {
                     .child(
                         Button::new("add-draft-images")
                             .outline()
-                            .small()
-                            .w(px(48.))
-                            .h(px(48.))
                             .icon(IconName::Plus)
                             .tooltip("添加商品图片")
                             .disabled(busy)
@@ -232,7 +228,6 @@ impl WorkAssistant {
                     Button::new("import-draft-images")
                         .debug_selector(|| "import-draft-images".into())
                         .outline()
-                        .small()
                         .label(if self.import_busy {
                             "导入中…"
                         } else {
@@ -256,7 +251,6 @@ impl WorkAssistant {
                         .child(
                             Button::new("photo-recovery")
                                 .outline()
-                                .small()
                                 .label("核实后恢复导入…")
                                 .disabled(busy || !self.writable || !self.connected)
                                 .on_click(cx.listener(|this, _, _, cx| {
@@ -271,7 +265,6 @@ impl WorkAssistant {
                                     .child(
                                         Button::new("photo-recovery-cancel")
                                             .ghost()
-                                            .small()
                                             .label("取消")
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 this.confirm_import_retry = false;
@@ -281,7 +274,6 @@ impl WorkAssistant {
                                     .child(
                                         Button::new("photo-recovery-confirm")
                                             .outline()
-                                            .small()
                                             .label("确认未导入，恢复")
                                             .disabled(busy || !self.writable || !self.connected)
                                             .on_click(cx.listener(|this, _, _, cx| {
@@ -304,7 +296,6 @@ impl WorkAssistant {
                 el.child(
                     Button::new("cancel-draft-import")
                         .ghost()
-                        .small()
                         .label("停止后续导入")
                         .on_click(cx.listener(|_, _, _, cx| cx.emit(AssistantEvent::CancelImport))),
                 )
@@ -320,11 +311,10 @@ impl WorkAssistant {
 }
 struct ImageDragView(String);
 impl Render for ImageDragView {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .p_2()
-            .bg(rgb(0x233247))
-            .text_color(rgb(0xffffff))
+            .bg(theme::selected(cx))
             .child(format!("移动图片 {}", &self.0[..8]))
     }
 }

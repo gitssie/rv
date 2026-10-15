@@ -5,7 +5,7 @@ pub(super) fn needs_current_account(spec: &OperationSpec) -> bool {
     spec.task == 31
         && !matches!(
             spec.method,
-            "queryState" | "signInAppStore" | "enableICloud"
+            "queryState" | "signInAppStore"
         )
 }
 
@@ -28,7 +28,13 @@ pub(super) fn current_account(method: &str, state: &Value) -> Result<String, Str
             .map(str::to_owned)
             .ok_or_else(|| "手机未登录 App Store，未执行操作".into());
     }
-    // iCloud operations must never pick the App Store account or a historical record.
+    if method == "enableICloud" {
+        return domain_account(state, "app_store")?
+            .filter(|_| state["app_store"]["account"]["authenticated"] == true)
+            .map(str::to_owned)
+            .ok_or_else(|| "请先登录 App Store，再登录 iCloud".into());
+    }
+    // Existing iCloud operations must never pick an unrelated Store profile.
     let cloud = domain_account(state, "icloud")?;
     if matches!(
         method,
@@ -123,6 +129,17 @@ mod tests {
         };
         json!({"icloud":section(cloud),"identity":section(identity),"app_store":section(store)})
     }
+    #[test]
+    fn cloud_login_uses_authenticated_store_account() {
+        let mut value = state(None, Some("identity@test"), Some("store@test"));
+        assert_eq!(current_account("enableICloud", &value).unwrap(), "store@test");
+        value["app_store"]["account"]["authenticated"] = json!(false);
+        assert!(current_account("enableICloud", &value).is_err());
+        assert!(current_account("enableICloud", &state(Some("cloud@test"), None, None)).is_err());
+        value["app_store"]["status"] = json!("conflict");
+        assert!(current_account("enableICloud", &value).is_err());
+    }
+
     #[test]
     fn cloud_logout_uses_cloud_even_when_store_and_identity_differ() {
         assert_eq!(

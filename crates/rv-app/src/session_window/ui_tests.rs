@@ -40,6 +40,7 @@ fn setup_with_cursor_mode(
         .unwrap();
     let mut entity = None;
     let (_, cx) = cx.add_window_view(|window, cx| {
+        crate::theme::apply(rv_core::ThemePref::Dark, window, cx);
         let view = cx.new(|cx| {
             let mut view = SessionView::with_handle(
                 request,
@@ -50,6 +51,7 @@ fn setup_with_cursor_mode(
                     menu_key: "f8".into(),
                     hide_shots: true,
                     thumb_path: None,
+                    app_icon_cache: None,
                     address_book: None,
                     transfer_folders: Default::default(),
                     app_shortcuts: rv_core::default_app_shortcuts(),
@@ -63,7 +65,7 @@ fn setup_with_cursor_mode(
             view
         });
         entity = Some(view.clone());
-        gpui_component::Root::new(view, window, cx)
+        gpui_component::Root::new(cx.new(|cx| super::SessionShell::new(view, cx)), window, cx)
     });
     cx.simulate_resize(size(px(1000.), px(800.)));
     cx.update(|window, cx| {
@@ -395,111 +397,55 @@ fn offscreen_keyboard_forwards_pairs_and_consumes_menu_shortcuts(cx: &mut TestAp
 }
 
 #[gpui::test]
-fn offscreen_trollvnc_ctrl_v_sends_command_v_once_and_restores_control(cx: &mut TestAppContext) {
-    use rv_core::{XK_CONTROL_L, XK_SUPER_L};
+fn offscreen_trollvnc_paste_waits_for_ack_and_does_not_repeat(cx: &mut TestAppContext) {
     let (view, cx, mut peer) = setup(cx, false);
-    peer.events
-        .send(SessionEvent::Apps(rv_session::AppEvent::Capabilities(
-            rv_session::AppCapabilities::default(),
-        )))
-        .unwrap();
+    peer.events.send(SessionEvent::Apps(rv_session::AppEvent::Capabilities(
+        rv_session::AppCapabilities { control: true, clipboard_write: true, ..Default::default() }
+    ))).unwrap();
     view.update(cx, |view, cx| view.pump(cx));
     commands(&mut peer);
-    cx.simulate_event(gpui::ModifiersChangedEvent {
-        modifiers: Modifiers {
-            control: true,
-            ..Default::default()
-        },
-        capslock: gpui::Capslock { on: false },
-    });
+    cx.write_to_clipboard(ClipboardItem::new_string("中文输入".into()));
     for is_held in [false, false, true] {
         cx.simulate_event(gpui::KeyDownEvent {
-            keystroke: gpui::Keystroke::parse("ctrl-v").unwrap(),
-            is_held,
-            prefer_character_input: false,
+            keystroke: gpui::Keystroke::parse("cmd-v").unwrap(), is_held, prefer_character_input: false,
         });
     }
-    cx.simulate_event(gpui::KeyUpEvent {
-        keystroke: gpui::Keystroke::parse("ctrl-v").unwrap(),
-    });
-    cx.simulate_keystrokes("ctrl-a");
-    cx.simulate_event(gpui::KeyUpEvent {
-        keystroke: gpui::Keystroke::parse("ctrl-a").unwrap(),
-    });
-    cx.simulate_event(gpui::ModifiersChangedEvent {
-        modifiers: Modifiers::default(),
-        capslock: gpui::Capslock { on: false },
-    });
-    let keys: Vec<_> = commands(&mut peer)
-        .into_iter()
-        .map(|command| {
-            let SessionCommand::Input(vnc::X11Event::KeyEvent(event)) = command else {
-                panic!("unexpected command: {command:?}");
-            };
-            (event.keycode, event.down)
-        })
-        .collect();
-    assert_eq!(
-        keys,
-        [
-            (XK_CONTROL_L, true),
-            (XK_CONTROL_L, false),
-            (XK_SUPER_L, true),
-            (u32::from(b'v'), true),
-            (u32::from(b'v'), false),
-            (XK_SUPER_L, false),
-            (XK_CONTROL_L, true),
-            (u32::from(b'a'), true),
-            (u32::from(b'a'), false),
-            (XK_CONTROL_L, false),
-        ]
-    );
-    view.read_with(cx, |view, _| assert!(!view.command_paste_pressed));
+    cx.simulate_event(gpui::KeyUpEvent { keystroke: gpui::Keystroke::parse("v").unwrap() });
+    let sent = commands(&mut peer);
+    let writes: Vec<_> = sent.iter().filter_map(|command| match command {
+        SessionCommand::App(command @ rv_session::AppCommand::WriteClipboard { .. }) => Some(command.clone()),
+        _ => None,
+    }).collect();
+    assert_eq!(writes.len(), 1);
+    assert!(!sent.iter().any(|command| matches!(command,
+        SessionCommand::Input(vnc::X11Event::KeyEvent(event)) if event.keycode == u32::from(b'v'))));
+    view.update(cx, |view, cx| view.apply_app_event(rv_session::AppEvent::Finished(writes[0].clone()), cx));
+    cx.update(|window, cx| { view.update(cx, |view, cx| view.finish_keyboard_paste(window, cx)); });
+    let sent = commands(&mut peer);
+    assert_eq!(sent.iter().filter(|command| matches!(command,
+        SessionCommand::Input(vnc::X11Event::KeyEvent(event)) if event.keycode == u32::from(b'v'))).count(), 2);
+    assert!(cx.read_from_clipboard().is_none_or(|item| item.text().is_none_or(|text| text.is_empty())));
+    cx.simulate_keystrokes("cmd-v");
+    assert!(!commands(&mut peer).iter().any(|command| matches!(command,
+        SessionCommand::App(rv_session::AppCommand::WriteClipboard { .. })) || matches!(command,
+        SessionCommand::Input(vnc::X11Event::KeyEvent(event)) if event.keycode == u32::from(b'v'))));
 }
 
 #[gpui::test]
-fn offscreen_trollvnc_paste_recovers_after_losing_key_up(cx: &mut TestAppContext) {
+fn offscreen_trollvnc_paste_without_capability_does_not_paste_old_phone_text(cx: &mut TestAppContext) {
     let (view, cx, mut peer) = setup(cx, false);
-    peer.events
-        .send(SessionEvent::Apps(rv_session::AppEvent::Capabilities(
-            rv_session::AppCapabilities::default(),
-        )))
-        .unwrap();
+    peer.events.send(SessionEvent::Apps(rv_session::AppEvent::Capabilities(
+        rv_session::AppCapabilities::default()
+    ))).unwrap();
     view.update(cx, |view, cx| view.pump(cx));
     commands(&mut peer);
-    cx.simulate_keystrokes("ctrl-v");
-    view.read_with(cx, |view, _| assert!(view.command_paste_pressed));
-    commands(&mut peer);
-    cx.update(|window, cx| {
-        view.read(cx)
-            .password_input
-            .focus_handle(cx)
-            .focus(window, cx);
-        window.draw(cx).clear(cx);
-    });
-    view.read_with(cx, |view, _| assert!(!view.command_paste_pressed));
-    // V is released elsewhere; no key-up reaches the session.
-    cx.update(|window, cx| {
-        let focus = view.read(cx).focus.clone();
-        focus.focus(window, cx);
-        window.draw(cx).clear(cx);
-    });
-    commands(&mut peer);
-    cx.simulate_keystrokes("ctrl-v");
-    let keys = commands(&mut peer);
-    assert!(keys.iter().any(|command| matches!(command,
-        SessionCommand::Input(vnc::X11Event::KeyEvent(event))
-            if event.keycode == rv_core::XK_SUPER_L && event.down
-    )));
-    assert_eq!(
-        keys.iter()
-            .filter(|command| matches!(command,
-                SessionCommand::Input(vnc::X11Event::KeyEvent(event))
-                    if event.keycode == u32::from(b'v')
-            ))
-            .count(),
-        2
-    );
+    for key in ["ctrl-v", "cmd-v"] {
+        cx.simulate_keystrokes(key);
+        cx.simulate_event(gpui::KeyUpEvent { keystroke: gpui::Keystroke::parse("v").unwrap() });
+        assert!(!commands(&mut peer).iter().any(|command| matches!(command,
+            SessionCommand::App(rv_session::AppCommand::WriteClipboard { .. })) || matches!(command,
+            SessionCommand::Input(vnc::X11Event::KeyEvent(event)) if event.keycode == u32::from(b'v'))));
+    }
 }
 
 #[gpui::test]
@@ -525,7 +471,7 @@ fn offscreen_paste_keeps_plain_vnc_and_mac_shortcuts(cx: &mut TestAppContext) {
     let (view, cx, mut peer) = setup(cx, false);
     for (trollvnc, shortcut, modifier) in [
         (false, "ctrl-v", XK_CONTROL_L),
-        (true, "cmd-v", XK_SUPER_L),
+        (false, "cmd-v", XK_SUPER_L),
         (true, "ctrl-shift-v", XK_CONTROL_L),
     ] {
         if trollvnc {
@@ -571,7 +517,7 @@ fn offscreen_clipboard_sends_utf8_text_to_remote(cx: &mut TestAppContext) {
             if text == "中文剪贴板"
     ));
     view.read_with(cx, |view, _| {
-        assert_eq!(view.status.as_ref(), "Clipboard request sent")
+        assert_eq!(view.status.as_ref(), "正在发送剪贴板")
     });
 }
 
@@ -718,26 +664,62 @@ fn retry_exhaustion_keeps_the_same_compact_dialog(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn keyboard_popover_uses_compact_rows_in_light_theme(cx: &mut TestAppContext) {
-    let (_, cx, _) = setup(cx, false);
+fn control_toolbar_keeps_primary_actions_reachable_at_640px(cx: &mut TestAppContext) {
+    let (_, cx, mut peer) = setup(cx, false);
+    cx.simulate_resize(size(px(640.), px(800.)));
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let toolbar = cx.debug_bounds("session-toolbar").unwrap();
+    assert_eq!(toolbar.top(), crate::theme::toolbar_height());
+    assert_eq!(toolbar.size.height, crate::theme::toolbar_height());
+    assert_eq!(cx.debug_bounds("session-stage").unwrap().top(), crate::theme::toolbar_height() * 2.);
+    let settings = cx.debug_bounds("session-settings").unwrap();
+    assert!(settings.bottom() <= toolbar.top());
+    let notifications = cx.debug_bounds("phone-notifications").unwrap();
+    assert!(notifications.bottom() <= toolbar.top());
+    assert!(notifications.right() <= settings.left());
+    let files = cx.debug_bounds("files").unwrap();
+    assert!(files.bottom() <= toolbar.top());
+    assert!(files.right() <= notifications.left());
+    assert!(cx.debug_bounds("disconnect-control").is_none());
+    let functions = cx.debug_bounds("function-menu-toggle").unwrap();
+    assert!(functions.left() > cx.debug_bounds("app-plus").unwrap().right());
+    let clipboard = cx.debug_bounds("clip").unwrap();
+    let app_plus = cx.debug_bounds("app-plus").unwrap();
+    assert!(clipboard.left() >= app_plus.right());
+    assert!(clipboard.left() - app_plus.right() < px(12.));
+    let keyboard = cx.debug_bounds("keyboard-menu").unwrap();
+    assert!(keyboard.bottom() <= toolbar.top());
+    assert!(keyboard.right() <= files.left());
+    for selector in ["function-menu-toggle", "clip"] {
+        let bounds = cx.debug_bounds(selector).unwrap();
+        assert!(bounds.left() >= toolbar.left() && bounds.right() <= toolbar.right(), "{selector}: {bounds:?}");
+    }
+    while peer.commands.try_recv().is_ok() {}
+    let more = cx.debug_bounds("session-settings").unwrap();
+    cx.simulate_click(more.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("session-menu").is_some());
+    assert!(peer.commands.try_recv().is_err());
+    cx.simulate_keystrokes("escape");
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("session-menu").is_none());
+    assert!(peer.commands.try_recv().is_err());
+}
+
+#[gpui::test]
+fn keyboard_menu_dismiss_does_not_send_remote_keys(cx: &mut TestAppContext) {
+    let (_, cx, mut peer) = setup(cx, false);
     cx.update(|window, cx| {
         crate::theme::apply(rv_core::ThemePref::Light, window, cx);
         window.draw(cx).clear(cx);
     });
+    let _ = commands(&mut peer);
     let trigger = cx.debug_bounds("keyboard-menu").unwrap();
     cx.simulate_click(trigger.center(), Modifiers::default());
     cx.run_until_parked();
     cx.update(|window, cx| window.draw(cx).clear(cx));
-    for selector in [
-        "keyboard-key-Ctrl",
-        "keyboard-key-Alt",
-        "keyboard-key-Win",
-        "keyboard-key-Tab",
-        "keyboard-key-Esc",
-        "keyboard-key-Caps",
-    ] {
-        let bounds = cx.debug_bounds(selector).unwrap();
-        assert_eq!(bounds.size.height, px(26.));
-        assert!(bounds.size.width <= px(170.));
-    }
+    assert!(commands(&mut peer).is_empty());
+    cx.simulate_keystrokes("escape");
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(commands(&mut peer).is_empty());
 }

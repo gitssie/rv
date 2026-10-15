@@ -1,7 +1,6 @@
 use super::apps_ui::app_icon;
 use super::*;
 use crate::assets::AppActionIcon;
-use gpui_component::popover::Popover;
 use rv_session::{AppCommand, NotificationSnapshot};
 
 pub(super) struct NotificationsUI {
@@ -114,96 +113,31 @@ impl SessionView {
             .caps
             .as_ref()
             .is_some_and(|caps| caps.home && caps.control);
-        tool_btn(
-            cx,
-            "home-screen",
-            AppActionIcon::Home,
-            "回到主屏幕",
-            cx.listener(|this, _, _, _| {
+        crate::ui::icon_button("home-screen", AppActionIcon::Home, "回到主屏幕")
+            .on_click(cx.listener(|this, _, _, _| {
                 if this.phase == Phase::Connected
                     && !this.view_only()
                     && !this.unlock.blocks_input()
                 {
                     this.handle.app(AppCommand::Home);
                 }
-            }),
-        )
-        .disabled(
-            !supported
-                || self.phase != Phase::Connected
-                || self.view_only()
-                || self.unlock.blocks_input(),
-        )
+            }))
+            .disabled(
+                !supported
+                    || self.phase != Phase::Connected
+                    || self.view_only()
+                    || self.unlock.blocks_input(),
+            )
     }
 
     pub(super) fn render_screenshot(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let entity = cx.entity();
-        Popover::new("screenshot-menu")
-            .bg(theme::toolbar())
-            .text_color(theme::toolbar_fg())
-            .border_color(theme::toolbar_line())
-            .p_1()
-            .rounded_md()
-            .anchor(Anchor::TopLeft)
-            .trigger(
-                Button::new("screenshot")
-                    .ghost()
-                    .bg(theme::toolbar())
-                    .size(px(28.))
-                    .icon(AppActionIcon::Camera)
-                    .text_color(theme::toolbar_fg())
-                    .tooltip("截图")
-                    .accessibility_label("截图")
-                    .disabled(
-                        self.phase != Phase::Connected
-                            || self.screenshot_busy
-                            || self.render_image.is_none(),
-                    ),
+        crate::ui::icon_button("screenshot", AppActionIcon::Camera, "复制截图")
+            .on_click(cx.listener(|this, _, _, cx| this.screenshot(false, cx)))
+            .disabled(
+                self.phase != Phase::Connected
+                    || self.screenshot_busy
+                    || self.render_image.is_none(),
             )
-            .content(move |_, _, cx| {
-                let popover = cx.entity().downgrade();
-                let save_popover = popover.clone();
-                entity.update(cx, |this, cx| {
-                    v_flex()
-                        .w(px(170.))
-                        .gap_0p5()
-                        .child(
-                            menu_item(
-                                "copy-screenshot",
-                                IconName::Copy,
-                                "复制截图",
-                                cx.listener(move |this, _, window, cx| {
-                                    let _ =
-                                        popover.update(cx, |state, cx| state.dismiss(window, cx));
-                                    this.screenshot(false, cx);
-                                }),
-                            )
-                            .disabled(this.screenshot_busy),
-                        )
-                        .child(
-                            menu_item(
-                                "save-screenshot",
-                                IconName::ArrowDown,
-                                "保存截图…",
-                                cx.listener(move |this, _, window, cx| {
-                                    let _ = save_popover
-                                        .update(cx, |state, cx| state.dismiss(window, cx));
-                                    this.screenshot(true, cx);
-                                }),
-                            )
-                            .disabled(this.screenshot_busy),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .px_2()
-                                .py_1()
-                                .text_color(theme::toolbar_muted())
-                                .child("仅截取远程画面"),
-                        )
-                        .into_any_element()
-                })
-            })
     }
 
     pub(super) fn render_notification_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -215,33 +149,31 @@ impl SessionView {
         div()
             .relative()
             .flex_shrink_0()
-            .child(tool_btn(
-                cx,
-                "phone-notifications",
-                IconName::Bell,
-                "手机通知",
-                cx.listener(|this, _, _, cx| {
-                    this.notifications.open = !this.notifications.open;
-                    if this.notifications.open {
-                        let released = this.keys.release_all();
-                        this.send_keys(released);
-                        this.command_paste_pressed = false;
-                    }
-                    this.notifications.unread = 0;
-                    this.info_open = false;
-                    if this.notifications.open
-                        && this.phase == Phase::Connected
-                        && this
-                            .apps
-                            .caps
-                            .as_ref()
-                            .is_some_and(|caps| caps.notifications)
-                    {
-                        this.handle.app(AppCommand::Notifications);
-                    }
-                    cx.notify();
-                }),
-            ))
+            .child(
+                crate::ui::icon_button("phone-notifications", IconName::Bell, "手机通知").on_click(
+                    cx.listener(|this, _, _, cx| {
+                        this.notifications.open = !this.notifications.open;
+                        if this.notifications.open {
+                            let released = this.keys.release_all();
+                            this.send_keys(released);
+                            this.command_paste_pressed = false;
+                        }
+                        this.notifications.unread = 0;
+                        this.info_open = false;
+                        if this.notifications.open
+                            && this.phase == Phase::Connected
+                            && this
+                                .apps
+                                .caps
+                                .as_ref()
+                                .is_some_and(|caps| caps.notifications)
+                        {
+                            this.handle.app(AppCommand::Notifications);
+                        }
+                        cx.notify();
+                    }),
+                ),
+            )
             .when(self.notifications.unread > 0, |el| {
                 el.child(
                     div()
@@ -250,7 +182,7 @@ impl SessionView {
                         .right_0()
                         .size(px(5.))
                         .rounded_full()
-                        .bg(rgb(0x79b8ff)),
+                        .bg(theme::accent(cx)),
                 )
             })
             .when(!supported, |el| el.opacity(0.6))
@@ -268,7 +200,7 @@ impl SessionView {
             .snapshot
             .as_ref()
             .map_or(0, |snapshot| snapshot.notifications.len());
-        v_flex()
+        crate::ui::tool_surface(cx)
             .id("phone-notification-panel")
             .occlude()
             .absolute()
@@ -277,12 +209,6 @@ impl SessionView {
             .w(px(320.))
             .max_w_full()
             .max_h(px(420.))
-            .rounded_md()
-            .bg(theme::toolbar())
-            .border_1()
-            .border_color(theme::toolbar_line())
-            .shadow_lg()
-            .text_color(theme::toolbar_fg())
             .child(
                 h_flex()
                     .px_3()
@@ -301,50 +227,43 @@ impl SessionView {
                             }),
                     )
                     .child(
-                        tool_btn(
-                            cx,
+                        crate::ui::icon_button(
                             "auto-notifications",
                             IconName::Bell,
                             "自动接收通知",
-                            cx.listener(|this, _, _, cx| {
-                                this.notifications.enabled = !this.notifications.enabled;
-                                this.handle.app(AppCommand::SubscribeNotifications(
-                                    this.notifications.enabled,
-                                ));
-                                cx.notify();
-                            }),
                         )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.notifications.enabled = !this.notifications.enabled;
+                            this.handle.app(AppCommand::SubscribeNotifications(
+                                this.notifications.enabled,
+                            ));
+                            cx.notify();
+                        }))
                         .selected(self.notifications.enabled)
-                        .when(self.notifications.enabled, |button| {
-                            button.bg(rgb(0x2a3a50))
-                        })
-                        .text_color(if self.notifications.enabled {
-                            rgb(0x79b8ff).into()
-                        } else {
-                            theme::toolbar_muted()
-                        })
                         .disabled(!supported),
                     )
                     .child(
-                        tool_btn(
-                            cx,
+                        crate::ui::icon_button(
                             "refresh-notifications",
                             AppActionIcon::Restart,
                             "刷新已接收的通知",
+                        )
+                        .on_click(
                             cx.listener(|this, _, _, _| this.handle.app(AppCommand::Notifications)),
                         )
                         .disabled(!supported),
                     )
-                    .child(tool_btn(
-                        cx,
-                        "close-notifications",
-                        IconName::Close,
-                        "关闭通知列表",
-                        cx.listener(|this, _, _, cx| {
+                    .child(
+                        crate::ui::icon_button(
+                            "close-notifications",
+                            IconName::Close,
+                            "关闭通知列表",
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
                             this.notifications.open = false;
                             cx.notify();
-                        }),
-                    )),
+                        })),
+                    ),
             )
             .when(!supported, |el| {
                 el.child(
@@ -352,7 +271,7 @@ impl SessionView {
                         .px_3()
                         .py_2()
                         .text_sm()
-                        .text_color(theme::toolbar_muted())
+                        .text_color(theme::muted(cx))
                         .child(if self.phase == Phase::Connected {
                             "通知不可用"
                         } else {
@@ -365,7 +284,7 @@ impl SessionView {
                     div()
                         .px_3()
                         .text_xs()
-                        .text_color(rgb(0xe9a11b))
+                        .text_color(theme::warning(cx))
                         .child(error),
                 )
             })
@@ -381,7 +300,7 @@ impl SessionView {
                             div()
                                 .py_4()
                                 .text_sm()
-                                .text_color(theme::toolbar_muted())
+                                .text_color(theme::muted(cx))
                                 .child("暂无通知"),
                         )
                     })
@@ -417,7 +336,7 @@ impl SessionView {
                                     .py_2()
                                     .gap_2()
                                     .border_b_1()
-                                    .border_color(theme::toolbar_line())
+                                    .border_color(theme::line(cx))
                                     .child(app_icon(self.apps.icon_for(&notification.source), 28.))
                                     .child(
                                         v_flex()
@@ -434,21 +353,21 @@ impl SessionView {
                                                             .min_w_0()
                                                             .text_xs()
                                                             .text_ellipsis()
-                                                            .text_color(theme::toolbar_muted())
+                                                            .text_color(theme::muted(cx))
                                                             .child(name),
                                                     )
                                                     .child(
                                                         div()
                                                             .flex_shrink_0()
-                                                            .text_size(px(10.))
-                                                            .text_color(theme::toolbar_muted())
+                                                            .text_xs()
+                                                            .text_color(theme::muted(cx))
                                                             .child(time),
                                                     ),
                                             )
                                             .when(!notification.title.is_empty(), |el| {
                                                 el.child(
                                                     div()
-                                                        .text_size(px(12.))
+                                                        .text_sm()
                                                         .font_semibold()
                                                         .child(notification.title.clone()),
                                                 )
@@ -463,8 +382,7 @@ impl SessionView {
                                             .when(!notification.message.is_empty(), |el| {
                                                 el.child(
                                                     div()
-                                                        .text_size(px(12.))
-                                                        .text_color(theme::toolbar_fg())
+                                                        .text_sm()
                                                         .child(notification.message.clone()),
                                                 )
                                             }),
@@ -495,61 +413,54 @@ impl SessionView {
                     .max_w_full()
                     .p_3()
                     .gap_2()
-                    .rounded_md()
-                    .bg(theme::toolbar())
+                    .rounded(theme::radius(cx))
+                    .bg(theme::card(cx))
                     .border_1()
-                    .border_color(theme::toolbar_line())
-                    .text_color(theme::toolbar_fg())
+                    .border_color(theme::line(cx))
                     .child(
                         h_flex()
                             .gap_2()
                             .items_center()
-                            .child(
-                                Icon::new(if automatic {
-                                    IconName::Loader
-                                } else {
-                                    IconName::TriangleAlert
-                                })
-                                .small(),
-                            )
+                            .child(Icon::new(if automatic {
+                                IconName::Loader
+                            } else {
+                                IconName::TriangleAlert
+                            }))
                             .child(div().text_sm().font_semibold().child(if connecting {
                                 "正在重连"
                             } else {
                                 "连接中断"
                             })),
                     )
-                    .child(div().text_xs().text_color(theme::toolbar_muted()).child(
-                        if connecting {
-                            format!("第 {} 次尝试", self.recovery.attempt.max(1))
-                        } else if self.recovery.deadline.is_some() {
-                            format!(
-                                "{} 秒后重试 · 第 {} 次",
-                                self.recovery.seconds(std::time::Instant::now()),
-                                self.recovery.attempt
-                            )
-                        } else if auth_failed {
-                            "密码错误，请重新输入".into()
-                        } else if self.recovery.attempt >= 5 {
-                            "自动重连失败，可手动重试".into()
-                        } else {
-                            "可手动重试".into()
-                        },
-                    ))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme::muted(cx))
+                            .child(if connecting {
+                                format!("第 {} 次尝试", self.recovery.attempt.max(1))
+                            } else if self.recovery.deadline.is_some() {
+                                format!(
+                                    "{} 秒后重试 · 第 {} 次",
+                                    self.recovery.seconds(std::time::Instant::now()),
+                                    self.recovery.attempt
+                                )
+                            } else if auth_failed {
+                                "密码错误，请重新输入".into()
+                            } else if self.recovery.attempt >= 5 {
+                                "自动重连失败，可手动重试".into()
+                            } else {
+                                "可手动重试".into()
+                            }),
+                    )
                     .when(!automatic && !auth_failed, |panel| {
                         panel.when_some(self.error.clone(), |panel, error| {
-                            panel.child(
-                                div()
-                                    .text_xs()
-                                    .text_color(theme::toolbar_muted())
-                                    .child(error),
-                            )
+                            panel.child(div().text_xs().text_color(theme::muted(cx)).child(error))
                         })
                     })
                     .when(auth_failed, |panel| {
                         panel
                             .child(
                                 Input::new(&self.password_input)
-                                    .small()
                                     .w_full()
                                     .aria_label("Password for reconnect"),
                             )
@@ -574,9 +485,8 @@ impl SessionView {
                             .justify_end()
                             .child(
                                 Button::new("recovery-now")
-                                    .small()
                                     .ghost()
-                                    .text_color(rgb(0x79b8ff))
+                                    .text_color(theme::accent(cx))
                                     .label("立即重连")
                                     .disabled(connecting)
                                     .on_click(cx.listener(move |this, _, window, cx| {
@@ -591,9 +501,7 @@ impl SessionView {
                             )
                             .child(
                                 Button::new("recovery-stop")
-                                    .small()
                                     .ghost()
-                                    .text_color(theme::toolbar_fg())
                                     .label(if automatic { "停止" } else { "关闭" })
                                     .on_click(cx.listener(move |this, _, window, cx| {
                                         if automatic {

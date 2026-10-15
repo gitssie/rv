@@ -1888,8 +1888,14 @@ fn app_control_uses_zxtouch_and_configured_port_while_rfb_keeps_streaming() {
     server.join().unwrap();
     stop_control.store(true, std::sync::atomic::Ordering::Relaxed);
     let (operations, connections) = control.join().unwrap();
-    assert_eq!(connections, 1, "Apps and native functions must share a session HTTP/2 pool");
-    assert!(operations.iter().any(|&op| op == 0), "shared control must authorize before use");
+    assert_eq!(
+        connections, 1,
+        "Apps and native functions must share a session HTTP/2 pool"
+    );
+    assert!(
+        operations.iter().any(|&op| op == 0),
+        "shared control must authorize before use"
+    );
     for op in [2, 12, 16] {
         assert_eq!(
             operations.iter().filter(|&&seen| seen == op).count(),

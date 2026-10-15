@@ -1,13 +1,13 @@
 use super::{AddressBookApp, Modal, ViewMode, WindowRoot};
 use crate::actions::*;
-use gpui::{AppContext, Entity, Modifiers, TestAppContext, VisualTestContext, px, size};
+use gpui::{AppContext, Entity, Modifiers, TestAppContext, VisualTestContext, point, px, size};
 use gpui_component::Root;
 use rv_core::{
     AddressBook, ClipboardMode, ConnectRequest, Connection, LocalCursorMode, TransferFolders,
 };
 use tempfile::TempDir;
 
-fn setup(
+pub(super) fn setup(
     cx: &mut TestAppContext,
     connections: Vec<Connection>,
 ) -> (Entity<AddressBookApp>, &mut VisualTestContext, TempDir) {
@@ -19,6 +19,7 @@ fn setup(
     book.save().unwrap();
     cx.update(|cx| {
         gpui_component::init(cx);
+        cx.set_reduce_motion(true);
         crate::bind_keys(cx);
     });
     let mut entity = None;
@@ -32,15 +33,56 @@ fn setup(
     (entity.unwrap(), cx, dir)
 }
 
-fn click(cx: &mut VisualTestContext, selector: &str) {
+pub(super) fn click(cx: &mut VisualTestContext, selector: &str) {
+    cx.update(|window, cx| window.draw(cx).clear(cx));
     cx.update(|window, cx| window.draw(cx).clear(cx));
     let bounds = cx
         .debug_bounds(Box::leak(selector.to_owned().into_boxed_str()))
-        .expect("button must be rendered");
+        .unwrap_or_else(|| panic!("button must be rendered: {selector}"));
     assert!(bounds.size.width > px(0.) && bounds.size.height > px(0.));
     cx.simulate_mouse_move(bounds.center(), None, Modifiers::default());
     cx.simulate_click(bounds.center(), Modifiers::default());
     cx.run_until_parked();
+}
+
+#[gpui::test]
+fn home_actions_share_window_titlebar_without_a_second_toolbar(cx: &mut TestAppContext) {
+    let (app, cx, _dir) = setup(cx, vec![]);
+    for width in [1100., 800.] {
+        cx.simulate_resize(size(px(width), px(720.)));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let toolbar = cx.debug_bounds("management-toolbar").unwrap();
+        let content = cx.debug_bounds("home-content").unwrap();
+        assert_eq!(toolbar.top(), px(0.));
+        // TitleBar reserves its bottom pixel for the window separator.
+        assert_eq!(toolbar.size.height, crate::theme::toolbar_height() - px(1.));
+        assert_eq!(content.top(), crate::theme::toolbar_height());
+        for selector in [
+            "sidebar-toggle",
+            "chat-open",
+            "view-grid",
+            "management-settings",
+        ] {
+            let button = cx.debug_bounds(selector).unwrap();
+            assert!(button.top() >= toolbar.top() && button.bottom() <= toolbar.bottom());
+            assert!(button.left() >= toolbar.left() && button.right() <= toolbar.right());
+        }
+    }
+    click(cx, "chat-open");
+    app.read_with(cx, |app, _| assert!(matches!(app.modal, Modal::Chat)));
+    app.update(cx, |app, cx| app.close_modal(cx));
+    click(cx, "sidebar-toggle");
+    app.read_with(cx, |app, _| assert!(app.collapsed));
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert_eq!(cx.debug_bounds("home-content").unwrap().left(), px(0.));
+    assert!(cx.debug_bounds("management-new").is_none());
+    click(cx, "sidebar-toggle");
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert_eq!(
+        cx.debug_bounds("home-content").unwrap().left(),
+        crate::theme::sidebar_width()
+    );
+    assert!(cx.debug_bounds("management-new").is_some());
 }
 
 #[gpui::test]
@@ -253,10 +295,21 @@ fn offscreen_connection_modal_stays_within_minimum_window_height(cx: &mut TestAp
     cx.simulate_keystrokes("ctrl-n");
     cx.update(|window, cx| window.draw(cx).clear(cx));
     let bounds = cx
-        .debug_bounds("modal-card")
+        .debug_bounds("modal-save")
         .expect("connection modal must be rendered");
     assert!(bounds.origin.y >= px(0.));
     assert!(bounds.bottom() <= px(520.));
+}
+
+#[gpui::test]
+fn chat_dialog_fits_minimum_window(cx: &mut TestAppContext) {
+    let (_app, cx, _dir) = setup(cx, vec![]);
+    cx.simulate_resize(size(px(800.), px(520.)));
+    click(cx, "chat-open");
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let bounds = cx.debug_bounds("chat-panel").unwrap();
+    assert!(bounds.left() >= px(0.) && bounds.right() <= px(800.));
+    assert!(bounds.top() >= px(0.) && bounds.bottom() <= px(520.));
 }
 
 #[gpui::test]
@@ -357,21 +410,17 @@ fn offscreen_successful_password_retry_updates_saved_connection(cx: &mut TestApp
 fn offscreen_search_and_view_shortcuts_keep_address_book_intact(cx: &mut TestAppContext) {
     let office = Connection::new("Office", "office.test", 5900);
     let lab = Connection::new("Lab", "lab.test", 5900);
-    let lab_id = lab.id;
     let (app, cx, _dir) = setup(cx, vec![office, lab]);
     cx.simulate_keystrokes("ctrl-l ctrl-b ctrl-f");
     cx.simulate_input("lab");
     app.read_with(cx, |app, cx| {
         assert!(matches!(app.view_mode, ViewMode::List));
         assert!(app.collapsed);
-        assert_eq!(
-            app.visible(cx).iter().map(|c| c.id).collect::<Vec<_>>(),
-            [lab_id]
-        );
+        assert_eq!(app.query(cx), "lab");
         assert_eq!(app.book.connections().len(), 2);
     });
     cx.simulate_keystrokes("escape");
-    app.read_with(cx, |app, cx| assert_eq!(app.visible(cx).len(), 2));
+    app.read_with(cx, |app, cx| assert!(app.query(cx).is_empty()));
 }
 
 #[gpui::test]
@@ -410,51 +459,66 @@ fn offscreen_username_can_be_cleared_and_does_not_leak_into_new_connection(
 }
 
 #[gpui::test]
-fn offscreen_management_cards_fit_grid_and_keep_actions_inside(cx: &mut TestAppContext) {
-    let connections: Vec<_> = (0..6)
-        .map(|i| Connection::new(format!("Device {i}"), "example.test", 5900))
-        .collect();
-    let ids: Vec<_> = connections.iter().map(|conn| conn.id).collect();
-    let (app, cx, _dir) = setup(cx, connections);
-    for (width, height, columns) in [(1100., 720., 3), (800., 520., 2)] {
-        cx.simulate_resize(size(px(width), px(height)));
-        cx.update(|window, cx| {
-            app.update(cx, |app, cx| {
-                app.selected = Some(ids[0]);
-                app.credential_busy = true;
-                cx.notify();
-            });
-            window.draw(cx).clear(cx);
-        });
-        let first = cx
-            .debug_bounds(Box::leak(format!("card-{}", ids[0]).into_boxed_str()))
+fn backup_cards_deduplicate_and_edit_persisted_notes(cx: &mut TestAppContext) {
+    let device = Connection::new("phone", "example.test", 5900);
+    let device_id = device.id;
+    let (app, cx, dir) = setup(cx, vec![device]);
+    let id = "C9EB7804-2062-4519-AC8D-6F68972574F3";
+    let reply = serde_json::json!({"bundle_id":"lt.manodrabuziai.fr","backups":[{"kind":"snapshot","backup_id":"snapshot:1","idfv":id,"display_name":"店铺","note":"来自手机"}]});
+    app.update(cx, |app, cx| {
+        app.sync_phone_backups(device_id, "lt.manodrabuziai.fr", &reply, cx)
+    });
+    cx.run_until_parked();
+    app.update(cx, |app, cx| {
+        app.sync_phone_backups(device_id, "lt.manodrabuziai.fr", &reply, cx)
+    });
+    cx.run_until_parked();
+    app.read_with(cx, |app, _| assert_eq!(app.home.apps.len(), 1));
+    let key = rv_core::workspace::AppId::from_idfv(id).unwrap();
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            app.open_app_card(key.clone(), window, cx);
+            app.home
+                .note
+                .update(cx, |s, cx| s.set_value("本地备注", window, cx));
+        })
+    });
+    app.update(cx, |app, cx| app.save_app_card(cx));
+    cx.run_until_parked();
+    let store =
+        rv_core::workspace::WorkspaceStore::open(&rv_core::StorePaths::in_dir(dir.path().into()))
             .unwrap();
-        for id in &ids {
-            let card = cx
-                .debug_bounds(Box::leak(format!("card-{id}").into_boxed_str()))
-                .unwrap();
-            assert!(card.origin.x >= px(0.) && card.right() <= px(width));
-            assert_eq!(card.size.width, first.size.width);
-        }
-        let next_row = cx
-            .debug_bounds(Box::leak(format!("card-{}", ids[columns]).into_boxed_str()))
+    assert_eq!(store.load(&key).unwrap().note, "本地备注");
+}
+
+#[gpui::test]
+fn home_filters_preserve_phone_selection_and_all_tag_choices(cx: &mut TestAppContext) {
+    let device = Connection::new("phone", "example.test", 5900);
+    let device_id = device.id;
+    let (app, cx, dir) = setup(cx, vec![device]);
+    let id = rv_core::workspace::AppId::from_idfv("C9EB7804-2062-4519-AC8D-6F68972574F3").unwrap();
+    let reply = serde_json::json!({"bundle_id":"lt.manodrabuziai.fr","backups":[{"kind":"snapshot","backup_id":"snapshot:1","idfv":id.as_str(),"display_name":"店铺"}]});
+    let mut store =
+        rv_core::workspace::WorkspaceStore::open(&rv_core::StorePaths::in_dir(dir.path().into()))
             .unwrap();
-        assert!(next_row.origin.y >= first.bottom());
-        let connect = cx
-            .debug_bounds(Box::leak(
-                format!("connection-connect-{}", ids[0]).into_boxed_str(),
-            ))
-            .unwrap();
-        assert_eq!(connect.size.height, px(28.));
-        assert!(connect.origin.x >= first.origin.x && connect.right() <= first.right());
-        assert!(connect.bottom() <= first.bottom());
-        click(cx, &format!("connection-connect-{}", ids[0]));
-        app.read_with(cx, |app, _| {
-            assert_eq!(app.selected, Some(ids[0]));
-            assert!(app.credential_busy);
-            assert!(matches!(app.modal, Modal::None));
-        });
-    }
+    store
+        .sync_backups(device_id, "lt.manodrabuziai.fr", &reply)
+        .unwrap();
+    let mut card = store.load(&id).unwrap();
+    card.tags = vec!["法国".into(), "工作".into()];
+    store.save(&card).unwrap();
+    app.update(cx, |app, cx| {
+        app.selected = Some(device_id);
+        app.reload_home(cx);
+    });
+    cx.run_until_parked();
+    click(cx, "app-filter-1");
+    cx.run_until_parked();
+    app.read_with(cx, |app, _| {
+        assert_eq!(app.selected, Some(device_id));
+        assert!(app.home.apps.is_empty());
+        assert_eq!(app.home.available_tags, vec!["工作", "法国"]);
+    });
 }
 
 #[gpui::test]
@@ -472,11 +536,7 @@ fn offscreen_connection_ellipsis_edits_its_target_in_grid_and_list(cx: &mut Test
             cx.notify();
         });
         cx.update(|window, cx| window.draw(cx).clear(cx));
-        let prefix = if mode == ViewMode::Grid {
-            "card"
-        } else {
-            "row"
-        };
+        let prefix = "device-row";
         let target = cx
             .debug_bounds(Box::leak(format!("{prefix}-{second_id}").into_boxed_str()))
             .unwrap();
@@ -572,4 +632,444 @@ fn offscreen_editor_derives_zxtouch_default_and_omits_connection_progress(cx: &m
     click(cx, "modal-save");
     let book = AddressBook::load(rv_core::StorePaths::in_dir(dir.path().into())).unwrap();
     assert_eq!(book.get(phone.id).unwrap().zxtouch_port, Some(6000));
+}
+
+#[gpui::test]
+fn home_phone_control_reads_metadata_and_opens_environment_without_vnc(cx: &mut TestAppContext) {
+    use crate::session_window::{SessionOptions, SessionView};
+    use rv_session::{AppEvent, SessionEvent, SessionHandle};
+    let device = Connection::new("phone", "example.test", 5901);
+    let id = device.id;
+    let (app, cx, _dir) = setup(cx, vec![device.clone()]);
+    let (handle, peer) = SessionHandle::test_pair();
+    let view = cx.update(|window, cx| {
+        let options = SessionOptions {
+            scale: rv_core::ScaleMode::Fit,
+            pin_toolbar: false,
+            menu_key: "F8".into(),
+            hide_shots: true,
+            thumb_path: None,
+            app_icon_cache: None,
+            address_book: Some(app.downgrade()),
+            transfer_folders: Default::default(),
+            app_shortcuts: vec![],
+            remember_password: false,
+        };
+        let view = cx.new(|cx| {
+            SessionView::with_control_test_handle(
+                ConnectRequest::from_connection(&device, None),
+                options,
+                handle,
+                window,
+                cx,
+            )
+        });
+        app.update(cx, |app, _| {
+            app.home.control_loading.remove(&id);
+            app.home.controls.insert(
+                id,
+                super::home::control::PhoneControl::new(view.clone(), &device),
+            );
+        });
+        peer.events.send(SessionEvent::ControlState(true)).unwrap();
+        peer.events
+            .send(SessionEvent::Apps(AppEvent::DeviceInfo(
+                serde_json::json!({"model":"iPhone Test","os_version":"15.8.8"}),
+            )))
+            .unwrap();
+        view.update(cx, |view, cx| view.pump_control_test(cx));
+        app.update(cx, |app, cx| {
+            assert!(app.phone_online(id, cx));
+            assert!(app.home.sessions.is_empty());
+            assert_eq!(
+                app.book.get(id).unwrap().model.as_deref(),
+                Some("iPhone Test")
+            );
+            app.show_phone_backups(id, None, window, cx);
+            assert!(matches!(app.modal, Modal::PhoneControl(target) if target == id));
+            assert!(
+                app.home.sessions.is_empty(),
+                "home actions must not create a VNC window"
+            );
+        });
+        view
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("function-tab-App 环境").is_some());
+    click(cx, "function-close");
+    app.read_with(cx, |app, cx| {
+        assert!(matches!(app.modal, Modal::None));
+        assert!(
+            app.phone_online(id, cx),
+            "closing the panel must retain phone control"
+        );
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("function-close").is_none());
+    assert!(
+        cx.debug_bounds(Box::leak(
+            format!("device-status-online-{id}").into_boxed_str()
+        ))
+        .is_some()
+    );
+    assert!(
+        cx.debug_bounds(Box::leak(
+            format!("device-status-offline-{id}").into_boxed_str()
+        ))
+        .is_none()
+    );
+    cx.update(|_, cx| {
+        peer.events.send(SessionEvent::ControlState(false)).unwrap();
+        view.update(cx, |view, cx| view.pump_control_test(cx));
+        app.read_with(cx, |app, cx| assert!(!app.phone_online(id, cx)));
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        cx.debug_bounds(Box::leak(
+            format!("device-status-offline-{id}").into_boxed_str()
+        ))
+        .is_some()
+    );
+    assert!(
+        cx.debug_bounds(Box::leak(
+            format!("device-status-online-{id}").into_boxed_str()
+        ))
+        .is_none()
+    );
+}
+
+#[gpui::test]
+fn saved_password_editor_shows_mask_without_submitting_mask_as_password(cx: &mut TestAppContext) {
+    let mut phone = Connection::new("phone", "example.test", 5901);
+    phone.remember_password = true;
+    let id = phone.id;
+    let (app, cx, _dir) = setup(cx, vec![phone.clone()]);
+    app.read_with(cx, |app, _| {
+        app.book
+            .paths()
+            .save_password(id, "fixture-secret")
+            .unwrap()
+    });
+    cx.update(|window, cx| app.update(cx, |app, cx| app.open_editor(Some(&phone), window, cx)));
+    cx.run_until_parked();
+    app.read_with(cx, |app, cx| {
+        let input = app.password_input.read(cx);
+        assert_eq!(input.presentation().placeholder().as_ref(), "********");
+        assert!(input.unmask_value().is_empty());
+    });
+    cx.update(|window, cx| app.update(cx, |app, cx| app.submit_connect(false, window, cx)));
+    cx.run_until_parked();
+    app.read_with(cx, |app, _| {
+        assert_eq!(
+            app.book.paths().load_password(id).unwrap().as_deref(),
+            Some("fixture-secret")
+        )
+    });
+    cx.update(|window, cx| app.update(cx, |app, cx| app.open_editor(None, window, cx)));
+    cx.run_until_parked();
+    app.read_with(cx, |app, cx| {
+        assert_eq!(
+            app.password_input
+                .read(cx)
+                .presentation()
+                .placeholder()
+                .as_ref(),
+            "密码（可选）"
+        )
+    });
+}
+
+#[gpui::test]
+fn card_delete_defaults_to_phone_and_local_only_keeps_other_idfv(cx: &mut TestAppContext) {
+    use rv_core::workspace::{AppId, WorkspaceStore};
+    let device = Connection::new("phone", "example.test", 5901);
+    let (app, cx, _dir) = setup(cx, vec![device.clone()]);
+    let id = AppId::from_idfv("C9EB7804-2062-4519-AC8D-6F68972574F3").unwrap();
+    let other = AppId::from_idfv("7A70B21A-2F9D-4F66-81C4-6D21355758D7").unwrap();
+    let response = serde_json::json!({"bundle_id":"lt.manodrabuziai.fr","backups":[
+        {"backup_id":"snapshot:20261007-01","kind":"snapshot","display_name":"shop","idfv":id.as_str()},
+        {"backup_id":"snapshot:20261007-02","kind":"snapshot","display_name":"other","idfv":other.as_str()}
+    ]});
+    cx.update(|_, cx| {
+        app.update(cx, |app, cx| {
+            WorkspaceStore::open(app.book.paths())
+                .unwrap()
+                .sync_backups(device.id, "lt.manodrabuziai.fr", &response)
+                .unwrap();
+            app.open_app_delete(id.clone(), cx);
+            assert!(app.home.deletion.as_ref().unwrap().phone);
+        })
+    });
+    click(cx, "confirm-app-delete");
+    app.read_with(cx, |app, _| {
+        let state = app.home.deletion.as_ref().unwrap();
+        assert!(!state.busy && state.error.is_some());
+        assert!(
+            WorkspaceStore::open(app.book.paths())
+                .unwrap()
+                .load(&id)
+                .is_ok()
+        );
+    });
+    // Enter and the footer share this guard after a failed phone deletion.
+    app.update(cx, |app, cx| app.confirm_app_delete(cx));
+    app.read_with(cx, |app, _| {
+        let state = app.home.deletion.as_ref().unwrap();
+        assert!(!state.busy && state.error.is_some());
+        assert!(
+            WorkspaceStore::open(app.book.paths())
+                .unwrap()
+                .load(&id)
+                .is_ok()
+        );
+    });
+    click(cx, "delete-phone-backup");
+    click(cx, "confirm-app-delete");
+    app.read_with(cx, |app, _| {
+        assert!(matches!(app.modal, Modal::None));
+        let store = WorkspaceStore::open(app.book.paths()).unwrap();
+        assert!(store.load(&id).is_err());
+        assert!(store.load(&other).is_ok());
+        assert!(
+            store
+                .phone_state(device.id, "lt.manodrabuziai.fr")
+                .unwrap()
+                .is_some()
+        );
+    });
+}
+
+#[gpui::test]
+fn shop_skeleton_tags_and_phone_delete_failure_preserve_card(cx: &mut TestAppContext) {
+    use crate::session_window::{SessionOptions, SessionView};
+    use rv_core::workspace::{AppId, WorkspaceStore};
+    use rv_session::{FunctionEvent, SessionEvent, SessionHandle};
+    let device = Connection::new("phone", "example.test", 5901);
+    let (app, cx, _dir) = setup(cx, vec![device.clone()]);
+    let id = AppId::from_idfv("C9EB7804-2062-4519-AC8D-6F68972574F3").unwrap();
+    let (handle, peer) = SessionHandle::test_pair();
+    let view = cx.update(|window, cx| {
+        let view = cx.new(|cx| SessionView::with_control_test_handle(
+            ConnectRequest::from_connection(&device, None),
+            SessionOptions { scale: rv_core::ScaleMode::Fit, pin_toolbar: false,
+                menu_key: "F8".into(), hide_shots: true, thumb_path: None,
+                app_icon_cache: None,
+                address_book: Some(app.downgrade()), transfer_folders: Default::default(),
+                app_shortcuts: vec![], remember_password: false }, handle, window, cx));
+        app.update(cx, |app, cx| {
+            app.home.control_loading.remove(&device.id);
+            app.home.controls.insert(device.id, super::home::control::PhoneControl::new(view.clone(), &device));
+            let mut store = WorkspaceStore::open(app.book.paths()).unwrap();
+            store.sync_backups(device.id, "lt.manodrabuziai.fr", &serde_json::json!({"bundle_id":"lt.manodrabuziai.fr", "backups":[
+                {"backup_id":"snapshot:fixture", "kind":"snapshot", "display_name":"shop", "idfv":id.as_str()}
+            ]})).unwrap();
+            let mut card = store.load(&id).unwrap();
+            card.tags = vec!["France".into(), "Fashion".into()];
+            store.save(&card).unwrap();
+            app.reload_home(cx);
+        });
+        peer.events.send(SessionEvent::ControlState(true)).unwrap();
+        view.update(cx, |view, cx| view.pump_control_test(cx));
+        view
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let skeleton = cx
+        .debug_bounds("shop-product-skeleton")
+        .expect("empty shop preserves product layout");
+    assert!(skeleton.size.height >= px(72.));
+    let tags = cx
+        .debug_bounds(Box::leak(
+            format!("app-card-tags-{}", id.as_str()).into_boxed_str(),
+        ))
+        .unwrap();
+    assert!(tags.bottom() <= skeleton.top());
+    click(cx, &format!("app-avatar-{}", id.as_str()));
+    app.read_with(cx, |app, _| assert!(matches!(app.modal, Modal::Shop)));
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("shop-detail-skeleton").unwrap().size.height >= px(320.));
+    app.update(cx, |app, cx| app.close_modal(cx));
+    cx.update(|window, cx| app.update(cx, |app, cx| app.open_app_card(id.clone(), window, cx)));
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("app-edit-form").is_some());
+    assert!(
+        cx.debug_bounds("shop-detail-skeleton").is_none(),
+        "editing must not render business data"
+    );
+    assert!(cx.debug_bounds("shop-operations").is_none());
+    app.update(cx, |app, cx| app.close_modal(cx));
+    app.update(cx, |app, cx| {
+        app.open_app_delete(id.clone(), cx);
+        app.confirm_app_delete(cx);
+    });
+    app.read_with(cx, |app, _| {
+        assert!(app.home.deletion.as_ref().unwrap().busy)
+    });
+    cx.update(|_, cx| {
+        // The control runtime can reject the request without an operation wrapper.
+        peer.events
+            .send(SessionEvent::Functions(FunctionEvent::Error(
+                "ZXTouch 尚未连接".into(),
+            )))
+            .unwrap();
+        view.update(cx, |view, cx| view.pump_control_test(cx));
+    });
+    app.read_with(cx, |app, _| {
+        let state = app.home.deletion.as_ref().unwrap();
+        assert!(!state.busy && state.error.is_some());
+        assert!(
+            WorkspaceStore::open(app.book.paths())
+                .unwrap()
+                .load(&id)
+                .is_ok()
+        );
+    });
+    // Enter and the footer share this guard after a failed phone deletion.
+    app.update(cx, |app, cx| app.confirm_app_delete(cx));
+    app.read_with(cx, |app, _| {
+        let state = app.home.deletion.as_ref().unwrap();
+        assert!(!state.busy && state.error.is_some());
+        assert!(
+            WorkspaceStore::open(app.book.paths())
+                .unwrap()
+                .load(&id)
+                .is_ok()
+        );
+    });
+    app.update(cx, |app, cx| app.close_modal(cx));
+    app.read_with(cx, |app, _| assert!(matches!(app.modal, Modal::None)));
+}
+
+#[gpui::test]
+fn proxy_manager_edits_credentials_and_card_editor_keeps_fixed_binding(cx: &mut TestAppContext) {
+    use rv_core::workspace::{AppId, ProxyMode, SocksProxy, WorkspaceStore};
+    let device = Connection::new("phone", "example.test", 5900);
+    let device_id = device.id;
+    let (app, cx, dir) = setup(cx, vec![device]);
+    let paths = rv_core::StorePaths::in_dir(dir.path().into());
+    let id = AppId::from_idfv("C9EB7804-2062-4519-AC8D-6F68972574F3").unwrap();
+    let proxy = SocksProxy {
+        id: uuid::Uuid::new_v4().to_string(),
+        name: "Shop exit".into(),
+        host: "127.0.0.1".into(),
+        port: 1080,
+        username: "user".into(),
+        password: "actual-secret".into(),
+        mode: ProxyMode::Exclusive,
+    };
+    let mut store = WorkspaceStore::open(&paths).unwrap();
+    store.sync_backups(device_id,"lt.manodrabuziai.fr",&serde_json::json!({"bundle_id":"lt.manodrabuziai.fr","backups":[{"kind":"snapshot","backup_id":"snapshot:1","idfv":id.as_str(),"display_name":"shop"}]})).unwrap();
+    store.save_proxy(&proxy).unwrap();
+    store.bind_proxy(&id, Some(&proxy.id)).unwrap();
+    cx.update(|window, cx| app.update(cx, |app, cx| app.open_proxy_manager(window, cx)));
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("settings-proxies").is_some());
+    click(cx, "proxy-save");
+    let saved = store.proxies().unwrap();
+    assert_eq!(saved.len(), 1);
+    assert_eq!(saved[0].password, "actual-secret");
+    assert_eq!(saved[0].mode, ProxyMode::Exclusive);
+    click(cx, "settings-back");
+    app.read_with(cx, |app, _| assert!(matches!(app.modal, Modal::None)));
+    cx.update(|window, cx| app.update(cx, |app, cx| app.open_app_card(id.clone(), window, cx)));
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("app-proxy-binding").is_some());
+    app.update(cx, |app, cx| app.save_app_card(cx));
+    assert_eq!(store.proxy_binding(&id).unwrap(), Some(proxy.id.clone()));
+    cx.update(|window, cx| app.update(cx, |app, cx| app.open_app_card(id.clone(), window, cx)));
+    app.read_with(cx, |app, cx| {
+        assert_eq!(
+            app.home.proxies.binding_select.read(cx).selected_value(),
+            Some(&proxy.id)
+        );
+    });
+    app.update(cx, |app, cx| {
+        app.home.proxies.binding_select.update(cx, |_, cx| {
+            cx.emit(gpui_component::select::SelectEvent::<
+                Vec<super::home::ProxyChoice>,
+            >::Confirm(Some(String::new())));
+        });
+    });
+    cx.run_until_parked();
+    app.update(cx, |app, cx| app.save_app_card(cx));
+    assert_eq!(store.proxy_binding(&id).unwrap(), None);
+}
+
+#[gpui::test]
+fn full_window_settings_keeps_home_state_and_cross_page_focus(cx: &mut TestAppContext) {
+    use super::settings::SettingsPage;
+    use gpui::Focusable;
+    let phone = Connection::new("phone", "example.test", 5900);
+    let id = phone.id;
+    let (app, cx, _dir) = setup(cx, vec![phone]);
+    app.update(cx, |app, _| {
+        app.selected = Some(id);
+        app.collapsed = true;
+    });
+    cx.update(|window, cx| app.update(cx, |app, cx| app.on_prefs(&OpenPreferences, window, cx)));
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("settings-page").is_some());
+    assert!(cx.debug_bounds("home-content").is_none());
+    assert!(cx.debug_bounds("management-toolbar").is_none());
+    cx.simulate_keystrokes("ctrl-n");
+    app.read_with(cx, |app, _| assert!(matches!(app.modal, Modal::None)));
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            app.settings.theme.focus_handle(cx).focus(window, cx);
+            app.select_settings_page(SettingsPage::Proxies, window, cx);
+            assert!(app.focus.is_focused(window));
+            app.home.proxies.select.focus_handle(cx).focus(window, cx);
+            app.select_settings_page(SettingsPage::General, window, cx);
+            assert!(app.focus.is_focused(window));
+            app.on_focus_search(&FocusSearch, window, cx);
+            assert!(!app.search.focus_handle(cx).is_focused(window));
+        })
+    });
+    click(cx, "settings-back");
+    app.read_with(cx, |app, _| {
+        assert!(app.settings.page.is_none());
+        assert_eq!(app.selected, Some(id));
+        assert!(app.collapsed);
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("home-content").is_some());
+}
+
+#[gpui::test]
+fn settings_component_switches_pages_without_search(cx: &mut TestAppContext) {
+    use gpui::Focusable;
+    let (app, cx, _dir) = setup(cx, vec![]);
+    cx.simulate_resize(size(px(1100.), px(720.)));
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            app.open_settings(window, cx);
+        })
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("settings-general").is_some());
+    assert!(cx.debug_bounds("settings-proxies").is_none());
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            app.settings.theme.focus_handle(cx).focus(window, cx);
+        });
+    });
+    let root = cx.debug_bounds("settings-page").unwrap();
+    let proxy_menu = point(root.left() + px(80.), root.top() + px(74.));
+    cx.simulate_mouse_move(proxy_menu, None, Modifiers::default());
+    cx.simulate_click(proxy_menu, Modifiers::default());
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("settings-proxies").is_some());
+    app.read_with(cx, |app, _| {
+        assert_eq!(
+            app.settings.page,
+            Some(super::settings::SettingsPage::Proxies)
+        );
+    });
+    cx.update(|window, cx| {
+        assert!(app.read(cx).focus.is_focused(window));
+    });
+    cx.update(|window, cx| app.update(cx, |app, cx| app.on_close_modal(&CloseModal, window, cx)));
+    app.read_with(cx, |app, _| assert!(app.settings.page.is_none()));
 }

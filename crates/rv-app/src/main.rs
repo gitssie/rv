@@ -1,10 +1,14 @@
 mod actions;
 mod app;
+mod app_icons;
 mod assets;
 mod file_transfer_window;
 mod photo_transfer;
 mod session_window;
 mod theme;
+mod typography;
+mod ui;
+mod window_controls;
 mod work_assistant;
 
 use std::cell::RefCell;
@@ -40,6 +44,10 @@ fn main() {
 
         let bounds = Bounds::centered(None, size(px(1100.), px(720.)), cx);
         let mut options = TitleBar::window_options();
+        if let Some(titlebar) = options.titlebar.as_mut() {
+            titlebar.title = Some("RV".into());
+            titlebar.traffic_light_position = Some(point(px(9.), px(12.)));
+        }
         options.window_bounds = Some(WindowBounds::Windowed(bounds));
         options.window_min_size = Some(size(px(800.), px(520.)));
         options.app_id = Some("app.rv.viewer".into());
@@ -77,6 +85,8 @@ fn main() {
 
 fn bind_keys(cx: &mut App) {
     cx.bind_keys([
+        KeyBinding::new("ctrl-cmd-f", HomeFullscreen, Some("AddressBook")),
+        KeyBinding::new("f11", HomeFullscreen, Some("AddressBook")),
         KeyBinding::new("cmd-n", NewConnection, Some("AddressBook")),
         KeyBinding::new("ctrl-n", NewConnection, Some("AddressBook")),
         KeyBinding::new("cmd-f", FocusSearch, Some("AddressBook")),
