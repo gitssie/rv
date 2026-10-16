@@ -25,8 +25,6 @@ CREATE TABLE IF NOT EXISTS phone_app_state (
     bundle_id TEXT NOT NULL, result TEXT NOT NULL, updated_at INTEGER NOT NULL,
     PRIMARY KEY(device_id,bundle_id)
 );
--- Explicitly dismissed IDFV values must not return on the next phone sync.
-CREATE TABLE IF NOT EXISTS app_dismissed (id TEXT PRIMARY KEY NOT NULL);
 CREATE TABLE IF NOT EXISTS app_instances (
     -- id is the canonical real IDFV, never a generated local identifier.
     id TEXT PRIMARY KEY NOT NULL, bundle_id TEXT NOT NULL, title TEXT NOT NULL,

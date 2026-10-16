@@ -6089,6 +6089,7 @@ dependencies = [
  "tokio-openssl",
  "tokio-rustls",
  "tracing",
+ "tracing-subscriber",
  "uuid",
  "vnc-rs",
  "webpki-roots 0.26.11",

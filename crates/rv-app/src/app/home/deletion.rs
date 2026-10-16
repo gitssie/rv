@@ -13,6 +13,7 @@ pub(in crate::app) struct AppDeletion {
     pub phone: bool,
     pub busy: bool,
     pub error: Option<String>,
+    started: bool,
     remaining: Vec<BackupLink>,
 }
 impl AddressBookApp {
@@ -30,6 +31,7 @@ impl AddressBookApp {
             phone: true,
             busy: false,
             error: None,
+            started: false,
             remaining: vec![],
         });
         self.modal = Modal::AppDelete;
@@ -75,6 +77,8 @@ impl AddressBookApp {
                         if let Some(state) = &mut this.home.deletion {
                             state.phone = *checked;
                             state.error = None;
+                            state.started = false;
+                            state.remaining.clear();
                         }
                         cx.notify();
                     })),
@@ -99,7 +103,7 @@ impl AddressBookApp {
                             .label("删除")
                             .debug_selector(|| "confirm-app-delete".into())
                             .loading(state.busy)
-                            .disabled(state.busy || state.error.is_some())
+                            .disabled(state.busy)
                             .on_click(cx.listener(|this, _, _, cx| this.confirm_app_delete(cx))),
                     ),
             )
@@ -108,23 +112,24 @@ impl AddressBookApp {
         let Some(state) = &self.home.deletion else {
             return;
         };
-        if state.busy
-            || state.error.is_some()
-            || self.read_only
-            || self.home.jobs.contains(&state.id)
-        {
+        if state.busy || self.read_only || self.home.jobs.contains(&state.id) {
             return;
         }
         let id = state.id.clone();
         let phone = state.phone;
-        let links =
+        let links = if state.started {
+            // Completed deletions have already been popped. An explicit retry
+            // continues from the failed archive instead of repeating the batch.
+            state.remaining.clone()
+        } else {
             match WorkspaceStore::open(self.book.paths()).and_then(|store| store.backups(&id)) {
                 Ok(links) => links,
                 Err(error) => {
                     self.delete_failed(error.to_string(), cx);
                     return;
                 }
-            };
+            }
+        };
         if phone {
             // Check every source before sending any mutation.
             if links
@@ -137,11 +142,16 @@ impl AddressBookApp {
         }
         let state = self.home.deletion.as_mut().unwrap();
         state.busy = true;
+        state.error = None;
+        state.started = true;
         state.remaining = if phone { links } else { vec![] };
         self.advance_app_delete(cx);
     }
     fn delete_failed(&mut self, message: String, cx: &mut Context<Self>) {
         if let Some(state) = &mut self.home.deletion {
+            tracing::error!(app_id = state.id.as_str(), delete_phone_backups = state.phone,
+                remaining_backups = state.remaining.len(), error = %message,
+                "Home App card deletion failed");
             state.busy = false;
             state.error = Some(message);
         }

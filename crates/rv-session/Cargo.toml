@@ -37,6 +37,7 @@ uuid.workspace = true
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "stream"] }
 
 [dev-dependencies]
+tracing-subscriber.workspace = true
 h2 = "0.4"
 flate2 = "1"
 tempfile = "3"

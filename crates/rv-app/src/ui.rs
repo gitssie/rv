@@ -1,16 +1,40 @@
 //! Shared compositions; individual controls keep GPUI Component defaults.
 use crate::{theme, typography};
-use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::{
-    ThemeStyled,
+    ThemeStyled, WindowExt,
     button::{Button, ButtonVariants},
     dialog::Dialog,
     h_flex,
-    progress::Progress,
-    spinner::Spinner,
+    notification::{Notification, NotificationDelivery},
     v_flex,
 };
+
+/// One transient feedback slot per window owner, including inactive windows.
+/// Retain the returned task so replacing feedback cancels its previous deadline.
+pub(crate) fn notify<T: 'static>(
+    note: Notification,
+    window: &mut Window,
+    cx: &mut Context<T>,
+) -> Task<()> {
+    window.defer(cx, move |window, cx| {
+        window.push_notification(
+            note.id::<T>()
+                .placement(Anchor::BottomRight)
+                .delivery(NotificationDelivery::InApp)
+                .autohide(true),
+            cx,
+        );
+    });
+    cx.spawn_in(window, async move |this, cx| {
+        cx.background_executor()
+            .timer(std::time::Duration::from_secs(3))
+            .await;
+        let _ = this.update_in(cx, |_, window, cx| {
+            window.remove_notification::<T>(cx);
+        });
+    })
+}
 
 /// A tool surface has the same padding in its menu and operation pages.
 pub(crate) fn tool_panel(cx: &App) -> Div {
@@ -18,7 +42,17 @@ pub(crate) fn tool_panel(cx: &App) -> Div {
 }
 
 pub(crate) fn tool_surface(cx: &App) -> Div {
-    v_flex().popover_style(cx).text_sm()
+    tool_section().popover_style(cx).text_sm()
+}
+
+/// Content groups share the panel edge; only the outer surface adds padding.
+pub(crate) fn tool_section() -> Div {
+    v_flex().w_full().min_w_0().gap_2()
+}
+
+/// Use the same centered baseline and spacing for every tool action row.
+pub(crate) fn tool_actions() -> Div {
+    h_flex().w_full().min_w_0().items_center().gap_2()
 }
 
 pub(crate) fn icon_button(
@@ -43,51 +77,32 @@ pub(crate) fn field(label: &'static str, control: impl IntoElement, _cx: &App) -
     )
 }
 
+/// The standard Alert keeps its layout while only the loading icon rotates.
 pub(crate) fn loading(
     id: &'static str,
     title: impl Into<SharedString>,
     message: SharedString,
-    cx: &App,
+    _cx: &App,
 ) -> Stateful<Div> {
-    h_flex()
-        .id(id)
-        .debug_selector(move || id.into())
-        .items_start()
-        .gap_2()
-        .child(Spinner::new())
-        .child(
-            v_flex()
-                .flex_1()
-                .min_w_0()
-                .gap_1()
-                .child(typography::label(title, cx))
-                .when(!message.is_empty(), |body| {
-                    body.child(
-                        div()
-                            .debug_selector(move || format!("{id}-message"))
-                            .child(typography::caption(message, cx)),
-                    )
-                }),
-        )
-}
-
-/// Only native measured totals produce determinate percentages.
-pub(crate) fn operation_progress(
-    id: &'static str,
-    progress: Option<&serde_json::Value>,
-) -> Progress {
-    let percent = progress.and_then(|progress| {
-        let total = progress["total"]
-            .as_f64()
-            .filter(|n| n.is_finite() && *n > 0.)?;
-        let done = progress["completed"]
-            .as_f64()
-            .filter(|n| n.is_finite() && *n >= 0.)?;
-        Some((done / total * 100.).clamp(0., 100.) as f32)
-    });
-    Progress::new(id)
-        .loading(percent.is_none())
-        .value(percent.unwrap_or(0.))
+    let message = if message.is_empty() {
+        title.into()
+    } else {
+        message
+    };
+    v_flex().id(id).debug_selector(move || id.into()).child(
+        gpui_component::alert::Alert::info("loading-status", message).with_animation(
+            "loading-icon",
+            Animation::new(std::time::Duration::from_millis(800))
+                .repeat()
+                .with_easing(ease_in_out),
+            |alert, delta| {
+                alert.icon(
+                    gpui_component::Icon::new(gpui_component::IconName::Loader)
+                        .transform(Transformation::rotate(percentage(delta))),
+                )
+            },
+        ),
+    )
 }
 
 /// Compact confirmations that continue as a task panel share one placement policy.

@@ -2,6 +2,7 @@
 
 mod apps;
 mod karing;
+mod photo_confirmation;
 pub use karing::{KaringRequest, KaringResponse, karing_component};
 mod screen_control;
 pub use screen_control::{ScreenPasscode, ScreenProgress};
@@ -27,8 +28,8 @@ pub use compositor::Framebuffer;
 pub use encodings::encodings_for;
 pub use error::SessionError;
 pub use file_transfer::{
-    FileCommand, FileTransferClient, FileTransferSnapshot, PHOTO_PAGE_SIZE, PhotoAlbum, PhotoEntry,
-    PhotoFailure, TransferDirection, TransferRecord, TransferStatus,
+    FileCommand, FileTransferClient, FileTransferSnapshot, PHOTO_PAGE_SIZE, PhotoAlbum,
+    PhotoDeleteStatus, PhotoEntry, PhotoFailure, TransferDirection, TransferRecord, TransferStatus,
 };
 #[cfg(feature = "test-support")]
 pub use session::SessionTestPeer;

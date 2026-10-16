@@ -14,7 +14,7 @@ use directories::UserDirs;
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::{
-    Disableable as _, Icon, IconName, StyledExt, TitleBar,
+    Disableable as _, Icon, IconName, Sizable as _, StyledExt, TitleBar,
     button::{Button, ButtonVariants as _},
     h_flex,
     input::{Input, InputEvent, InputState},
@@ -23,8 +23,8 @@ use gpui_component::{
 };
 use rv_core::{ConnectionId, TransferFolders};
 use rv_session::{
-    FileCommand, FileTransferClient, FileTransferSnapshot, PHOTO_PAGE_SIZE, PhotoAlbum, PhotoEntry,
-    TransferDirection, TransferStatus,
+    FileCommand, FileTransferClient, FileTransferSnapshot, PHOTO_PAGE_SIZE, PhotoAlbum,
+    PhotoDeleteStatus, PhotoEntry, TransferDirection, TransferStatus,
 };
 use smallvec::SmallVec;
 
@@ -372,6 +372,7 @@ impl FileTransferView {
             focus,
             _subscriptions: subscriptions,
         };
+        view.restore_photo_view(cx);
         view.reload_local(cx);
         if view.remote.caps.is_some_and(|caps| caps.list) {
             view.request_remote_list(initial_remote);
@@ -391,6 +392,111 @@ impl FileTransferView {
         })
         .detach();
         view
+    }
+
+    /// The session snapshot survives this window; its render caches do not.
+    fn restore_photo_view(&mut self, cx: &mut Context<Self>) {
+        self.reconcile_photo_thumbs(cx);
+    }
+
+    fn render_status_bar(&self, cx: &App) -> AnyElement {
+        let error = self
+            .status_error
+            .clone()
+            .or_else(|| {
+                self.photo_mode
+                    .then(|| self.remote.photo_error.clone())
+                    .flatten()
+            })
+            .or_else(|| self.remote.error.clone());
+        let (message, icon, color, running) = if let Some(error) = error {
+            (error, IconName::CircleX, theme::danger(cx), false)
+        } else if let Some(status) = self
+            .remote
+            .photo_delete_status
+            .as_ref()
+            .filter(|_| self.photo_mode)
+        {
+            match status {
+                PhotoDeleteStatus::Running(stage) => {
+                    (stage.clone(), IconName::Loader, theme::accent(cx), true)
+                }
+                PhotoDeleteStatus::Complete(message) => (
+                    message.clone(),
+                    IconName::CircleCheck,
+                    theme::success(cx),
+                    false,
+                ),
+                PhotoDeleteStatus::Cancelled => (
+                    "Photo deletion cancelled".into(),
+                    IconName::TriangleAlert,
+                    theme::warning(cx),
+                    false,
+                ),
+                PhotoDeleteStatus::Failed(message) => {
+                    (message.clone(), IconName::CircleX, theme::danger(cx), false)
+                }
+            }
+        } else {
+            let succeeded = self.photo_mode && self.remote.photo_succeeded;
+            let running = if self.photo_mode {
+                self.remote.photo_busy && !succeeded
+            } else {
+                self.local_loading
+                    || self.remote.listing
+                    || self.remote.management_busy
+                    || self
+                        .remote
+                        .transfers
+                        .iter()
+                        .any(|transfer| matches!(transfer.status, TransferStatus::Running))
+            };
+            let message = if self.photo_mode {
+                self.remote.photo_status.clone().unwrap_or_else(|| {
+                    if running {
+                        "Loading Photos…".into()
+                    } else {
+                        format!(
+                            "{} local items · {} photos",
+                            self.local_entries.len(),
+                            self.remote.photo_total
+                        )
+                    }
+                })
+            } else if running {
+                "Working…".into()
+            } else {
+                format!(
+                    "{} local items · {} remote items",
+                    self.local_entries.len(),
+                    self.remote.entries.len()
+                )
+            };
+            if succeeded {
+                (message, IconName::CircleCheck, theme::success(cx), false)
+            } else {
+                (message, IconName::Info, theme::muted(cx), running)
+            }
+        };
+        h_flex()
+            .py_1()
+            .px_2()
+            .gap_2()
+            .items_center()
+            .border_t_1()
+            .border_color(theme::line(cx))
+            .text_xs()
+            .text_color(theme::muted(cx))
+            .child(if running {
+                gpui_component::spinner::Spinner::new()
+                    .small()
+                    .color(theme::accent(cx))
+                    .into_any_element()
+            } else {
+                Icon::new(icon).small().text_color(color).into_any_element()
+            })
+            .child(div().flex_1().min_w_0().text_ellipsis().child(message))
+            .into_any_element()
     }
 
     fn poll_remote(&mut self, cx: &mut Context<Self>) {
@@ -519,6 +625,27 @@ impl FileTransferView {
     fn request_remote_list(&self, path: String) {
         if let Some(client) = &self.client {
             client.send(FileCommand::List(path));
+        }
+    }
+
+    fn select_photo_album(&mut self, album: Option<String>, cx: &mut Context<Self>) {
+        if self.remote.photo_busy || !self.remote.can_photos || self.remote.photo_album == album {
+            return;
+        }
+        let sent = self
+            .client
+            .as_ref()
+            .is_some_and(|client| client.send(FileCommand::PhotoList { offset: 0, album }));
+        if sent {
+            self.remote.photo_busy = true;
+            self.remote.photo_succeeded = false;
+            self.remote.photo_delete_status = None;
+            self.remote.photo_error = None;
+            self.remote.photo_status = Some("Loading Photos…".into());
+            self.photo_selected = None;
+            self.photo_selected_ids.clear();
+            self.photo_anchor = None;
+            cx.notify();
         }
     }
 
@@ -2021,6 +2148,7 @@ impl FileTransferView {
             .bg(theme::card(cx))
             .child(
                 h_flex()
+                    .min_h_8()
                     .px_2()
                     .gap_2()
                     .items_center()
@@ -2028,20 +2156,7 @@ impl FileTransferView {
                     .text_sm()
                     .child(Icon::new(IconName::Folder))
                     .child("Local")
-                    .child(div().flex_1())
-                    .child(
-                        Button::new("local-new-folder")
-                            .ghost()
-                            .icon(IconName::Plus)
-                            .label("New folder")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.new_folder_side = Some(FileSide::Local);
-                                this.new_folder_input.update(cx, |input, cx| {
-                                    input.set_value("", window, cx);
-                                });
-                                cx.notify();
-                            })),
-                    ),
+                    .child(div().flex_1()),
             )
             .child(
                 h_flex()
@@ -2081,6 +2196,20 @@ impl FileTransferView {
                             .aria_label("Local folder path")
                             .flex_1()
                             .min_w_0(),
+                    )
+                    .child(
+                        Button::new("local-new-folder")
+                            .ghost()
+                            .icon(IconName::Plus)
+                            .tooltip("New folder")
+                            .accessibility_label("New folder")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.new_folder_side = Some(FileSide::Local);
+                                this.new_folder_input.update(cx, |input, cx| {
+                                    input.set_value("", window, cx);
+                                });
+                                cx.notify();
+                            })),
                     ),
             )
             .child(self.table_header(FileSide::Local, cx))
@@ -2392,7 +2521,7 @@ impl FileTransferView {
                     .items_center()
                     .font_semibold()
                     .text_sm()
-                    .child(Icon::new(IconName::File))
+                    .child(Icon::new(crate::assets::FunctionIcon::Smartphone))
                     .child("Remote")
                     .child(div().flex_1())
                     .child(
@@ -2421,6 +2550,8 @@ impl FileTransferView {
                     .text_xs()
                     .child(
                         Button::new("photo-albums")
+                            .loading(self.remote.photo_busy)
+                            .small()
                             .ghost()
                             .label(
                                 self.remote
@@ -2501,8 +2632,10 @@ impl FileTransferView {
                     .into_any_element()
             } else if self.remote.photo_busy && self.remote.photo_entries.is_empty() {
                 crate::ui::empty_state("Loading Photos…", cx).into_any_element()
-            } else if let Some(error) = &self.remote.photo_error {
-                crate::ui::empty_state(error.clone(), cx).into_any_element()
+            } else if self.remote.photo_error.is_some() && self.remote.photo_delete_status.is_none()
+            {
+                crate::ui::empty_state(self.remote.photo_error.clone().unwrap_or_default(), cx)
+                    .into_any_element()
             } else if self.remote.photo_entries.is_empty() {
                 crate::ui::empty_state("No photos in this view", cx).into_any_element()
             } else {
@@ -2545,12 +2678,13 @@ impl FileTransferView {
             .bg(theme::card(cx))
             .child(
                 h_flex()
+                    .min_h_8()
                     .px_2()
                     .gap_2()
                     .items_center()
                     .font_semibold()
                     .text_sm()
-                    .child(Icon::new(IconName::Folder))
+                    .child(Icon::new(crate::assets::FunctionIcon::Smartphone))
                     .child("Remote")
                     .child(div().flex_1())
                     .child(
@@ -2567,26 +2701,6 @@ impl FileTransferView {
                             .label("Photos")
                             .disabled(!self.remote.can_photos)
                             .on_click(cx.listener(|this, _, _, cx| this.show_photos(cx))),
-                    )
-                    .child(
-                        Button::new("remote-new-folder")
-                            .ghost()
-                            .icon(IconName::Plus)
-                            .label("New folder")
-                            .disabled(
-                                !self.allow_upload
-                                    || !self.remote.can_mkdir
-                                    || self.remote.management_busy
-                                    || self.remote.listed_path.as_deref()
-                                        != Some(self.remote.remote_path.as_str()),
-                            )
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.new_folder_side = Some(FileSide::Remote);
-                                this.new_folder_input.update(cx, |input, cx| {
-                                    input.set_value("", window, cx);
-                                });
-                                cx.notify();
-                            })),
                     ),
             )
             .child(
@@ -2627,6 +2741,27 @@ impl FileTransferView {
                             .aria_label("Remote folder path")
                             .flex_1()
                             .min_w_0(),
+                    )
+                    .child(
+                        Button::new("remote-new-folder")
+                            .ghost()
+                            .icon(IconName::Plus)
+                            .tooltip("New folder")
+                            .accessibility_label("New folder")
+                            .disabled(
+                                !self.allow_upload
+                                    || !self.remote.can_mkdir
+                                    || self.remote.management_busy
+                                    || self.remote.listed_path.as_deref()
+                                        != Some(self.remote.remote_path.as_str()),
+                            )
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.new_folder_side = Some(FileSide::Remote);
+                                this.new_folder_input.update(cx, |input, cx| {
+                                    input.set_value("", window, cx);
+                                });
+                                cx.notify();
+                            })),
                     ),
             )
             .child(self.table_header(FileSide::Remote, cx))
@@ -2900,10 +3035,12 @@ impl Render for FileTransferView {
                 this.child(
                     TitleBar::new().child(
                         div()
-                            .w_full()
-                            .text_center()
+                            .flex_1()
+                            .min_w_0()
+                            .px_2()
+                            .text_left()
                             .text_sm()
-                            .font_semibold()
+                            .text_ellipsis()
                             .child(format!("File transfer — {}", self.host)),
                     ),
                 )
@@ -3062,7 +3199,7 @@ impl Render for FileTransferView {
                             } else {
                                 IconName::ChevronRight
                             })
-                            .label("Transfers")
+                            .accessibility_label("Transfers")
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.transfers_open = !this.transfers_open;
                                 this.auto_collapse_armed = false;
@@ -3201,40 +3338,7 @@ impl Render for FileTransferView {
                         }),
                 )
             })
-            .child(
-                h_flex()
-                    .py_1()
-                    .px_2()
-                    .items_center()
-                    .border_t_1()
-                    .border_color(theme::line(cx))
-                    .text_xs()
-                    .text_color(theme::muted(cx))
-                    .child(
-                        div().w_full().text_ellipsis().child(
-                            self.status_error
-                                .clone()
-                                .or_else(|| {
-                                    self.photo_mode
-                                        .then(|| {
-                                            self.remote
-                                                .photo_error
-                                                .clone()
-                                                .or_else(|| self.remote.photo_status.clone())
-                                        })
-                                        .flatten()
-                                })
-                                .or_else(|| self.remote.error.clone())
-                                .unwrap_or_else(|| {
-                                    format!(
-                                        "{} local items · {} remote items",
-                                        self.local_entries.len(),
-                                        self.remote.entries.len()
-                                    )
-                                }),
-                        ),
-                    ),
-            )
+            .child(self.render_status_bar(cx))
             .when(fullscreen, |this| {
                 this.child(self.render_fullscreen_toolbar(cx))
             })
@@ -3253,16 +3357,7 @@ fn album_menu(
         let all_view = view.clone();
         let mut menu = menu.item(PopupMenuItem::new("All photos").on_click(move |_, _, cx| {
             all_view.update(cx, |this, cx| {
-                this.photo_selected = None;
-                this.photo_selected_ids.clear();
-                this.photo_anchor = None;
-                if let Some(client) = &this.client {
-                    client.send(FileCommand::PhotoList {
-                        offset: 0,
-                        album: None,
-                    });
-                }
-                cx.notify();
+                this.select_photo_album(None, cx);
             });
         }));
         for album in &albums {
@@ -3271,16 +3366,7 @@ fn album_menu(
             menu = menu.item(
                 PopupMenuItem::new(album.name.clone()).on_click(move |_, _, cx| {
                     album_view.update(cx, |this, cx| {
-                        this.photo_selected = None;
-                        this.photo_selected_ids.clear();
-                        this.photo_anchor = None;
-                        if let Some(client) = &this.client {
-                            client.send(FileCommand::PhotoList {
-                                offset: 0,
-                                album: Some(id.clone()),
-                            });
-                        }
-                        cx.notify();
+                        this.select_photo_album(Some(id.clone()), cx);
                     });
                 }),
             );
@@ -4408,6 +4494,18 @@ mod tests {
                 &[17, 73, 231, 255],
                 "Photos thumbnails must use GPUI's BGRA channel order",
             );
+
+            // Reopening starts with the same session snapshot but no window
+            // image cache. An identical list refresh cannot hydrate that cache.
+            let snapshot = view.remote.clone();
+            for (_, image) in view.photo_thumbs.drain() {
+                cx.drop_image(image, None);
+            }
+            view.remote = snapshot;
+            let revision = view.remote.photo_revision;
+            view.restore_photo_view(cx);
+            assert_eq!(view.remote.photo_revision, revision);
+            assert!(view.photo_thumbs.contains_key("photo-0"));
 
             view.remote.photo_entries[0].thumbnail.clear();
             view.reconcile_photo_thumbs(cx);

@@ -21,7 +21,7 @@ use crate::compositor::{Apply, Framebuffer};
 use crate::encodings::encodings_for;
 use crate::file_transfer::{
     self, FileCommand, FileTransferClient, FileTransferSnapshot, PHOTO_PAGE_SIZE, PhotoAlbum,
-    PhotoEntry, PhotoFailure, TransferDirection, TransferRecord, TransferStatus,
+    PhotoDeleteStatus, PhotoEntry, PhotoFailure, TransferDirection, TransferRecord, TransferStatus,
 };
 use crate::vencrypt;
 
@@ -562,21 +562,12 @@ async fn session_loop(
         }
         apps.advance(&client, &app_send).await;
         functions.advance(&function_send);
+        files.advance_photo_confirmation(apps.http_client());
         files.advance_upload(&client).await;
         if let Some((offset, album)) = files.next_photo_page.take() {
             files.send_photo_list(&client, offset, album).await;
         } else if let Some(command) = files.followup.pop_front() {
             files.command(&client, command).await;
-        } else if files.pending_photo.is_none()
-            && files.pending_photo_page.is_none()
-            && files.pending_photo_upload.is_none()
-            && files.pending_export_cleanup.is_none()
-            && files.active.is_none()
-            && let Some((offset, album)) = files.queued_photo_list.take()
-        {
-            files
-                .command(&client, FileCommand::PhotoList { offset, album })
-                .await;
         }
         files.advance_photo(&client).await;
         let since_refresh = last_refresh.elapsed();
@@ -800,7 +791,6 @@ struct FileRuntime {
     pending_photo: Option<PendingPhoto>,
     pending_photo_page: Option<PendingPhotoPage>,
     next_photo_page: Option<(usize, Option<String>)>,
-    queued_photo_list: Option<(usize, Option<String>)>,
     pending_photo_upload: Option<PendingPhotoUpload>,
     photo_upload_source: Option<PathBuf>,
     pending_export_cleanup: Option<String>,
@@ -809,6 +799,7 @@ struct FileRuntime {
     next_management_id: u32,
     pending_lists: VecDeque<String>,
     allow_upload: bool,
+    photo_confirmation: Option<(String, crate::photo_confirmation::Confirmation)>,
 }
 
 impl FileRuntime {
@@ -822,7 +813,6 @@ impl FileRuntime {
             pending_photo: None,
             pending_photo_page: None,
             next_photo_page: None,
-            queued_photo_list: None,
             pending_photo_upload: None,
             photo_upload_source: None,
             pending_export_cleanup: None,
@@ -831,6 +821,7 @@ impl FileRuntime {
             next_management_id: 1,
             pending_lists: VecDeque::new(),
             allow_upload,
+            photo_confirmation: None,
         }
     }
 
@@ -842,6 +833,7 @@ impl FileRuntime {
     fn photo_fail(&mut self, message: impl Into<String>) {
         let message = message.into();
         self.pending_photo = None;
+        self.photo_confirmation = None;
         self.pending_photo_page = None;
         self.next_photo_page = None;
         self.photo_upload_source = None;
@@ -853,6 +845,13 @@ impl FileRuntime {
         }
         file_transfer::update(&self.state, |state| {
             state.photo_busy = false;
+            state.photo_succeeded = false;
+            if matches!(
+                state.photo_delete_status,
+                Some(PhotoDeleteStatus::Running(_))
+            ) {
+                state.photo_delete_status = Some(PhotoDeleteStatus::Failed(message.clone()));
+            }
             state.photo_failure.get_or_insert(PhotoFailure::Unknown);
             state.photo_error = Some(message);
             state.photo_revision = state.photo_revision.wrapping_add(1);
@@ -910,6 +909,13 @@ impl FileRuntime {
         file_transfer::update(&self.state, |state| {
             state.photo_busy = true;
             state.photo_error = None;
+            if op == 9 {
+                state.photo_delete_status = Some(PhotoDeleteStatus::Running(
+                    "Submitting Photos deletion…".into(),
+                ));
+            } else if op != 5 {
+                state.photo_delete_status = None;
+            }
             if op == 4 {
                 state.photo_failure = Some(PhotoFailure::Unknown);
             }
@@ -918,6 +924,7 @@ impl FileRuntime {
                     status.starts_with("Imported into Photos") || status.starts_with("Deleted ")
                 })
             {
+                state.photo_succeeded = false;
                 state.photo_status = Some(
                     match op {
                         4 => "Importing into Photos…",
@@ -942,32 +949,13 @@ impl FileRuntime {
         }
     }
 
-    // A second view request must not turn an in-flight page into a persistent
-    // error. Keep only the latest different target; identical refreshes are
-    // already satisfied by the page being loaded.
-    fn photo_list_ready(&mut self, offset: usize, album: &Option<String>) -> bool {
-        if self.pending_photo_upload.is_some() {
-            return false;
-        }
-        if let Some(pending) = &self.pending_photo {
-            if matches!(&pending.action, PhotoAction::List { .. }) {
-                self.queued_photo_list = (!self
-                    .pending_photo_page
-                    .as_ref()
-                    .is_some_and(|page| page.offset == offset && &page.album == album))
-                .then(|| (offset, album.clone()));
-            }
-            return false;
-        }
-        if let Some(page) = &self.pending_photo_page {
-            if &page.album == album && page.offset == offset {
-                self.queued_photo_list = None;
-                return false;
-            }
-            self.queued_photo_list = Some((offset, album.clone()));
-            return false;
-        }
-        true
+    // Album/page navigation is single-flight. Internal transport pagination
+    // continues separately; user requests received while busy are not queued.
+    fn photo_list_ready(&self) -> bool {
+        self.pending_photo_upload.is_none()
+            && self.pending_photo.is_none()
+            && self.pending_photo_page.is_none()
+            && self.next_photo_page.is_none()
     }
 
     async fn send_photo_list(
@@ -995,6 +983,41 @@ impl FileRuntime {
             PhotoAction::List { offset, album },
         )
         .await;
+    }
+
+    fn advance_photo_confirmation(&mut self, client: Option<crate::phone_http::PhoneHttpClient>) {
+        let task = self
+            .pending_photo
+            .as_ref()
+            .filter(|pending| {
+                self.allow_upload && matches!(pending.action, PhotoAction::Delete { .. })
+            })
+            .and_then(|pending| pending.token.clone());
+        let Some(task) = task else {
+            self.photo_confirmation = None;
+            return;
+        };
+        if !self
+            .photo_confirmation
+            .as_ref()
+            .is_some_and(|(id, _)| id == &task)
+        {
+            self.photo_confirmation =
+                client.map(|client| (task.clone(), crate::photo_confirmation::start(client, task)));
+            let stage = PhotoDeleteStatus::Running(
+                "Confirm deletion on iPhone; waiting for result…".into(),
+            );
+            if self.state.lock().unwrap().photo_delete_status.as_ref() != Some(&stage) {
+                file_transfer::update(&self.state, |state| state.photo_delete_status = Some(stage));
+            }
+        }
+        if let Some((_, confirmation)) = &mut self.photo_confirmation {
+            if let Some(stage) = confirmation.progress() {
+                file_transfer::update(&self.state, |state| {
+                    state.photo_delete_status = Some(PhotoDeleteStatus::Running(stage.into()));
+                });
+            }
+        }
     }
 
     async fn advance_photo(&mut self, client: &vnc::VncClient) {
@@ -1043,6 +1066,9 @@ impl FileRuntime {
             self.photo_fail("Unexpected Photos response");
             return;
         }
+        if pending.token.is_some() && status != 2 {
+            self.photo_confirmation = None;
+        }
         if status == 1 {
             if pending.op == 4 && message.starts_with("Photo import not committed: ") {
                 file_transfer::update(&self.state, |state| {
@@ -1060,7 +1086,9 @@ impl FileRuntime {
             file_transfer::update(&self.state, |state| {
                 state.photo_busy = false;
                 state.photo_error = None;
+                state.photo_succeeded = false;
                 state.photo_status = Some("Photo deletion cancelled".into());
+                state.photo_delete_status = Some(PhotoDeleteStatus::Cancelled);
                 state.photo_revision = state.photo_revision.wrapping_add(1);
             });
             return;
@@ -1173,8 +1201,9 @@ impl FileRuntime {
                     state.photo_album = page.album;
                     state.photo_offset = page.offset;
                     state.photo_total = page.total;
-                    state.photo_busy = self.queued_photo_list.is_some();
+                    state.photo_busy = false;
                     if state.photo_status.as_deref() == Some("Loading Photos…") {
+                        state.photo_succeeded = false;
                         state.photo_status = None;
                     }
                     state.photo_revision = state.photo_revision.wrapping_add(1);
@@ -1194,6 +1223,7 @@ impl FileRuntime {
                     // once at the end instead of rebuilding 50 thumbnails per file.
                     state.photo_busy = refresh;
                     state.photos_need_refresh = true;
+                    state.photo_succeeded = true;
                     state.photo_status = Some(format!("Imported into Photos · {asset_id}"));
                     state.photo_asset_id = Some(asset_id.to_owned());
                     state.photo_failure = None;
@@ -1224,6 +1254,7 @@ impl FileRuntime {
                 }
                 self.pending_export_cleanup = Some(remote.to_owned());
                 file_transfer::update(&self.state, |state| {
+                    state.photo_succeeded = false;
                     state.photo_status = Some("Downloading original photo…".into());
                 });
                 self.followup.push_back(FileCommand::Download {
@@ -1245,10 +1276,11 @@ impl FileRuntime {
                 }
                 file_transfer::update(&self.state, |state| {
                     state.photo_busy = false;
-                    state.photo_status = Some(format!(
-                        "Deleted {count} photo{}",
-                        if count == 1 { "" } else { "s" }
-                    ));
+                    let message =
+                        format!("Deleted {count} photo{}", if count == 1 { "" } else { "s" });
+                    state.photo_succeeded = true;
+                    state.photo_status = Some(message.clone());
+                    state.photo_delete_status = Some(PhotoDeleteStatus::Complete(message));
                     state.photo_revision = state.photo_revision.wrapping_add(1);
                 });
                 self.followup
@@ -1461,6 +1493,20 @@ impl FileRuntime {
                 }
             }
             FileCommand::Cancel => {
+                if let Some((_, confirmation)) = &self.photo_confirmation {
+                    // Keep the task marker so a cancelled observer cannot restart.
+                    confirmation.cancel();
+                    file_transfer::update(&self.state, |state| {
+                        if matches!(
+                            state.photo_delete_status,
+                            Some(PhotoDeleteStatus::Running(_))
+                        ) {
+                            state.photo_delete_status = Some(PhotoDeleteStatus::Running(
+                                "Confirm deletion on iPhone; waiting for result…".into(),
+                            ));
+                        }
+                    });
+                }
                 let was_download = matches!(self.active, Some(ActiveFile::Download { .. }));
                 if self.active.is_some() {
                     let command = if was_download {
@@ -1520,7 +1566,7 @@ impl FileRuntime {
                 }
             }
             FileCommand::PhotoList { offset, album } => {
-                if !self.photo_list_ready(offset, &album) {
+                if !self.photo_list_ready() {
                     return;
                 }
                 self.send_photo_list(client, offset, album).await;
@@ -1613,6 +1659,8 @@ impl FileRuntime {
                     state.photo_error = None;
                     state.photo_asset_id = None;
                     state.photo_task_id = Some(token.clone());
+                    state.photo_succeeded = false;
+                    state.photo_delete_status = None;
                     state.photo_status = Some("Checking photo import result…".into());
                 });
                 self.pending_photo = Some(PendingPhoto {
@@ -1730,6 +1778,8 @@ impl FileRuntime {
                 file_transfer::update(&self.state, |state| {
                     state.photo_busy = true;
                     state.photo_error = None;
+                    state.photo_succeeded = false;
+                    state.photo_delete_status = None;
                     state.photo_status = Some("Uploading to Photos…".into());
                     state.photo_asset_id = None;
                     state.photo_task_id = task_id;
@@ -2381,6 +2431,7 @@ impl FileRuntime {
                     } else {
                         file_transfer::update(&self.state, |state| {
                             state.photo_busy = false;
+                            state.photo_succeeded = true;
                             state.photo_status = Some("Original photo downloaded".into());
                             state.photo_revision = state.photo_revision.wrapping_add(1);
                         });
@@ -2469,6 +2520,21 @@ impl Drop for FileRuntime {
             state.can_replace = false;
             state.can_checksum = false;
             state.can_photos = false;
+            if state.photo_busy {
+                state.photo_busy = false;
+                if !state.photo_succeeded {
+                    state.photo_error = Some("Connection closed during Photos operation".into());
+                }
+                state.photo_revision = state.photo_revision.wrapping_add(1);
+            }
+            if matches!(
+                state.photo_delete_status,
+                Some(PhotoDeleteStatus::Running(_))
+            ) {
+                state.photo_delete_status = Some(PhotoDeleteStatus::Failed(
+                    "Connection closed; deletion result not confirmed".into(),
+                ));
+            }
             state.management_busy = false;
             state.listing = false;
             state.error = Some("Connection closed".into());
@@ -2523,7 +2589,51 @@ mod transport_tests {
     }
 
     #[test]
-    fn overlapping_photo_lists_coalesce_and_keep_the_latest_view() {
+    fn disconnect_releases_photos_loading_and_preserves_completed_import() {
+        for succeeded in [false, true] {
+            let state = Arc::new(Mutex::new(FileTransferSnapshot {
+                can_photos: true,
+                photo_busy: true,
+                photo_succeeded: succeeded,
+                photo_status: succeeded.then(|| "Imported into Photos · asset".into()),
+                ..Default::default()
+            }));
+            let mut runtime = FileRuntime::new(state.clone(), true);
+            runtime.pending_photo_page = Some(PendingPhotoPage::new(0, None));
+            runtime.pending_photo = Some(PendingPhoto {
+                id: 1,
+                op: 5,
+                token: Some("list-token".into()),
+                poll_due: Instant::now(),
+                poll_delay: PHOTO_POLL_MIN,
+                action: PhotoAction::List {
+                    offset: 0,
+                    album: None,
+                },
+            });
+            drop(runtime);
+            let snapshot = state.lock().unwrap();
+            assert!(!snapshot.photo_busy);
+            assert!(!snapshot.can_photos);
+            assert_eq!(snapshot.photo_revision, 1);
+            assert_eq!(snapshot.photo_succeeded, succeeded);
+            if succeeded {
+                assert_eq!(
+                    snapshot.photo_status.as_deref(),
+                    Some("Imported into Photos · asset")
+                );
+                assert!(snapshot.photo_error.is_none());
+            } else {
+                assert_eq!(
+                    snapshot.photo_error.as_deref(),
+                    Some("Connection closed during Photos operation")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn overlapping_photo_lists_are_rejected_until_the_current_view_finishes() {
         let state = Arc::new(Mutex::new(FileTransferSnapshot {
             can_photos: true,
             photo_busy: true,
@@ -2542,41 +2652,29 @@ mod transport_tests {
                 album: None,
             },
         });
-
-        assert!(!runtime.photo_list_ready(0, &None));
-        assert!(runtime.queued_photo_list.is_none());
-        assert!(!runtime.photo_list_ready(0, &Some("album-a".into())));
-        assert!(!runtime.photo_list_ready(0, &Some("album-b".into())));
-        assert_eq!(runtime.queued_photo_list, Some((0, Some("album-b".into()))));
-        assert!(!runtime.photo_list_ready(0, &None));
-        assert!(runtime.queued_photo_list.is_none());
-        assert!(!runtime.photo_list_ready(0, &Some("album-b".into())));
-        assert!(state.lock().unwrap().photo_error.is_none());
-
+        for _ in 0..1000 {
+            assert!(!runtime.photo_list_ready());
+        }
         runtime.photo_result(7, 1, 0, r#"{"entries":[],"total":0}"#.into());
-        assert!(state.lock().unwrap().photo_busy);
-        assert!(runtime.photo_list_ready(0, &Some("album-b".into())));
+        assert!(!state.lock().unwrap().photo_busy);
+        assert!(runtime.photo_list_ready());
+        assert!(runtime.followup.is_empty());
+        assert!(state.lock().unwrap().photo_error.is_none());
     }
 
     #[test]
     fn external_photo_list_cannot_take_an_internal_page_continuation() {
-        let state = Arc::new(Mutex::new(FileTransferSnapshot {
-            can_photos: true,
-            photo_busy: true,
-            ..Default::default()
-        }));
+        let state = Arc::new(Mutex::new(FileTransferSnapshot::default()));
         let mut runtime = FileRuntime::new(state, true);
         runtime.pending_photo_page = Some(PendingPhotoPage::new(0, None));
         runtime.pending_photo_page.as_mut().unwrap().next_offset = 12;
         runtime.next_photo_page = Some((12, None));
-
-        assert!(!runtime.photo_list_ready(12, &None));
+        assert!(!runtime.photo_list_ready());
         assert_eq!(runtime.next_photo_page, Some((12, None)));
-        assert_eq!(runtime.queued_photo_list, Some((12, None)));
     }
 
     #[test]
-    fn failed_photo_page_keeps_the_latest_requested_view() {
+    fn failed_photo_page_releases_navigation_without_replaying_requests() {
         let state = Arc::new(Mutex::new(FileTransferSnapshot {
             can_photos: true,
             photo_busy: true,
@@ -2584,7 +2682,6 @@ mod transport_tests {
         }));
         let mut runtime = FileRuntime::new(state.clone(), true);
         runtime.pending_photo_page = Some(PendingPhotoPage::new(0, None));
-        runtime.queued_photo_list = Some((0, Some("album-b".into())));
         runtime.pending_photo = Some(PendingPhoto {
             id: 1,
             op: 5,
@@ -2596,15 +2693,63 @@ mod transport_tests {
                 album: None,
             },
         });
-
-        runtime.photo_result(7, 1, 1, "First page failed".into());
-
-        assert!(runtime.pending_photo_page.is_none());
-        assert_eq!(runtime.queued_photo_list, Some((0, Some("album-b".into()))));
+        runtime.photo_result(7, 1, 1, "Photos queue is full".into());
+        assert!(runtime.photo_list_ready());
+        assert!(!state.lock().unwrap().photo_busy);
         assert_eq!(
             state.lock().unwrap().photo_error.as_deref(),
-            Some("First page failed")
+            Some("Photos queue is full")
         );
+        assert!(runtime.followup.is_empty());
+    }
+
+    #[test]
+    fn photo_delete_alert_uses_authoritative_terminal_result_and_survives_list_refresh() {
+        for (status, response, expected) in [
+            (
+                0,
+                r#"{"deleted":["asset"]}"#,
+                PhotoDeleteStatus::Complete("Deleted 1 photo".into()),
+            ),
+            (3, "Photo deletion cancelled", PhotoDeleteStatus::Cancelled),
+            (
+                1,
+                "Permission denied",
+                PhotoDeleteStatus::Failed("Permission denied".into()),
+            ),
+        ] {
+            let state = Arc::new(Mutex::new(FileTransferSnapshot {
+                can_photos: true,
+                photo_busy: true,
+                photo_delete_status: Some(PhotoDeleteStatus::Running("Waiting for result…".into())),
+                ..Default::default()
+            }));
+            let mut runtime = FileRuntime::new(state.clone(), true);
+            runtime.pending_photo = Some(PendingPhoto {
+                id: 9,
+                op: 9,
+                token: Some("delete-task".into()),
+                poll_due: Instant::now(),
+                poll_delay: PHOTO_POLL_MIN,
+                action: PhotoAction::Delete {
+                    album: None,
+                    count: 1,
+                },
+            });
+            runtime.photo_result(7, 9, status, response.into());
+            runtime.advance_photo_confirmation(None);
+            assert!(!state.lock().unwrap().photo_busy);
+            assert_eq!(
+                state.lock().unwrap().photo_delete_status.as_ref(),
+                Some(&expected)
+            );
+            // A follow-up list failure must not rewrite a completed deletion.
+            runtime.photo_fail("List refresh failed");
+            assert_eq!(
+                state.lock().unwrap().photo_delete_status.as_ref(),
+                Some(&expected)
+            );
+        }
     }
 
     #[test]
@@ -2815,9 +2960,58 @@ mod transport_tests {
         );
         let s = state.lock().unwrap();
         assert_eq!(s.photo_asset_id.as_deref(), Some("committed"));
+        assert!(
+            s.photo_succeeded,
+            "committed import must expose a success state to the status bar"
+        );
         assert!(s.photo_failure.is_none());
         assert!(s.photo_error.is_none());
     }
+    #[tokio::test]
+    async fn confirmation_starts_only_for_an_accepted_photos_delete_and_stops_with_it() {
+        let state = Arc::new(Mutex::new(FileTransferSnapshot::default()));
+        let mut runtime = FileRuntime::new(state, true);
+        let client =
+            crate::phone_http::PhoneHttpClient::new("127.0.0.1", 1, "fixture".into()).unwrap();
+        runtime.pending_photo = Some(PendingPhoto {
+            id: 0,
+            op: 5,
+            token: Some("list-task".into()),
+            poll_due: Instant::now(),
+            poll_delay: PHOTO_POLL_MIN,
+            action: PhotoAction::List {
+                offset: 0,
+                album: None,
+            },
+        });
+        runtime.advance_photo_confirmation(Some(client.clone()));
+        assert!(runtime.photo_confirmation.is_none());
+        let pending = runtime.pending_photo.as_mut().unwrap();
+        pending.op = 9;
+        pending.action = PhotoAction::Delete {
+            album: None,
+            count: 1,
+        };
+        pending.token = None;
+        runtime.advance_photo_confirmation(Some(client.clone()));
+        assert!(runtime.photo_confirmation.is_none());
+        runtime.pending_photo.as_mut().unwrap().token = Some("delete-task".into());
+        runtime.advance_photo_confirmation(Some(client.clone()));
+        assert_eq!(
+            runtime.photo_confirmation.as_ref().unwrap().0,
+            "delete-task"
+        );
+        runtime.allow_upload = false;
+        runtime.advance_photo_confirmation(Some(client.clone()));
+        assert!(runtime.photo_confirmation.is_none());
+        runtime.allow_upload = true;
+        runtime.advance_photo_confirmation(Some(client.clone()));
+        assert!(runtime.photo_confirmation.is_some());
+        runtime.pending_photo = None;
+        runtime.advance_photo_confirmation(Some(client));
+        assert!(runtime.photo_confirmation.is_none());
+    }
+
     #[test]
     fn photo_job_polling_backs_off_without_delaying_short_jobs() {
         let state = Arc::new(Mutex::new(FileTransferSnapshot::default()));

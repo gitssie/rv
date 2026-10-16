@@ -15,6 +15,50 @@ fn result(id: &str) -> serde_json::Value {
     json!({"bundle_id":"lt.manodrabuziai.fr","backups":[{"backup_id":"snapshot:1","kind":"snapshot","display_name":"店铺法国","note":"每日检查商品与消息","idfv":id,"future_field":{"a":1}}]})
 }
 #[test]
+fn existing_database_upgrades_before_backup_sync_without_losing_local_data() {
+    let (mut store, device, dir) = fixture();
+    store
+        .sync_backups(device.id, "lt.manodrabuziai.fr", &result(ID))
+        .unwrap();
+    let id = AppId::from_idfv(ID).unwrap();
+    let mut app = store.load(&id).unwrap();
+    app.note = "保留本地备注".into();
+    store.save(&app).unwrap();
+    // Version 3 installed before dismissal support did not have this table.
+    store
+        .db
+        .execute_batch("DROP TABLE app_dismissed; PRAGMA user_version=3;")
+        .unwrap();
+    drop(store);
+    let paths = StorePaths::in_dir(dir.path().into());
+    let mut store = WorkspaceStore::open(&paths).unwrap();
+    let report = store
+        .sync_backups(device.id, "lt.manodrabuziai.fr", &result(ID))
+        .unwrap();
+    assert_eq!(report.created, 0);
+    assert_eq!(report.linked, 1);
+    assert_eq!(store.load(&id).unwrap().note, "保留本地备注");
+    assert_eq!(
+        AddressBook::load(paths.clone())
+            .unwrap()
+            .get(device.id)
+            .unwrap()
+            .name,
+        device.name
+    );
+    store.delete_app(&id).unwrap();
+    // Fresh version-3 databases already included the table; upgrading must
+    // preserve dismissal records instead of recreating or clearing them.
+    store.db.pragma_update(None, "user_version", 3).unwrap();
+    drop(store);
+    let mut store = WorkspaceStore::open(&paths).unwrap();
+    let report = store
+        .sync_backups(device.id, "lt.manodrabuziai.fr", &result(ID))
+        .unwrap();
+    assert_eq!(report.created, 0);
+    assert!(store.list(&AppQuery::default()).unwrap().is_empty());
+}
+#[test]
 fn backup_is_only_creation_source_idfv_deduplicates_and_keeps_local_edits() {
     let (mut store, device, _) = fixture();
     let r = store

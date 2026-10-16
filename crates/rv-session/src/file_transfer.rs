@@ -56,6 +56,14 @@ pub enum PhotoFailure {
     Unknown,
     TaskNotFound,
 }
+/// Deletion status stays separate from list refreshes and other photo operations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PhotoDeleteStatus {
+    Running(String),
+    Complete(String),
+    Cancelled,
+    Failed(String),
+}
 #[derive(Debug, Clone)]
 pub struct FileTransferSnapshot {
     pub revision: u64,
@@ -78,8 +86,11 @@ pub struct FileTransferSnapshot {
     pub photo_total: usize,
     pub photo_offset: usize,
     pub photo_busy: bool,
+    pub photo_delete_status: Option<PhotoDeleteStatus>,
     pub photos_need_refresh: bool,
     pub photo_status: Option<String>,
+    /// Set only after an authoritative successful import/export/delete result.
+    pub photo_succeeded: bool,
     pub photo_error: Option<String>,
     pub photo_failure: Option<PhotoFailure>,
     pub photo_revision: u64,
@@ -117,8 +128,10 @@ impl Default for FileTransferSnapshot {
             photo_total: 0,
             photo_offset: 0,
             photo_busy: false,
+            photo_delete_status: None,
             photos_need_refresh: false,
             photo_status: None,
+            photo_succeeded: false,
             photo_error: None,
             photo_failure: None,
             photo_revision: 0,
@@ -222,10 +235,30 @@ impl FileTransferClient {
         {
             return false;
         }
+        let photo_list = if let FileCommand::PhotoList { offset, album } = &command {
+            if state.photo_busy {
+                return false;
+            }
+            Some((*offset, album.clone()))
+        } else {
+            None
+        };
         if self.commands.send(SessionCommand::File(command)).is_err() {
             return false;
         }
         state.pending_commands += 1;
+        if let Some((offset, album)) = photo_list {
+            // Publish busy before another click (or another client clone) can
+            // enqueue a second navigation request.
+            state.photo_busy = true;
+            state.photo_error = None;
+            if state.photo_album != album || state.photo_offset != offset {
+                state.photo_status = Some("Loading Photos…".into());
+                state.photo_succeeded = false;
+                state.photo_delete_status = None;
+            }
+            state.revision = state.revision.wrapping_add(1);
+        }
         true
     }
     pub fn reserved_by_other(&self) -> bool {
@@ -307,6 +340,52 @@ mod tests {
         assert!(client.snapshot_if_changed(changed.revision).is_none());
     }
     #[test]
+    fn album_navigation_is_single_flight_across_client_clones() {
+        let state = Arc::new(Mutex::new(FileTransferSnapshot::default()));
+        let (commands, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let client = FileTransferClient {
+            state: state.clone(),
+            commands,
+            owner: None,
+        };
+        let other = client.clone();
+        assert!(client.send(FileCommand::PhotoList {
+            offset: 0,
+            album: Some("a".into())
+        }));
+        assert!(client.snapshot().photo_busy);
+        for _ in 0..1000 {
+            assert!(!other.send(FileCommand::PhotoList {
+                offset: 0,
+                album: Some("b".into())
+            }));
+        }
+        assert!(receiver.try_recv().is_ok());
+        assert!(
+            receiver.try_recv().is_err(),
+            "no queued navigation after the first request"
+        );
+        update(&state, |state| {
+            state.photo_busy = false;
+            state.pending_commands = 0;
+        });
+        assert!(other.send(FileCommand::PhotoList {
+            offset: 0,
+            album: Some("b".into())
+        }));
+        drop(receiver);
+        update(&state, |state| state.photo_busy = false);
+        assert!(!other.send(FileCommand::PhotoList {
+            offset: 0,
+            album: None
+        }));
+        assert!(
+            !client.snapshot().photo_busy,
+            "failed submission cannot leave navigation disabled"
+        );
+    }
+
+    #[test]
     fn reservation_blocks_other_clients_and_lives_through_clones() {
         let state = Arc::new(Mutex::new(FileTransferSnapshot::default()));
         let (commands, mut receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -332,7 +411,10 @@ mod tests {
         drop(clone);
         assert!(!client.reserved_by_other());
         assert!(client.try_reserve().is_none()); // queued commands retain the idle gate
-        state.lock().unwrap().pending_commands = 0;
+        update(&state, |state| {
+            state.pending_commands = 0;
+            state.photo_busy = false;
+        });
         assert!(client.try_reserve().is_some());
     }
 }

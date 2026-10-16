@@ -6,7 +6,7 @@ enum Feedback {
     #[default]
     Idle,
     Sending,
-    Sent,
+    Sent(std::time::Instant),
     Failed,
 }
 
@@ -26,6 +26,13 @@ pub(super) struct ClipboardTransfer {
     outbound_echo: Option<(u64, std::time::Instant)>,
 }
 impl ClipboardTransfer {
+    pub(super) fn expire_feedback(&mut self, now: std::time::Instant) -> bool {
+        if matches!(self.feedback, Feedback::Sent(deadline) if now >= deadline) {
+            self.feedback = Feedback::Idle;
+            return true;
+        }
+        false
+    }
     pub(super) fn busy(&self) -> bool {
         self.pending.is_some()
     }
@@ -33,7 +40,7 @@ impl ClipboardTransfer {
         match self.feedback {
             Feedback::Idle => theme::ink(cx),
             Feedback::Sending => theme::accent(cx),
-            Feedback::Sent => theme::success(cx),
+            Feedback::Sent(_) => theme::success(cx),
             Feedback::Failed => theme::danger(cx),
         }
     }
@@ -145,7 +152,8 @@ impl SessionView {
         {
             let pending = self.clipboard_transfer.pending.take().unwrap();
             clear_sent_clipboard(&pending, cx);
-            self.clipboard_transfer.feedback = Feedback::Sent;
+            self.clipboard_transfer.feedback =
+                Feedback::Sent(std::time::Instant::now() + Duration::from_secs(3));
         }
         // Keyboard paste is dispatched during rendering, where focus and current modifiers
         // can be checked. A write acknowledgement alone does not establish text insertion.
@@ -203,7 +211,8 @@ impl SessionView {
         );
         self.send_keys(events);
         clear_sent_clipboard(&pending, cx);
-        self.clipboard_transfer.feedback = Feedback::Sent;
+        self.clipboard_transfer.feedback =
+            Feedback::Sent(std::time::Instant::now() + Duration::from_secs(3));
         self.status = "剪贴板已发送".into();
     }
 }

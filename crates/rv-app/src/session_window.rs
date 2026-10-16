@@ -531,7 +531,9 @@ impl SessionView {
         // events. Stalling it delays key-ups, which the remote turns into
         // auto-repeat.
         let mut frame = None;
-        let mut changed = false;
+        let mut changed = self
+            .clipboard_transfer
+            .expire_feedback(std::time::Instant::now());
         for ev in self.handle.drain() {
             if self.phase == Phase::Disconnecting
                 && !matches!(&ev, SessionEvent::Error(_) | SessionEvent::Disconnected)

@@ -117,26 +117,60 @@ async fn next(events: &mut mpsc::Receiver<FunctionEvent>) -> FunctionEvent {
 #[tokio::test]
 async fn resume_authorization_failure_keeps_unknown_and_allows_explicit_requery() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let client = crate::phone_http::PhoneHttpClient::new("127.0.0.1", listener.local_addr().unwrap().port(), "test".into()).unwrap();
+    let client = crate::phone_http::PhoneHttpClient::new(
+        "127.0.0.1",
+        listener.local_addr().unwrap().port(),
+        "test".into(),
+    )
+    .unwrap();
     let (commands, rx) = mpsc::channel(8);
     let (events, mut states) = mpsc::channel(8);
     let actor = tokio::spawn(worker(client, rx, events));
-    assert!(matches!(next(&mut states).await, FunctionEvent::Available(true)));
-    commands.send(FunctionCommand::Resume { task: 32, operation_id: "original".into() }).await.unwrap();
+    assert!(matches!(
+        next(&mut states).await,
+        FunctionEvent::Available(true)
+    ));
+    commands
+        .send(FunctionCommand::Resume {
+            task: 32,
+            operation_id: "original".into(),
+        })
+        .await
+        .unwrap();
     let (socket, _) = listener.accept().await.unwrap();
     let mut socket = TestStream::new(socket);
     assert_eq!(packet(&mut socket).await.0, 33);
     reply(&mut socket, json!({"error":"unauthorized"})).await;
-    assert!(matches!(next(&mut states).await, FunctionEvent::Uncertain(_)));
-    assert!(tokio::time::timeout(Duration::from_millis(1100), socket.packets.recv()).await.is_err(), "failed query must not retry in background");
-    commands.send(FunctionCommand::Resume { task: 32, operation_id: "original".into() }).await.unwrap();
+    assert!(matches!(
+        next(&mut states).await,
+        FunctionEvent::Uncertain(_)
+    ));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1100), socket.packets.recv())
+            .await
+            .is_err(),
+        "failed query must not retry in background"
+    );
+    commands
+        .send(FunctionCommand::Resume {
+            task: 32,
+            operation_id: "original".into(),
+        })
+        .await
+        .unwrap();
     assert_eq!(packet(&mut socket).await.0, 33);
     reply(&mut socket, json!({"ok":true})).await;
     let (task, query) = packet(&mut socket).await;
     assert_eq!(task, 32);
     assert_eq!(query, json!({"action":"result","operation_id":"original"}));
-    reply(&mut socket, json!({"operation_id":"original","status":"completed","result":{}})).await;
-    assert!(matches!(next(&mut states).await, FunctionEvent::State { task:32, record } if record["status"] == "completed"));
+    reply(
+        &mut socket,
+        json!({"operation_id":"original","status":"completed","result":{}}),
+    )
+    .await;
+    assert!(
+        matches!(next(&mut states).await, FunctionEvent::State { task:32, record } if record["status"] == "completed")
+    );
     actor.abort();
 }
 
@@ -151,12 +185,14 @@ async fn automatic_code_rejection_is_reported() {
 #[tokio::test]
 async fn challenge_retries_code_link_until_code_arrives() {
     tokio::time::timeout(Duration::from_secs(12), challenge_flow(false, true, false))
-        .await.unwrap();
+        .await
+        .unwrap();
 }
 #[tokio::test]
 async fn challenge_manual_fetch_bypasses_retry_delay() {
     tokio::time::timeout(Duration::from_secs(12), challenge_flow(false, true, true))
-        .await.unwrap();
+        .await
+        .unwrap();
 }
 async fn challenge_flow(reject: bool, delayed_code: bool, manual_retry: bool) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -171,11 +207,18 @@ async fn challenge_flow(reject: bool, delayed_code: bool, manual_retry: bool) {
             let mut request = [0; 4096];
             use tokio::io::AsyncReadExt;
             stream.read(&mut request).await.unwrap();
-            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}").await.unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+                .await
+                .unwrap();
         }
         let (mut stream, _) = tokio::time::timeout(
-            Duration::from_secs(if manual_retry { 2 } else { 6 }), http.accept(),
-        ).await.unwrap().unwrap();
+            Duration::from_secs(if manual_retry { 2 } else { 6 }),
+            http.accept(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         let mut buffer = [0; 4096];
         use tokio::io::AsyncReadExt;
         let count = stream.read(&mut buffer).await.unwrap();
@@ -276,10 +319,14 @@ async fn challenge_flow(reject: bool, delayed_code: bool, manual_retry: bool) {
                 commands.send(FunctionCommand::FetchCode).await.unwrap();
             }
             FunctionEvent::CodeFetched(code) if manual_retry => {
-                commands.send(FunctionCommand::SubmitCode {
-                    operation_id: "operation-1".into(),
-                    challenge_id: "challenge-1".into(), code,
-                }).await.unwrap();
+                commands
+                    .send(FunctionCommand::SubmitCode {
+                        operation_id: "operation-1".into(),
+                        challenge_id: "challenge-1".into(),
+                        code,
+                    })
+                    .await
+                    .unwrap();
             }
             FunctionEvent::Error(e) if reject => {
                 assert!(e.contains("code_rejected"));
@@ -368,7 +415,7 @@ async fn resumed_worker_requires_query_before_code_submission() {
 }
 
 #[test]
-fn native_unknown_and_partial_shapes_remain_uncertain() {
+fn native_unknown_is_distinct_from_a_finished_partial_failure() {
     assert!(uncertain_result(
         31,
         &json!({"error":{"domain":"org.trollvnc.apple","code":6}})
@@ -377,13 +424,17 @@ fn native_unknown_and_partial_shapes_remain_uncertain() {
         31,
         &json!({"error":{"domain":"Accounts","code":6}})
     ));
-    assert!(uncertain_result(
+    assert!(!uncertain_result(
         32,
         &json!({"error":{"domain":"TVAppStateServices","code":3}})
     ));
+    assert!(!uncertain_result(
+        32,
+        &json!({"status":"completed","progress":{"phase":"restore","stage":"copy"},"error":{"domain":"TVAppStateServices","code":2,"state_may_be_partial":true}})
+    ));
     assert!(uncertain_result(
         32,
-        &json!({"error":{"state_may_be_partial":true}})
+        &json!({"status":"completed","error":{"domain":"TVAppStateServices","code":4,"state_may_be_partial":true}})
     ));
     assert!(uncertain_result(
         31,
@@ -593,8 +644,14 @@ async fn query_followup_rechecks_bound_account_before_exactly_one_mutation() {
         let (commands, rx) = mpsc::channel(8);
         let (events, mut states) = mpsc::channel(32);
         let actor = tokio::spawn(worker(
-            crate::phone_http::PhoneHttpClient::new("127.0.0.1", listener.local_addr().unwrap().port(), "a".repeat(64)).unwrap(),
-            rx, events,
+            crate::phone_http::PhoneHttpClient::new(
+                "127.0.0.1",
+                listener.local_addr().unwrap().port(),
+                "a".repeat(64),
+            )
+            .unwrap(),
+            rx,
+            events,
         ));
         let peer = tokio::spawn(async move {
             let (socket, _) = listener.accept().await.unwrap();
@@ -602,30 +659,61 @@ async fn query_followup_rechecks_bound_account_before_exactly_one_mutation() {
             assert_eq!(packet(&mut socket).await.0, 33);
             reply(&mut socket, json!({"version":1,"op":0,"id":0,"status":0})).await;
             assert_eq!(packet(&mut socket).await.1["method"], "queryAccountState");
-            let current = if matching { "original@example.test" } else { "changed@example.test" };
-            reply(&mut socket, json!({"operation_id":"read","status":"completed","result":{
-                "icloud":{"status":"signed_in","account":{"apple_id":current}},
-                "identity":{"status":"signed_in","account":{"apple_id":current}}
-            }})).await;
+            let current = if matching {
+                "original@example.test"
+            } else {
+                "changed@example.test"
+            };
+            reply(
+                &mut socket,
+                json!({"operation_id":"read","status":"completed","result":{
+                    "icloud":{"status":"signed_in","account":{"apple_id":current}},
+                    "identity":{"status":"signed_in","account":{"apple_id":current}}
+                }}),
+            )
+            .await;
             if matching {
                 socket = reconnect(&listener, socket).await;
-                assert_eq!(packet(&mut socket).await, (31, json!({"action":"invoke","method":"stopUsingAppleID",
-                    "params":{"apple_id":"original@example.test","bundle_id":"fr.vinted"}})));
+                assert_eq!(
+                    packet(&mut socket).await,
+                    (
+                        31,
+                        json!({"action":"invoke","method":"stopUsingAppleID",
+                    "params":{"apple_id":"original@example.test","bundle_id":"fr.vinted"}})
+                    )
+                );
                 reply(&mut socket, json!({"operation_id":"stop","method":"stopUsingAppleID","status":"completed","result":{"outcome":"succeeded"}})).await;
             }
             let mut line = String::new();
             assert_eq!(socket.read_line(&mut line).await.unwrap(), 0);
-            assert!(tokio::time::timeout(Duration::from_millis(300), listener.accept()).await.is_err(), "unexpected mutation or replay");
+            assert!(
+                tokio::time::timeout(Duration::from_millis(300), listener.accept())
+                    .await
+                    .is_err(),
+                "unexpected mutation or replay"
+            );
         });
-        assert!(matches!(next(&mut states).await, FunctionEvent::Available(true)));
-        commands.send(FunctionCommand::InvokeForAccount {
-            id:"authorization-stop".into(), text:"App=fr.vinted".into(), apple_id:"original@example.test".into(),
-        }).await.unwrap();
+        assert!(matches!(
+            next(&mut states).await,
+            FunctionEvent::Available(true)
+        ));
+        commands
+            .send(FunctionCommand::InvokeForAccount {
+                id: "authorization-stop".into(),
+                text: "App=fr.vinted".into(),
+                apple_id: "original@example.test".into(),
+            })
+            .await
+            .unwrap();
         let event = next(&mut states).await;
         if matching {
-            assert!(matches!(event, FunctionEvent::State {record,..} if record["operation_id"] == "stop"));
+            assert!(
+                matches!(event, FunctionEvent::State {record,..} if record["operation_id"] == "stop")
+            );
         } else {
-            assert!(matches!(event, FunctionEvent::Error(message) if message.contains("账户已改变")));
+            assert!(
+                matches!(event, FunctionEvent::Error(message) if message.contains("账户已改变"))
+            );
         }
         peer.await.unwrap();
         actor.abort();
@@ -1038,8 +1126,11 @@ async fn independent_function_finishes_while_another_socket_waits() {
 async fn cloud_login_resolves_fresh_store_account_before_invoking() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let client = crate::phone_http::PhoneHttpClient::new(
-        "127.0.0.1", listener.local_addr().unwrap().port(), "a".repeat(64),
-    ).unwrap();
+        "127.0.0.1",
+        listener.local_addr().unwrap().port(),
+        "a".repeat(64),
+    )
+    .unwrap();
     let (commands, rx) = mpsc::channel(8);
     let (events, mut states) = mpsc::channel(32);
     let actor = tokio::spawn(worker(client, rx, events));
@@ -1059,26 +1150,46 @@ async fn cloud_login_resolves_fresh_store_account_before_invoking() {
         socket = reconnect(&listener, socket).await;
         let (_, invoke) = packet(&mut socket).await;
         assert_eq!(invoke["method"], "enableICloud");
-        assert_eq!(invoke["params"], json!({
-            "apple_id":"fresh@test", "password":"test-password", "device_passcode":"001234"
-        }));
-        reply(&mut socket, json!({
-            "operation_id":"cloud-login", "method":"enableICloud", "status":"completed",
-            "result":{"outcome":"succeeded"}
-        })).await;
+        assert_eq!(
+            invoke["params"],
+            json!({
+                "apple_id":"fresh@test", "password":"test-password", "device_passcode":"001234"
+            })
+        );
+        reply(
+            &mut socket,
+            json!({
+                "operation_id":"cloud-login", "method":"enableICloud", "status":"completed",
+                "result":{"outcome":"succeeded"}
+            }),
+        )
+        .await;
     });
-    assert!(matches!(next(&mut states).await, FunctionEvent::Available(true)));
+    assert!(matches!(
+        next(&mut states).await,
+        FunctionEvent::Available(true)
+    ));
     // Missing local configuration must not even start a phone mutation.
-    commands.send(FunctionCommand::Invoke {
-        id:"cloud-login".into(), text:"test-password".into(),
-    }).await.unwrap();
-    assert!(matches!(next(&mut states).await, FunctionEvent::Error(error) if error.contains("锁屏密码")));
-    commands.send(FunctionCommand::Invoke {
-        id:"cloud-login".into(), text:"密码=test-password\n设备密码=001234".into(),
-    }).await.unwrap();
+    commands
+        .send(FunctionCommand::Invoke {
+            id: "cloud-login".into(),
+            text: "test-password".into(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(next(&mut states).await, FunctionEvent::Error(error) if error.contains("锁屏密码"))
+    );
+    commands
+        .send(FunctionCommand::Invoke {
+            id: "cloud-login".into(),
+            text: "密码=test-password\n设备密码=001234".into(),
+        })
+        .await
+        .unwrap();
     loop {
         match next(&mut states).await {
-            FunctionEvent::State {record, ..} if record["status"] == "completed" => break,
+            FunctionEvent::State { record, .. } if record["status"] == "completed" => break,
             FunctionEvent::Error(error) | FunctionEvent::Uncertain(error) => panic!("{error}"),
             _ => {}
         }

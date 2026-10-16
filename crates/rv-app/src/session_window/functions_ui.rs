@@ -2,8 +2,9 @@ use super::*;
 use crate::assets::FunctionIcon;
 use gpui_component::{
     WindowExt,
+    alert::Alert,
     input::{Editor, EditorState, Textarea, TextareaState},
-    notification::{Notification, NotificationDelivery},
+    notification::Notification,
 };
 use rv_session::{
     FunctionCommand, FunctionEvent,
@@ -22,6 +23,7 @@ struct FunctionPanel {
     email_rebind_operation: Option<String>,
     busy: bool,
     uncertain: bool,
+    failed: bool,
     target_app: Option<(String, String)>,
     expected_account: Option<String>,
     text: Entity<TextareaState>,
@@ -45,7 +47,7 @@ struct FunctionPanel {
 }
 impl FunctionPanel {
     /// Completed history is display-only; a new menu click starts a fresh operation.
-    /// Live receipts and challenges remain resumable. Ended login attempts become notification history.
+    /// Live receipts and challenges remain resumable. Ended attempts retain their final state until the user leaves.
     fn resumable(&self) -> bool {
         self.busy
             || self.uncertain
@@ -59,24 +61,17 @@ impl FunctionPanel {
             .result
             .as_ref()
             .is_some_and(|record| record["status"] == "completed");
+        if self.selected.is_some_and(|spec| spec.task == 32)
+            && !self.busy
+            && (terminal || self.uncertain)
+        {
+            return true;
+        }
         if self.selected.is_some_and(is_login_action) && terminal {
             return !self.busy && self.cloud_preparation.is_none() && self.challenge.is_none();
         }
         !self.resumable() && terminal
     }
-    fn clear_login_result(&mut self) {
-        self.busy = false;
-        self.uncertain = false;
-        self.operation = None;
-        self.challenge = None;
-        self.message = "".into();
-        self.result = None;
-        self.result_open = false;
-        self.verification_submitted = false;
-        self.verification_received = false;
-        self.pending_verification_code = None;
-    }
-
     fn disconnected(&mut self) {
         if self.cloud_preparation.take().is_some() {
             self.busy = false;
@@ -101,6 +96,7 @@ pub(super) struct FunctionUi {
     next_cloud_preparation: u64,
     pending_results: Vec<(&'static OperationSpec, serde_json::Value)>,
     notified_results: std::collections::HashSet<String>,
+    notification_close_task: Option<Task<()>>,
     pub open: bool,
     editor_hidden: bool,
     email_rebinding: bool,
@@ -111,6 +107,7 @@ pub(super) struct FunctionUi {
     account_error: Option<String>,
     busy: bool,
     uncertain: bool,
+    failed: bool,
     target_app: Option<(String, String)>,
     expected_account: Option<String>,
     environment: EnvironmentUi,
@@ -136,13 +133,12 @@ pub(super) struct FunctionUi {
 }
 impl FunctionUi {
     pub(in crate::session_window) fn app_state_unsettled(&self) -> bool {
-        let active =
-            self.selected.is_some_and(|spec| spec.task == 32) && (self.busy || self.uncertain);
+        let active = self.selected.is_some_and(|spec| spec.task == 32) && self.busy;
         active
-            || self.panels.values().any(|panel| {
-                panel.selected.is_some_and(|spec| spec.task == 32)
-                    && (panel.busy || panel.uncertain)
-            })
+            || self
+                .panels
+                .values()
+                .any(|panel| panel.selected.is_some_and(|spec| spec.task == 32) && panel.busy)
     }
     fn panel_key(&self) -> Option<&'static str> {
         self.selected.map(|s| {
@@ -178,6 +174,7 @@ impl FunctionUi {
             email_rebind_operation: self.email_rebind_operation.clone(),
             busy: self.busy.clone(),
             uncertain: self.uncertain.clone(),
+            failed: self.failed,
             target_app: self.target_app.clone(),
             expected_account: self.expected_account.clone(),
             text: self.text.clone(),
@@ -206,6 +203,7 @@ impl FunctionUi {
         self.email_rebind_operation = p.email_rebind_operation;
         self.busy = p.busy;
         self.uncertain = p.uncertain;
+        self.failed = p.failed;
         self.target_app = p.target_app;
         self.expected_account = p.expected_account;
         self.text = p.text;
@@ -255,6 +253,7 @@ impl FunctionUi {
             next_cloud_preparation: 0,
             pending_results: Vec::new(),
             notified_results: Default::default(),
+            notification_close_task: None,
             open: false,
             editor_hidden: false,
             email_rebinding: false,
@@ -265,6 +264,7 @@ impl FunctionUi {
             account_error: None,
             busy: false,
             uncertain: false,
+            failed: false,
             target_app: None,
             expected_account: None,
             environment: EnvironmentUi::new(environment_apps),
@@ -603,10 +603,12 @@ impl SessionView {
                 }
             }
             FunctionEvent::Progress(message) => {
+                self.functions.failed = false;
                 self.functions.busy = true;
                 self.functions.message = message.into();
             }
             FunctionEvent::Uncertain(message) => {
+                self.functions.failed = false;
                 self.environment_run_error(&message, true);
                 if self.functions.environment.open
                     && self
@@ -621,6 +623,7 @@ impl SessionView {
                 self.functions.message = message.into();
             }
             FunctionEvent::Error(message) => {
+                self.functions.failed = true;
                 self.environment_run_error(&message, false);
                 if self.functions.environment.open
                     && self
@@ -650,6 +653,8 @@ impl SessionView {
                     .filter(|challenge| !challenge.is_empty() && challenge.len() <= 128)
                     .map(str::to_owned);
                 self.functions.result = Some(record.clone());
+                self.functions.failed =
+                    record["status"] == "completed" && record.get("error").is_some();
                 self.functions.message = match record["status"].as_str() {
                     Some("requires_verification_code") => {
                         self.functions.busy = false;
@@ -661,11 +666,7 @@ impl SessionView {
                     }
                     Some("completed") => {
                         self.functions.busy = false;
-                        self.functions.result_open = !self
-                            .functions
-                            .selected
-                            .is_some_and(|spec| spec.task == 31 && is_query(spec))
-                            && record["result"]["outcome"] != "requires_email_verification";
+                        self.functions.result_open = false;
                         let unknown = rv_session::functions::uncertain_result(task, &record);
                         self.functions.email_rebinding = false;
                         self.functions.uncertain = unknown;
@@ -688,7 +689,14 @@ impl SessionView {
                             self.functions.email_needs_resume = false;
                         }
                         if unknown {
-                            "结果未知；请查询原操作，不要重复执行".into()
+                            if record["error"]["message"]
+                                .as_str()
+                                .is_some_and(|message| !message.trim().is_empty())
+                            {
+                                format!("结果待确认：{}", function_error_message(&record)).into()
+                            } else {
+                                "结果待确认".into()
+                            }
                         } else if record.get("error").is_some() {
                             function_error_message(&record).into()
                         } else if record["result"]["outcome"] == "requires_email_verification" {
@@ -783,105 +791,78 @@ impl SessionView {
         cx: &mut Context<Self>,
     ) {
         for (spec, record) in std::mem::take(&mut self.functions.pending_results) {
-            let operation_id = record["operation_id"]
-                .as_str()
-                .unwrap_or_default()
-                .to_owned();
-            let matches_record = |panel: &FunctionPanel| {
-                !panel.busy
-                    && panel
-                        .result
-                        .as_ref()
-                        .is_some_and(|result| result["operation_id"] == operation_id)
-            };
-            if self.functions.panel_key() == Some(spec.id) {
-                let mut panel = self.functions.snapshot();
-                if matches_record(&panel) {
-                    panel.clear_login_result();
-                    self.functions.restore(panel);
-                    if self.functions.open
-                        && !self.functions.editor_hidden
-                        && !window.has_active_dialog(cx)
-                    {
-                        if spec.id == "cloud-login" {
-                            self.functions
-                                .cloud_password
-                                .update(cx, |input, cx| input.focus(window, cx));
-                        } else if spec.id == "store-login" {
-                            self.functions
-                                .text
-                                .update(cx, |input, cx| input.focus(window, cx));
-                        }
-                    }
-                }
-            } else if let Some(panel) = self.functions.panels.get_mut(spec.id) {
-                if matches_record(panel) {
-                    panel.clear_login_result();
-                }
-            }
             // Notify owns an immutable historical result, independent of subsequent requests.
-            window.defer(cx, move |window, cx| {
+            {
                 let unknown = rv_session::functions::uncertain_result(31, &record);
                 let mut note = if unknown {
-                    Notification::info("操作已结束，结果待确认")
+                    Notification::info(
+                        if record["error"]["message"]
+                            .as_str()
+                            .is_some_and(|message| !message.trim().is_empty())
+                        {
+                            format!(
+                                "{}：结果待确认，{}",
+                                spec.title,
+                                function_error_message(&record)
+                            )
+                        } else {
+                            format!("{}：结果待确认", spec.title)
+                        },
+                    )
                 } else if record.get("error").is_some() {
-                    Notification::error(function_error_message(&record))
+                    Notification::error(format!(
+                        "{}：{}",
+                        spec.title,
+                        function_error_message(&record)
+                    ))
                 } else {
                     Notification::success(result_summary(&record).0)
                 };
                 let response = function_response_text(&record);
-                note = note
-                    .title(spec.title)
-                    .id1::<FunctionUi>(operation_id)
-                    .placement(Anchor::BottomRight)
-                    .delivery(NotificationDelivery::InApp)
-                    .autohide(false)
-                    .action(move |_, _, _| {
-                        let response = response.clone();
-                        Button::new("function-notification-details")
-                            .debug_selector(|| "function-notification-details".into())
-                            .ghost()
-                            .icon(IconName::File)
-                            .accessibility_label("原始结果")
-                            .on_click(move |_, window, cx| {
-                                let editor = cx.new(|cx| {
-                                    EditorState::new(window, cx)
-                                        .language("json")
-                                        .soft_wrap(false)
-                                        .default_value(response.clone())
-                                });
-                                let copy = response.clone();
-                                window.open_dialog(cx, move |dialog, _, _| {
-                                    let copy = copy.clone();
-                                    dialog
-                                        .title(spec.title)
-                                        .child(
-                                            div()
-                                                .debug_selector(|| {
-                                                    "function-notification-result".into()
-                                                })
-                                                .child(
-                                                    Editor::new(&editor).readonly(true).h(px(320.)),
-                                                ),
-                                        )
-                                        .footer(
-                                            gpui_component::dialog::DialogFooter::new().child(
-                                                Button::new("function-notification-copy")
-                                                    .ghost()
-                                                    .icon(IconName::Copy)
-                                                    .accessibility_label("复制原始结果")
-                                                    .on_click(move |_, _, cx| {
-                                                        cx.write_to_clipboard(
-                                                            ClipboardItem::new_string(copy.clone()),
-                                                        );
-                                                    }),
-                                            ),
-                                        )
-                                });
-                            })
-                    });
-                window.push_notification(note, cx);
-            });
+                note = note.action(move |_, _, _| {
+                    let response = response.clone();
+                    Button::new("function-notification-details")
+                        .debug_selector(|| "function-notification-details".into())
+                        .ghost()
+                        .icon(IconName::File)
+                        .accessibility_label("原始结果")
+                        .on_click(move |_, window, cx| {
+                            let editor = cx.new(|cx| {
+                                EditorState::new(window, cx)
+                                    .language("json")
+                                    .soft_wrap(false)
+                                    .default_value(response.clone())
+                            });
+                            let copy = response.clone();
+                            window.open_dialog(cx, move |dialog, _, _| {
+                                let copy = copy.clone();
+                                dialog
+                                    .title(spec.title)
+                                    .child(
+                                        div()
+                                            .debug_selector(|| {
+                                                "function-notification-result".into()
+                                            })
+                                            .child(Editor::new(&editor).readonly(true).h(px(320.))),
+                                    )
+                                    .footer(
+                                        gpui_component::dialog::DialogFooter::new().child(
+                                            Button::new("function-notification-copy")
+                                                .ghost()
+                                                .icon(IconName::Copy)
+                                                .accessibility_label("复制原始结果")
+                                                .on_click(move |_, _, cx| {
+                                                    cx.write_to_clipboard(
+                                                        ClipboardItem::new_string(copy.clone()),
+                                                    );
+                                                }),
+                                        ),
+                                    )
+                            });
+                        })
+                });
+                self.functions.notification_close_task = Some(crate::ui::notify(note, window, cx));
+            }
         }
     }
 
@@ -1050,7 +1031,7 @@ impl SessionView {
         let Some(spec) = self.functions.selected else {
             return;
         };
-        if self.functions.uncertain && !is_query(spec) {
+        if self.functions.uncertain && spec.task != 32 && !is_query(spec) {
             return;
         }
         if !account_action_visible(spec.id, self.functions.account_state.as_ref()) {
@@ -1599,13 +1580,9 @@ impl SessionView {
             })
             .when_some(selected, |panel, spec| {
                 panel.child(
-                    v_flex()
-                        .gap_1()
+                    crate::ui::tool_section()
                         .child(
-                            h_flex()
-                                .items_center()
-                                .gap_1()
-                                .pb_1()
+                            crate::ui::tool_actions()
                                 .child(div().flex_1().min_w_0().text_sm().font_semibold().child(
                                     if spec.id == "apple-query" {
                                         "账户资料"
@@ -1695,9 +1672,10 @@ impl SessionView {
                                     )
                                 }),
                         )
-                        .when(spec.task == 31 && spec.id != "apple-query", |panel| {
-                            panel.child(self.render_apple_operation_context(spec, cx))
-                        })
+                        .when(
+                            spec.task == 31 && spec.id != "apple-query" && !operation_done,
+                            |panel| panel.child(self.render_apple_operation_context(spec, cx)),
+                        )
                         .when(
                             matches!(spec.id, "email-add" | "email-verify")
                                 && self.functions.uncertain,
@@ -1751,9 +1729,8 @@ impl SessionView {
                                 && matches!(spec.id, "apple-logout" | "cloud-logout"),
                             |panel| {
                                 panel.child(
-                                    h_flex()
+                                    crate::ui::tool_actions()
                                         .justify_between()
-                                        .gap_2()
                                         .child(
                                             div()
                                                 .text_xs()
@@ -1810,6 +1787,8 @@ impl SessionView {
                                 if spec.id == "email-verify" {
                                     return panel.child(
                                         div()
+                                            .w_full()
+                                            .min_w_0()
                                             .debug_selector(|| "function-input-area".into())
                                             .child(
                                                 Input::new(&self.functions.verification_text)
@@ -1823,6 +1802,8 @@ impl SessionView {
                                 {
                                     return panel.child(
                                         div()
+                                            .w_full()
+                                            .min_w_0()
                                             .debug_selector(|| "function-input-area".into())
                                             .child(
                                                 Input::new(&self.functions.cloud_password)
@@ -1831,11 +1812,15 @@ impl SessionView {
                                     );
                                 }
                                 panel.child(
-                                    div().debug_selector(|| "function-input-area".into()).child(
-                                        Textarea::new(&self.functions.text)
-                                            .readonly(self.functions.busy)
-                                            .h(px(100.)),
-                                    ),
+                                    div()
+                                        .w_full()
+                                        .min_w_0()
+                                        .debug_selector(|| "function-input-area".into())
+                                        .child(
+                                            Textarea::new(&self.functions.text)
+                                                .readonly(self.functions.busy)
+                                                .h(px(100.)),
+                                        ),
                                 )
                             },
                         )
@@ -1867,9 +1852,8 @@ impl SessionView {
                                 && !self.functions.verification_submitted,
                             |panel| {
                                 panel.child(
-                                    h_flex()
+                                    crate::ui::tool_actions()
                                         .justify_end()
-                                        .gap_1()
                                         .when(
                                             self.function_has_text(spec)
                                                 && !locked
@@ -2020,10 +2004,8 @@ impl SessionView {
                         || self.functions.verification_submitted),
                 |panel| {
                     panel.child(
-                        h_flex()
+                        crate::ui::tool_actions()
                             .debug_selector(|| "function-verification-row".into())
-                            .items_center()
-                            .gap_1()
                             .child(
                                 Input::new(&self.functions.verification_text)
                                     .flex_1()
@@ -2115,6 +2097,8 @@ impl SessionView {
                 |panel| {
                     panel.child(
                         div()
+                            .w_full()
+                            .min_w_0()
                             .debug_selector(|| "function-operation-message".into())
                             .child(function_loading(
                                 "function-query-loading",
@@ -2130,61 +2114,50 @@ impl SessionView {
                                     self.functions.message.clone()
                                 },
                                 cx,
-                            ))
-                            .when(selected.is_some_and(|spec| spec.task == 32), |body| {
-                                let progress = self
-                                    .functions
-                                    .result
-                                    .as_ref()
-                                    .map(|record| &record["progress"]);
-                                body.child(crate::ui::operation_progress(
-                                    "function-app-progress",
-                                    progress,
-                                ))
-                            }),
+                            )),
                     )
                 },
             )
             .when(
                 !completed && !self.functions.message.is_empty() && !self.functions.busy,
                 |panel| {
+                    let message = if self.functions.uncertain {
+                        if self.functions.message.is_empty() {
+                            SharedString::from("结果待确认")
+                        } else {
+                            self.functions.message.clone()
+                        }
+                    } else {
+                        self.functions.message.clone()
+                    };
+                    let alert = if self.functions.uncertain {
+                        Alert::warning("function-operation-status", message)
+                    } else if self.functions.failed {
+                        Alert::error("function-operation-status", message)
+                    } else {
+                        Alert::info("function-operation-status", message)
+                    };
                     panel.child(
                         div()
+                            .w_full()
+                            .min_w_0()
                             .debug_selector(|| "function-operation-message".into())
-                            .text_xs()
-                            .text_color(theme::muted(cx))
-                            .child(if self.functions.uncertain {
-                                SharedString::from(
-                                    "结果待确认。请查询原操作结果；也可返回菜单读取账户资料核实。",
-                                )
-                            } else {
-                                self.functions.message.clone()
-                            }),
+                            .child(alert),
                     )
                 },
             )
             .when(completed && !query, |panel| {
                 let record = self.functions.result.as_ref().unwrap();
                 let (title, detail) = result_summary(record);
+                let alert = if detail.is_empty() {
+                    Alert::success("function-result-status", title)
+                } else {
+                    Alert::success("function-result-status", detail).title(title)
+                };
                 panel.child(
-                    h_flex()
-                        .id("function-result-summary")
+                    div()
                         .debug_selector(|| "function-result-summary".into())
-                        .gap_2()
-                        .py_1()
-                        .items_start()
-                        .child(Icon::new(IconName::Check).text_color(theme::success(cx)))
-                        .child(
-                            v_flex()
-                                .gap_1()
-                                .flex_1()
-                                .child(div().text_sm().child(title))
-                                .when(!detail.is_empty(), |text| {
-                                    text.child(
-                                        div().text_xs().text_color(theme::muted(cx)).child(detail),
-                                    )
-                                }),
-                        ),
+                        .child(alert),
                 )
             })
             .when(query && completed, |panel| {
@@ -2199,10 +2172,9 @@ impl SessionView {
                         .is_some_and(|record| record["status"] == "completed"),
                 |panel| {
                     panel.child(
-                        h_flex()
+                        crate::ui::tool_actions()
                             .debug_selector(|| "function-result-toolbar".into())
-                            .items_center()
-                            .gap_1()
+                            .justify_end()
                             .child(
                                 Button::new("function-view-result")
                                     .debug_selector(|| "function-view-result".into())
@@ -2220,7 +2192,6 @@ impl SessionView {
                                         cx.notify();
                                     })),
                             )
-                            .child(div().flex_1())
                             .child(
                                 Button::new("function-copy-result")
                                     .ghost()
@@ -2382,6 +2353,7 @@ fn operation_succeeded(spec: &OperationSpec, record: &serde_json::Value) -> bool
 fn result_summary(record: &serde_json::Value) -> (String, String) {
     let title = match record["method"].as_str().unwrap_or_default() {
         "signOutICloud" => "已退出 iCloud",
+        "signOutAppStore" => "已退出 App Store",
         "signOutAppleID" => "已退出 Apple 账户",
         "signInAppStore" => "已登录 App Store",
         "enableICloud" => "已登录 iCloud",
@@ -2393,7 +2365,10 @@ fn result_summary(record: &serde_json::Value) -> (String, String) {
         {
             "等待邮箱验证码"
         }
+        "beginAddingContactEmail" => "联系邮箱已添加",
         "verifyContactEmail" => "邮箱已验证",
+        "stopUsingAppleID" => "App 授权已停止",
+        "removeOtherICloudDevices" => "其它设备已移除",
         "queryState"
         | "queryName"
         | "queryEmail"
@@ -2422,8 +2397,15 @@ fn result_summary(record: &serde_json::Value) -> (String, String) {
     (title.into(), detail)
 }
 
-pub(super) fn function_error_message(record: &serde_json::Value) -> &'static str {
-    if record["error"]["domain"] == "org.trollvnc.apple" {
+pub(super) fn function_error_message(record: &serde_json::Value) -> String {
+    if let Some(message) = record["error"]["message"]
+        .as_str()
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+    {
+        return message.to_owned();
+    }
+    let fallback = if record["error"]["domain"] == "org.trollvnc.apple" {
         match record["error"]["code"].as_i64() {
             Some(1) => "手机暂不支持此操作",
             Some(2) => "手机服务权限不足",
@@ -2440,12 +2422,28 @@ pub(super) fn function_error_message(record: &serde_json::Value) -> &'static str
             Some("restore_pending") => "当前环境恢复未完成",
             Some("name_required") => "当前环境尚未命名",
             Some("store_busy") => "备份目录正被占用",
+            Some("operation_busy") => "手机操作仍在执行",
+            Some("file_copy_failed") => match record["error"]["posix_code"].as_i64() {
+                Some(1 | 13) => "恢复文件失败：权限不足",
+                Some(28) => "恢复文件失败：存储空间不足",
+                Some(30) => "恢复文件失败：目标为只读",
+                Some(2) => "恢复文件失败：文件已不存在",
+                Some(5) => "恢复文件失败：读写错误",
+                Some(45 | 102) => "恢复文件失败：文件属性不受支持",
+                _ => "恢复文件失败",
+            },
             Some("archive_unavailable") => "所选备份已不存在",
             Some("invalid_archive") => "备份文件校验失败",
             Some("keychain_failed") => "凭据恢复失败",
             Some("identity_failed") => "设备身份恢复失败",
             _ => match record["error"]["code"].as_i64() {
                 Some(1) => "无法准备手机环境服务",
+                Some(2)
+                    if record["progress"]["phase"] == "restore"
+                        && record["progress"]["stage"] == "copy" =>
+                {
+                    "恢复文件失败"
+                }
                 Some(2) => "手机环境操作失败",
                 Some(3) => "操作结束，但临时文件清理失败",
                 Some(4) => "手机操作结果未确认",
@@ -2454,7 +2452,8 @@ pub(super) fn function_error_message(record: &serde_json::Value) -> &'static str
         }
     } else {
         "操作未完成"
-    }
+    };
+    fallback.to_owned()
 }
 
 fn needs_app(spec: &OperationSpec) -> bool {
@@ -2592,7 +2591,7 @@ mod tests {
         );
     }
     #[gpui::test]
-    fn successful_logout_notifies_and_keeps_a_new_form(cx: &mut TestAppContext) {
+    fn successful_logout_keeps_its_final_state_after_notification(cx: &mut TestAppContext) {
         let (view, cx, _) = setup(cx, false);
         cx.update(|window, cx| {
             view.update(cx, |view, cx| {
@@ -2600,10 +2599,10 @@ mod tests {
             });
             window.draw(cx).clear(cx);
         });
-        assert!(cx.debug_bounds("function-result-summary").is_none());
+        assert!(cx.debug_bounds("function-result-summary").is_some());
         assert!(cx.debug_bounds("function-result-text").is_none());
-        assert!(cx.debug_bounds("function-execute").is_some());
-        assert!(cx.debug_bounds("logout-data-keep").is_some());
+        assert!(cx.debug_bounds("function-execute").is_none());
+        assert!(cx.debug_bounds("logout-data-keep").is_none());
         assert_eq!(
             super::result_summary(
                 &serde_json::json!({"method":"signOutAppleID","result":{"completed_domains":["icloud","identity","media"]}})
@@ -2750,31 +2749,40 @@ mod tests {
             .advance_clock(std::time::Duration::from_millis(500));
         cx.run_until_parked();
         cx.update(|window, cx| window.draw(cx).clear(cx));
-        assert!(cx.debug_bounds("function-input-area").is_some());
-        assert!(cx.debug_bounds("function-execute").is_some());
-        assert!(cx.debug_bounds("function-query-resume").is_none());
+        assert!(cx.debug_bounds("function-input-area").is_none());
+        assert!(cx.debug_bounds("function-execute").is_none());
+        assert!(cx.debug_bounds("function-query-resume").is_some());
         assert!(cx.debug_bounds("function-result-text").is_none());
         assert!(cx.debug_bounds("function-notification-details").is_some());
         assert!(
             peer.commands.try_recv().is_err(),
             "a notification must not replay login"
         );
-        view.update(cx, |view, cx| {
-            assert!(!view.functions.uncertain);
-            assert!(view.functions.result.is_none());
-            assert!(view.functions.operation.is_none());
-            view.functions.next_cloud_preparation += 1;
-            let token = view.functions.next_cloud_preparation;
-            view.functions.cloud_preparation = Some(token);
-            view.functions.busy = true;
-            let spec = view.functions.selected.unwrap();
-            let parsed = super::parse_operation(spec, "new-password").unwrap();
-            view.finish_cloud_login_preparation(
-                token,
-                parsed,
-                Ok(Some(rv_core::UnlockCode::new("001234".into()).unwrap())),
-                cx,
-            );
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                assert!(view.functions.uncertain);
+                assert!(view.functions.result.is_some());
+                let spec = OPERATIONS
+                    .iter()
+                    .find(|spec| spec.id == "cloud-login")
+                    .unwrap();
+                view.select_function(spec, window, cx);
+                assert!(!view.functions.uncertain);
+                assert!(view.functions.result.is_none());
+                assert!(view.functions.operation.is_none());
+                view.functions.next_cloud_preparation += 1;
+                let token = view.functions.next_cloud_preparation;
+                view.functions.cloud_preparation = Some(token);
+                view.functions.busy = true;
+                let spec = view.functions.selected.unwrap();
+                let parsed = super::parse_operation(spec, "new-password").unwrap();
+                view.finish_cloud_login_preparation(
+                    token,
+                    parsed,
+                    Ok(Some(rv_core::UnlockCode::new("001234".into()).unwrap())),
+                    cx,
+                );
+            })
         });
         assert!(matches!(peer.commands.try_recv().map(unscoped).unwrap(),
             rv_session::SessionCommand::Function(FunctionCommand::Invoke {id, text})
@@ -2825,7 +2833,8 @@ mod tests {
         cx.update(|window, cx| window.draw(cx).clear(cx));
         assert!(cx.debug_bounds("function-query-loading").is_none());
         assert!(cx.debug_bounds("function-result-text").is_none());
-        assert!(cx.debug_bounds("function-input-area").is_some());
+        assert!(cx.debug_bounds("function-input-area").is_none());
+        assert!(cx.debug_bounds("function-result-summary").is_some());
     }
 
     #[gpui::test]

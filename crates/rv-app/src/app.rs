@@ -284,7 +284,11 @@ impl AddressBookApp {
                     format!("{} 份备份未提供 IDFV，未生成卡片", report.missing_idfv).into()
             }
             Ok(_) => {}
-            Err(error) => self.status = format!("备份同步失败：{error}").into(),
+            Err(error) => {
+                tracing::error!(device_id = %device, bundle_id = bundle, error = %error,
+                    "Phone backup sync to virtual Apps failed");
+                self.status = format!("备份同步失败：{error}").into();
+            }
         }
         self.reload_home(cx);
     }

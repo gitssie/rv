@@ -248,9 +248,7 @@ impl SessionView {
                     .and_then(|record| record["result"]["apple_id"].as_str())
             })
             .or_else(|| operation_account(spec, self.functions.account_state.as_ref()));
-        v_flex()
-            .gap_1()
-            .min_w_0()
+        crate::ui::tool_section()
             .debug_selector(|| "function-apple-context".into())
             .when(
                 (spec.id != "store-login" || account.is_some()) && spec.id != "apple-query",
@@ -335,8 +333,7 @@ impl SessionView {
         else {
             return div().into_any_element();
         };
-        let mut content = v_flex()
-            .gap_2()
+        let mut content = crate::ui::tool_section()
             .min_w_0()
             .debug_selector(|| "function-query-content".into());
         let followup_account = result["apple_id"].as_str().filter(|id| !id.is_empty());

@@ -446,8 +446,8 @@ impl SessionView {
                                 )
                             } else if auth_failed {
                                 "密码错误，请重新输入".into()
-                            } else if self.recovery.attempt >= 5 {
-                                "自动重连失败，可手动重试".into()
+                            } else if self.recovery.stopped {
+                                "自动重连已停止".into()
                             } else {
                                 "可手动重试".into()
                             }),

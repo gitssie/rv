@@ -23,7 +23,7 @@ pub(crate) fn open(path: &Path) -> Result<Connection, StoreError> {
     db.busy_timeout(Duration::from_secs(5))?;
     db.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")?;
     let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    if version > 3 {
+    if version > 4 {
         return Err(StoreError::Invalid("数据库版本高于当前程序支持版本".into()));
     }
     if version == 0 {
@@ -34,6 +34,9 @@ pub(crate) fn open(path: &Path) -> Result<Connection, StoreError> {
     }
     if version < 3 {
         db.execute_batch(include_str!("workspace/proxies.sql"))?;
+    }
+    if version < 4 {
+        db.execute_batch(include_str!("workspace/dismissed.sql"))?;
     }
     Ok(db)
 }
