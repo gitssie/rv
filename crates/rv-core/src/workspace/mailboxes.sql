@@ -1,0 +1,7 @@
+BEGIN IMMEDIATE;
+CREATE TABLE IF NOT EXISTS mailbox_accounts (
+    id TEXT PRIMARY KEY NOT NULL,
+    encrypted BLOB NOT NULL
+);
+PRAGMA user_version=5;
+COMMIT;

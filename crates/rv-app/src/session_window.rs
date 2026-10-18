@@ -192,6 +192,8 @@ pub struct SessionView {
     file_transfer_opening: bool,
     transfer_folders: Rc<RefCell<TransferFolders>>,
     address_book: Option<WeakEntity<AddressBookApp>>,
+    store_paths: Option<rv_core::StorePaths>,
+    mailbox: mailbox_ui::MailboxUI,
     _password_subscription: Subscription,
     apps: apps_ui::AppToolbar,
     karing: karing_ui::KaringUI,
@@ -291,6 +293,9 @@ impl SessionView {
             app_shortcuts,
             remember_password,
         } = options;
+        let store_paths = app_icon_cache
+            .clone()
+            .or_else(|| rv_core::StorePaths::default_dir().ok());
         let password_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("Enter a new password")
@@ -336,6 +341,7 @@ impl SessionView {
                 .unwrap_or_default()
         });
         let functions = functions_ui::FunctionUi::new(environment_apps, window, cx);
+        let mailbox = mailbox_ui::MailboxUI::new(window, cx);
         Self {
             functions,
             assistant: None,
@@ -386,6 +392,8 @@ impl SessionView {
             file_transfer_opening: false,
             transfer_folders: Rc::new(RefCell::new(transfer_folders)),
             address_book,
+            store_paths,
+            mailbox,
             _password_subscription: password_subscription,
             image_box: Rc::new(Cell::new(Bounds::default())),
             keys: Keyboard::new(),
@@ -543,7 +551,17 @@ impl SessionView {
             changed = true;
             match ev {
                 SessionEvent::Apps(event) => self.apply_app_event(event, cx),
-                SessionEvent::Functions(event) => self.apply_function_event(event, cx),
+                SessionEvent::Functions(event) => {
+                    if matches!(
+                        &event,
+                        rv_session::FunctionEvent::ForOperation { id, .. }
+                            if id == "mailbox-panel"
+                    ) {
+                        self.apply_mailbox_event(event, cx);
+                    } else {
+                        self.apply_function_event(event, cx);
+                    }
+                }
                 SessionEvent::Status(s) => self.status = s.into(),
                 SessionEvent::ControlState(online) => {
                     if !online {
@@ -1081,6 +1099,16 @@ impl SessionView {
             .child(self.render_unlock_button(cx))
             .child(self.render_screenshot(cx))
             .child(self.render_app_toolbar(cx))
+            .child(self.render_mailbox_button(cx))
+            .when(cfg!(target_os = "windows"), |bar| {
+                bar.child(
+                    crate::ui::icon_button("files", IconName::Folder, "文件传输")
+                        .on_click(cx.listener(|this, _, _, cx| this.open_file_transfer(cx)))
+                        .disabled(self.phase != Phase::Connected),
+                )
+                .child(self.render_notification_button(cx))
+                .child(self.render_session_settings(cx))
+            })
             .child(
                 crate::ui::icon_button("clip", IconName::Copy, "发送剪贴板")
                     .on_click(cx.listener(|this, _, _, cx| {
@@ -1603,16 +1631,24 @@ impl Render for SessionView {
                             .items_center()
                             .child(div().text_sm().text_ellipsis().child(self.title.clone()))
                             .child(div().flex_1())
-                            .child(self.render_keyboard_shortcuts(cx))
-                            .child(
-                                crate::ui::icon_button("files", IconName::Folder, "文件传输")
-                                    .on_click(
-                                        cx.listener(|this, _, _, cx| this.open_file_transfer(cx)),
+                            .when(!cfg!(target_os = "windows"), |bar| {
+                                bar.child(self.render_keyboard_shortcuts(cx))
+                                    .child(
+                                        crate::ui::icon_button(
+                                            "files",
+                                            IconName::Folder,
+                                            "文件传输",
+                                        )
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| {
+                                                this.open_file_transfer(cx)
+                                            }),
+                                        )
+                                        .disabled(self.phase != Phase::Connected),
                                     )
-                                    .disabled(self.phase != Phase::Connected),
-                            )
-                            .child(self.render_notification_button(cx))
-                            .child(self.render_session_settings(cx)),
+                                    .child(self.render_notification_button(cx))
+                                    .child(self.render_session_settings(cx))
+                            }),
                     ),
             )
             .when(show_pinned, |this| {
@@ -1736,6 +1772,9 @@ impl Render for SessionView {
                     })
                     .when(self.notifications.open, |this| {
                         this.child(self.render_notifications(cx))
+                    })
+                    .when(self.mailbox.open, |this| {
+                        this.child(self.render_mailbox_panel(cx))
                     })
                     .when(
                         self.phase == Phase::Ended
@@ -2061,6 +2100,7 @@ mod clipboard_ui;
 mod controls_ui;
 mod functions_ui;
 mod karing_ui;
+mod mailbox_ui;
 mod reconnect;
 mod unlock_ui;
 

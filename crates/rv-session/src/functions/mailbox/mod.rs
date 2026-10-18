@@ -34,10 +34,10 @@ impl Credentials {
             return Ok(None);
         }
         let (Some(client_id), Some(token)) = (client, token) else {
-            return Err("邮箱资料须为：邮箱----密码----客户端ID----刷新令牌".into());
+            return Err("邮箱 OAuth 资料须包含邮箱、客户端ID和刷新令牌".into());
         };
         let refresh_token = Zeroizing::new(token);
-        if password.is_empty() || client_id.trim().is_empty() || refresh_token.is_empty() {
+        if client_id.trim().is_empty() || refresh_token.is_empty() {
             return Err("邮箱 OAuth 资料不完整或客户端ID格式错误".into());
         }
         let email = params["email"]
@@ -84,6 +84,21 @@ fn provider_for(email: &str) -> Result<&'static dyn MailboxProvider, String> {
         | "hotmail.fr" | "hotmail.de" | "live.co.uk" => Ok(&microsoft::Microsoft),
         _ => Err("此邮箱服务尚未接入自动取码；可只填写邮箱并手动验证".into()),
     }
+}
+pub(crate) fn validate_credentials(
+    email: &str,
+    client_id: &str,
+    refresh_token: &str,
+) -> Result<(), String> {
+    let credentials = Credentials {
+        email: email.trim().to_owned(),
+        client_id: client_id.trim().to_owned(),
+        refresh_token: Zeroizing::new(refresh_token.to_owned()),
+    };
+    if credentials.refresh_token.is_empty() {
+        return Err("邮箱 OAuth 刷新令牌不能为空".into());
+    }
+    Router.validate(&credentials)
 }
 pub(super) struct Router;
 impl MailboxProvider for Router {
