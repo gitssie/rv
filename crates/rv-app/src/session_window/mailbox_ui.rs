@@ -177,7 +177,7 @@ impl SessionView {
                 self.mailbox.select.update(cx, |select, cx| {
                     select.set_selected_value(&selected, window, cx)
                 });
-                self.mailbox.message = Some("邮箱资料已加密保存到本地 SQLite".into());
+                self.mailbox.message = Some("邮箱资料已保存到本地 SQLite".into());
             }
             Err(error) => self.mailbox.message = Some(format!("保存失败：{error}")),
         }

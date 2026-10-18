@@ -1,6 +1,6 @@
 //! Locally managed OAuth mailboxes used for explicit verification-code reads.
 use super::WorkspaceStore;
-use crate::{StoreError, store::credentials};
+use crate::StoreError;
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
@@ -8,7 +8,6 @@ use serde::{Deserialize, Serialize};
 pub struct MailboxAccount {
     pub id: String,
     pub email: String,
-    #[serde(default)]
     pub password: String,
     pub client_id: String,
     pub refresh_token: String,
@@ -28,17 +27,9 @@ impl WorkspaceStore {
     pub fn mailbox_accounts(&self) -> Result<Vec<MailboxAccount>, StoreError> {
         let mut query = self
             .db
-            .prepare("SELECT id,encrypted FROM mailbox_accounts ORDER BY id")?;
-        let rows = query.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
-        })?;
-        let mut accounts: Vec<MailboxAccount> = rows
-            .map(|row| {
-                let (id, encrypted) = row?;
-                let plain = credentials::unseal(&format!("rv-mailbox|{id}"), encrypted)?;
-                Ok(serde_json::from_slice(&plain)?)
-            })
-            .collect::<Result<_, StoreError>>()?;
+            .prepare("SELECT id,email,password,client_id,refresh_token FROM mailbox_accounts")?;
+        let rows = query.query_map([], mailbox_from_row)?;
+        let mut accounts: Vec<MailboxAccount> = rows.collect::<Result<_, _>>()?;
         accounts.sort_by_key(|account| account.email.to_ascii_lowercase());
         Ok(accounts)
     }
@@ -70,22 +61,13 @@ impl WorkspaceStore {
         let tx = self
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let existing_id = {
-            let mut query = tx.prepare("SELECT id,encrypted FROM mailbox_accounts")?;
-            let rows = query.query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
-            })?;
-            rows.map(|row| {
-                let (id, encrypted) = row?;
-                let plain = credentials::unseal(&format!("rv-mailbox|{id}"), encrypted)?;
-                let saved: MailboxAccount = serde_json::from_slice(&plain)?;
-                Ok(saved.email.eq_ignore_ascii_case(email).then_some(saved.id))
-            })
-            .collect::<Result<Vec<_>, StoreError>>()?
-            .into_iter()
-            .flatten()
-            .next()
-        };
+        let existing_id = tx
+            .query_row(
+                "SELECT id FROM mailbox_accounts WHERE email=?1 COLLATE NOCASE LIMIT 1",
+                [email],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
         let account = MailboxAccount {
             id: existing_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
             email: email.to_owned(),
@@ -93,34 +75,32 @@ impl WorkspaceStore {
             client_id: client_id.to_owned(),
             refresh_token: refresh_token.to_owned(),
         };
-        let encrypted = credentials::seal(
-            &format!("rv-mailbox|{}", account.id),
-            &serde_json::to_vec(&account)?,
-        )?;
         tx.execute(
-            "INSERT INTO mailbox_accounts(id,encrypted) VALUES(?1,?2) \
-             ON CONFLICT(id) DO UPDATE SET encrypted=excluded.encrypted",
-            params![account.id, encrypted],
+            "INSERT INTO mailbox_accounts(id,email,password,client_id,refresh_token) \
+             VALUES(?1,?2,?3,?4,?5) ON CONFLICT(id) DO UPDATE SET \
+             email=excluded.email,password=excluded.password,client_id=excluded.client_id, \
+             refresh_token=excluded.refresh_token",
+            params![
+                account.id,
+                account.email,
+                account.password,
+                account.client_id,
+                account.refresh_token
+            ],
         )?;
         tx.commit()?;
         Ok(account)
     }
 
     pub fn mailbox_account(&self, id: &str) -> Result<Option<MailboxAccount>, StoreError> {
-        let encrypted = self
-            .db
+        self.db
             .query_row(
-                "SELECT encrypted FROM mailbox_accounts WHERE id=?1",
+                "SELECT id,email,password,client_id,refresh_token FROM mailbox_accounts WHERE id=?1",
                 [id],
-                |row| row.get::<_, Vec<u8>>(0),
+                mailbox_from_row,
             )
-            .optional()?;
-        encrypted
-            .map(|encrypted| {
-                let plain = credentials::unseal(&format!("rv-mailbox|{id}"), encrypted)?;
-                Ok(serde_json::from_slice(&plain)?)
-            })
-            .transpose()
+            .optional()
+            .map_err(StoreError::from)
     }
 
     pub fn delete_mailbox_account(&mut self, id: &str) -> Result<bool, StoreError> {
@@ -131,12 +111,22 @@ impl WorkspaceStore {
     }
 }
 
+fn mailbox_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MailboxAccount> {
+    Ok(MailboxAccount {
+        id: row.get(0)?,
+        email: row.get(1)?,
+        password: row.get(2)?,
+        client_id: row.get(3)?,
+        refresh_token: row.get(4)?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn mailbox_credentials_are_encrypted_and_resaves_replace_the_same_account() {
+    fn mailbox_credentials_are_plaintext_and_resaves_replace_the_same_account() {
         let dir = tempfile::tempdir().unwrap();
         let paths = crate::StorePaths::in_dir(dir.path().into());
         let mut store = WorkspaceStore::open(&paths).unwrap();
@@ -151,21 +141,23 @@ mod tests {
             .unwrap();
         assert_eq!(saved.password, "test-password");
 
-        let encrypted: Vec<u8> = store
+        let stored: (String, String, String, String) = store
             .db
             .query_row(
-                "SELECT encrypted FROM mailbox_accounts WHERE id=?1",
+                "SELECT email,password,client_id,refresh_token FROM mailbox_accounts WHERE id=?1",
                 [&saved.id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .unwrap();
-        for secret in [b"test-password".as_slice(), b"test-refresh-token"] {
-            assert!(
-                !encrypted
-                    .windows(secret.len())
-                    .any(|window| window == secret)
-            );
-        }
+        assert_eq!(
+            stored,
+            (
+                "mail@example.test".into(),
+                "test-password".into(),
+                "test-client".into(),
+                "test-refresh-token".into()
+            )
+        );
 
         let updated = store
             .save_mailbox_account(
@@ -181,17 +173,5 @@ mod tests {
             store.mailbox_account(&saved.id).unwrap().unwrap().password,
             "new-password"
         );
-    }
-
-    #[test]
-    fn mailbox_account_without_password_deserializes_as_legacy_record() {
-        let old = serde_json::json!({
-            "id": "mailbox-id",
-            "email": "mail@example.test",
-            "client_id": "client",
-            "refresh_token": "token"
-        });
-        let account: MailboxAccount = serde_json::from_value(old).unwrap();
-        assert!(account.password.is_empty());
     }
 }

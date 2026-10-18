@@ -1,7 +1,10 @@
 BEGIN IMMEDIATE;
 CREATE TABLE IF NOT EXISTS mailbox_accounts (
     id TEXT PRIMARY KEY NOT NULL,
-    encrypted BLOB NOT NULL
+    email TEXT NOT NULL COLLATE NOCASE UNIQUE,
+    password TEXT NOT NULL DEFAULT '',
+    client_id TEXT NOT NULL,
+    refresh_token TEXT NOT NULL
 );
 PRAGMA user_version=5;
 COMMIT;
