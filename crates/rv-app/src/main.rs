@@ -20,7 +20,22 @@ use gpui_component::{Root, TitleBar};
 use crate::actions::*;
 use crate::app::{AddressBookApp, WindowRoot};
 
+#[cfg(target_os = "windows")]
+fn init_com() {
+    // Initialize COM for the main thread to avoid CO_E_NOTINITIALIZED (0x80040102)
+    // when gpui_windows creates window handles on background threads.
+    unsafe {
+        let _ = windows::Win32::System::Com::CoInitializeEx(
+            None,
+            windows::Win32::System::Com::COINIT_APARTMENTTHREADED,
+        );
+    }
+}
+
 fn main() {
+    #[cfg(target_os = "windows")]
+    init_com();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

@@ -380,7 +380,7 @@ impl FileTransferView {
         if view.photo_mode {
             view.request_photo_list();
         }
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             loop {
                 cx.background_executor()
                     .timer(Duration::from_millis(16))

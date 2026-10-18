@@ -1,10 +1,10 @@
 //! Persistent shared image cache. UI never loads remote image URLs.
 use rv_core::StorePaths;
 use sha2::{Digest, Sha256};
+use fs2::FileExt;
 use std::{
     fs::{self, OpenOptions},
     io::Write,
-    os::fd::AsRawFd,
     path::PathBuf,
     sync::OnceLock,
     time::Duration,
@@ -53,10 +53,7 @@ fn fetch_scoped(
         .write(true)
         .open(path.with_extension("lock"))
         .map_err(|e| e.to_string())?;
-    // flock releases when this file descriptor drops, including process crashes.
-    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
-        return Err(std::io::Error::last_os_error().to_string());
-    }
+    lock.lock_exclusive().map_err(|e| e.to_string())?;
     if path.is_file() {
         return Ok(path);
     }

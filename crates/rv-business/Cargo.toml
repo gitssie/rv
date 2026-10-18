@@ -18,7 +18,7 @@ chrono = "0.4"
 html5ever = "0.27"
 markup5ever_rcdom = "0.3"
 sha2 = "0.10"
-libc = "0.2"
+fs2 = "0.4"
 image = { workspace = true, features = ["webp", "gif"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 tokio.workspace = true
