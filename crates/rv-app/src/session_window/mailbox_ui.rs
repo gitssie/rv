@@ -52,14 +52,10 @@ impl MailboxUI {
 }
 
 impl SessionView {
-    pub(super) fn toggle_mailbox_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn toggle_mailbox_panel(&mut self, cx: &mut Context<Self>) {
         self.mailbox.open = !self.mailbox.open;
         if self.mailbox.open {
-            self.functions.open = false;
-            self.notifications.open = false;
-            self.info_open = false;
             self.load_mailboxes();
-            self.focus.focus(window, cx);
         }
         cx.notify();
     }
@@ -236,20 +232,20 @@ impl SessionView {
         true
     }
 
-    pub(super) fn render_mailbox_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        crate::ui::icon_button("mailbox", IconName::Inbox, "获取邮件验证码")
+    pub(super) fn render_mailbox_launcher(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        Button::new("mailbox-open")
+            .ghost()
+            .icon(IconName::Inbox)
+            .label("邮箱验证码与邮箱列表")
             .selected(self.mailbox.open)
-            .on_click(cx.listener(|this, _, window, cx| this.toggle_mailbox_panel(window, cx)))
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_mailbox_panel(cx)))
     }
 
     pub(super) fn render_mailbox_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
         crate::ui::tool_panel(cx)
             .id("mailbox-panel")
             .occlude()
-            .absolute()
-            .top_2()
-            .right_2()
-            .w(px(360.))
+            .w_full()
             .max_w_full()
             .max_h(px(500.))
             .child(

@@ -1099,7 +1099,6 @@ impl SessionView {
             .child(self.render_unlock_button(cx))
             .child(self.render_screenshot(cx))
             .child(self.render_app_toolbar(cx))
-            .child(self.render_mailbox_button(cx))
             .when(cfg!(target_os = "windows"), |bar| {
                 bar.child(
                     crate::ui::icon_button("files", IconName::Folder, "文件传输")
@@ -1772,9 +1771,6 @@ impl Render for SessionView {
                     })
                     .when(self.notifications.open, |this| {
                         this.child(self.render_notifications(cx))
-                    })
-                    .when(self.mailbox.open, |this| {
-                        this.child(self.render_mailbox_panel(cx))
                     })
                     .when(
                         self.phase == Phase::Ended

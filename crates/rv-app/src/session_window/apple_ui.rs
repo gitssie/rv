@@ -231,7 +231,7 @@ impl SessionView {
     pub(super) fn render_apple_operation_context(
         &self,
         spec: &'static OperationSpec,
-        cx: &App,
+        cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let login_account = (spec.id == "store-login" && self.functions.challenge.is_some())
             .then(|| parse_operation(spec, self.functions.text.read(cx).value().as_ref()).ok())
@@ -265,6 +265,16 @@ impl SessionView {
                         .text_color(theme::muted(cx)),
                 )
             })
+            .when(
+                cfg!(target_os = "windows") && matches!(spec.id, "email-add" | "email-verify"),
+                |column| {
+                    column
+                        .child(self.render_mailbox_launcher(cx))
+                        .when(self.mailbox.open, |column| {
+                            column.child(self.render_mailbox_panel(cx))
+                        })
+                },
+            )
     }
 
     /// Open a focused form from a query, without submitting any mutation.
