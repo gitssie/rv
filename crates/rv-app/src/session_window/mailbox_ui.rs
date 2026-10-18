@@ -2,10 +2,12 @@ use super::*;
 use gpui_component::{
     WindowExt,
     button::Button,
+    checkbox::Checkbox,
     form::{Field, Form},
     group_box::{GroupBox, GroupBoxVariants as _},
-    input::Input,
+    input::{Input, Textarea, TextareaState},
     scroll::ScrollableElement,
+    select::{Select, SelectItem, SelectState},
     tab::{Tab, TabBar},
 };
 use rv_core::workspace::{MailboxAccount, WorkspaceStore};
@@ -17,15 +19,36 @@ enum MailboxTab {
     Accounts,
 }
 
+#[derive(Clone)]
+struct MailboxChoice {
+    id: String,
+    email: String,
+}
+
+impl SelectItem for MailboxChoice {
+    type Value = String;
+
+    fn title(&self) -> SharedString {
+        self.email.clone().into()
+    }
+
+    fn value(&self) -> &String {
+        &self.id
+    }
+}
+
 pub(super) struct MailboxUI {
     pub(super) open: bool,
     tab: MailboxTab,
     accounts: Vec<MailboxAccount>,
-    selected: Option<String>,
+    select: Entity<SelectState<Vec<MailboxChoice>>>,
+    credentials_text: Entity<TextareaState>,
+    save_on_fetch: bool,
     busy: bool,
     code: Option<String>,
     message: Option<String>,
     email: Entity<InputState>,
+    password: Entity<InputState>,
     client_id: Entity<InputState>,
     refresh_token: Entity<InputState>,
 }
@@ -36,11 +59,22 @@ impl MailboxUI {
             open: false,
             tab: MailboxTab::Fetch,
             accounts: Vec::new(),
-            selected: None,
+            select: cx.new(|cx| SelectState::new(Vec::<MailboxChoice>::new(), None, window, cx)),
+            credentials_text: cx.new(|cx| {
+                TextareaState::new(window, cx)
+                    .rows(5)
+                    .placeholder("邮箱----密码----客户端ID----刷新令牌")
+            }),
+            save_on_fetch: true,
             busy: false,
             code: None,
             message: None,
             email: cx.new(|cx| InputState::new(window, cx).placeholder("name@outlook.com")),
+            password: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .masked(true)
+                    .placeholder("邮箱密码")
+            }),
             client_id: cx.new(|cx| InputState::new(window, cx).placeholder("OAuth 客户端 ID")),
             refresh_token: cx.new(|cx| {
                 InputState::new(window, cx)
@@ -52,15 +86,15 @@ impl MailboxUI {
 }
 
 impl SessionView {
-    pub(super) fn toggle_mailbox_panel(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn toggle_mailbox_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.mailbox.open = !self.mailbox.open;
         if self.mailbox.open {
-            self.load_mailboxes();
+            self.load_mailboxes(window, cx);
         }
         cx.notify();
     }
 
-    fn load_mailboxes(&mut self) {
+    fn load_mailboxes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.mailbox.message = None;
         let result = self
             .store_paths
@@ -73,14 +107,25 @@ impl SessionView {
             });
         match result {
             Ok(accounts) => {
-                if self
-                    .mailbox
-                    .selected
-                    .as_ref()
-                    .is_none_or(|id| !accounts.iter().any(|account| &account.id == id))
-                {
-                    self.mailbox.selected = accounts.first().map(|account| account.id.clone());
-                }
+                let previous = self.mailbox.select.read(cx).selected_value().cloned();
+                let selected = previous
+                    .filter(|id| accounts.iter().any(|account| &account.id == id))
+                    .or_else(|| accounts.first().map(|account| account.id.clone()));
+                let choices = accounts
+                    .iter()
+                    .map(|account| MailboxChoice {
+                        id: account.id.clone(),
+                        email: account.email.clone(),
+                    })
+                    .collect();
+                self.mailbox.select.update(cx, |select, cx| {
+                    select.set_items(choices, window, cx);
+                    if let Some(selected) = &selected {
+                        select.set_selected_value(selected, window, cx);
+                    } else {
+                        select.set_selected_index(None, window, cx);
+                    }
+                });
                 self.mailbox.accounts = accounts;
             }
             Err(error) => self.mailbox.message = Some(format!("读取邮箱列表失败：{error}")),
@@ -89,6 +134,7 @@ impl SessionView {
 
     fn save_mailbox(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let email = self.mailbox.email.read(cx).value().trim().to_owned();
+        let password = self.mailbox.password.read(cx).value().to_string();
         let client_id = self.mailbox.client_id.read(cx).value().trim().to_owned();
         let refresh_token = self
             .mailbox
@@ -109,13 +155,17 @@ impl SessionView {
             cx.notify();
             return;
         };
-        let result = WorkspaceStore::open(paths)
-            .and_then(|mut store| store.save_mailbox_account(&email, &client_id, &refresh_token));
+        let result = WorkspaceStore::open(paths).and_then(|mut store| {
+            store.save_mailbox_account(&email, &password, &client_id, &refresh_token)
+        });
         match result {
             Ok(account) => {
-                self.mailbox.selected = Some(account.id);
+                let selected = account.id;
                 self.mailbox
                     .email
+                    .update(cx, |input, cx| input.set_value("", window, cx));
+                self.mailbox
+                    .password
                     .update(cx, |input, cx| input.set_value("", window, cx));
                 self.mailbox
                     .client_id
@@ -123,15 +173,18 @@ impl SessionView {
                 self.mailbox
                     .refresh_token
                     .update(cx, |input, cx| input.set_value("", window, cx));
-                self.load_mailboxes();
-                self.mailbox.message = Some("邮箱已保存；OAuth 凭据已加密存入本地 SQLite".into());
+                self.load_mailboxes(window, cx);
+                self.mailbox.select.update(cx, |select, cx| {
+                    select.set_selected_value(&selected, window, cx)
+                });
+                self.mailbox.message = Some("邮箱资料已加密保存到本地 SQLite".into());
             }
             Err(error) => self.mailbox.message = Some(format!("保存失败：{error}")),
         }
         cx.notify();
     }
 
-    fn delete_mailbox(&mut self, id: &str, cx: &mut Context<Self>) {
+    fn delete_mailbox(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let result = self
             .store_paths
             .as_ref()
@@ -143,7 +196,7 @@ impl SessionView {
             });
         match result {
             Ok(_) => {
-                self.load_mailboxes();
+                self.load_mailboxes(window, cx);
                 self.mailbox.message = Some("邮箱已删除".into());
             }
             Err(error) => self.mailbox.message = Some(format!("删除失败：{error}")),
@@ -166,34 +219,90 @@ impl SessionView {
                 .title("删除邮箱？")
                 .description(format!("删除 {email} 的本地 OAuth 凭据。"))
                 .confirm()
-                .on_ok(move |_, _, cx| {
-                    entity.update(cx, |this, cx| this.delete_mailbox(&id, cx));
+                .on_ok(move |_, window, cx| {
+                    entity.update(cx, |this, cx| this.delete_mailbox(&id, window, cx));
                     true
                 })
         });
     }
 
-    fn fetch_mail_code(&mut self, cx: &mut Context<Self>) {
+    fn fetch_mail_code(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.mailbox.busy {
             return;
         }
-        let Some(account) = self.mailbox.selected.as_deref().and_then(|id| {
-            self.mailbox
-                .accounts
-                .iter()
-                .find(|account| account.id == id)
-        }) else {
-            self.mailbox.message = Some("请先选择邮箱".into());
-            cx.notify();
-            return;
+        let pasted = self.mailbox.credentials_text.read(cx).value().to_string();
+        let (text, selected_message) = if pasted.trim().is_empty() {
+            let selected = self.mailbox.select.read(cx).selected_value().cloned();
+            let Some(account) = selected
+                .as_deref()
+                .and_then(|id| {
+                    self.mailbox
+                        .accounts
+                        .iter()
+                        .find(|account| account.id == id)
+                })
+                .cloned()
+            else {
+                self.mailbox.message = Some("请选择已保存邮箱，或粘贴邮箱资料".into());
+                cx.notify();
+                return;
+            };
+            (format_mailbox_text(&account), None)
+        } else {
+            let Ok((email, password, client_id, refresh_token)) = parse_mailbox_text(&pasted)
+            else {
+                self.mailbox.message =
+                    Some("资料格式应为：邮箱----密码----客户端ID----刷新令牌".into());
+                cx.notify();
+                return;
+            };
+            if let Err(error) = rv_session::functions::validate_mailbox_credentials(
+                &email,
+                &client_id,
+                &refresh_token,
+            ) {
+                self.mailbox.message = Some(error);
+                cx.notify();
+                return;
+            }
+            let message = if self.mailbox.save_on_fetch {
+                let Some(paths) = self.store_paths.as_ref() else {
+                    self.mailbox.message = Some("本地数据目录不可用，无法保存邮箱资料".into());
+                    cx.notify();
+                    return;
+                };
+                let result = WorkspaceStore::open(paths).and_then(|mut store| {
+                    store.save_mailbox_account(&email, &password, &client_id, &refresh_token)
+                });
+                match result {
+                    Ok(account) => {
+                        let id = account.id;
+                        self.load_mailboxes(window, cx);
+                        self.mailbox
+                            .select
+                            .update(cx, |select, cx| select.set_selected_value(&id, window, cx));
+                        Some("邮箱资料已保存，正在读取邮件…".to_owned())
+                    }
+                    Err(error) => {
+                        self.mailbox.message = Some(format!("保存失败：{error}"));
+                        cx.notify();
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+            (
+                format!(
+                    "邮箱={email}\n密码={password}\n客户端ID={client_id}\n刷新令牌={refresh_token}"
+                ),
+                message,
+            )
         };
-        let text = format!(
-            "邮箱={}\n客户端ID={}\n刷新令牌={}",
-            account.email, account.client_id, account.refresh_token
-        );
         self.mailbox.busy = true;
         self.mailbox.code = None;
-        self.mailbox.message = Some("正在读取最新邮件验证码…".into());
+        self.mailbox.message =
+            Some(selected_message.unwrap_or_else(|| "正在读取最新邮件验证码…".into()));
         self.handle.function(FunctionCommand::Scoped {
             id: "mailbox-panel".into(),
             command: Box::new(FunctionCommand::ReadEmailCode { text }),
@@ -238,7 +347,7 @@ impl SessionView {
             .icon(IconName::Inbox)
             .label("邮箱验证码与邮箱列表")
             .selected(self.mailbox.open)
-            .on_click(cx.listener(|this, _, _, cx| this.toggle_mailbox_panel(cx)))
+            .on_click(cx.listener(|this, _, window, cx| this.toggle_mailbox_panel(window, cx)))
     }
 
     pub(super) fn render_mailbox_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -296,35 +405,34 @@ impl SessionView {
                 div()
                     .text_xs()
                     .text_color(theme::muted(cx))
-                    .child("从所选 Outlook / Hotmail 邮箱读取最新邮件中的六位验证码。"),
+                    .child("选择已保存邮箱，或粘贴四段邮箱资料后获取最新邮件中的六位验证码。"),
             )
             .child(
-                GroupBox::new()
-                    .outline()
-                    .children(self.mailbox.accounts.iter().map(|account| {
-                        let id = account.id.clone();
-                        Button::new(format!("mailbox-select-{id}"))
-                            .ghost()
-                            .w_full()
-                            .justify_start()
-                            .label(account.email.clone())
-                            .selected(self.mailbox.selected.as_deref() == Some(&id))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.mailbox.selected = Some(id.clone());
-                                this.mailbox.code = None;
-                                this.mailbox.message = None;
-                                cx.notify();
-                            }))
-                    }))
-                    .when(self.mailbox.accounts.is_empty(), |box_| {
-                        box_.child(
-                            div()
-                                .p_2()
-                                .text_sm()
-                                .text_color(theme::muted(cx))
-                                .child("还没有邮箱，请到“邮箱列表”添加。"),
-                        )
-                    }),
+                Form::vertical()
+                    .child(
+                        Field::new().label("已保存邮箱").child(
+                            Select::new(&self.mailbox.select)
+                                .accessibility_label("选择邮箱")
+                                .placeholder("选择要读取的邮箱")
+                                .disabled(self.mailbox.accounts.is_empty() || self.mailbox.busy),
+                        ),
+                    )
+                    .child(
+                        Field::new()
+                            .label("邮箱资料")
+                            .child(Textarea::new(&self.mailbox.credentials_text).overflow_hidden()),
+                    )
+                    .child(
+                        Field::new().child(
+                            Checkbox::new("mailbox-save-on-fetch")
+                                .checked(self.mailbox.save_on_fetch)
+                                .label("获取时保存邮箱资料（默认开启）")
+                                .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                                    this.mailbox.save_on_fetch = *checked;
+                                    cx.notify();
+                                })),
+                        ),
+                    ),
             )
             .child(
                 crate::ui::tool_actions()
@@ -338,8 +446,10 @@ impl SessionView {
                             .primary()
                             .loading(self.mailbox.busy)
                             .label("获取验证码")
-                            .disabled(self.mailbox.busy || self.mailbox.selected.is_none())
-                            .on_click(cx.listener(|this, _, _, cx| this.fetch_mail_code(cx))),
+                            .disabled(self.mailbox.busy)
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.fetch_mail_code(window, cx)),
+                            ),
                     ),
             )
             .when_some(self.mailbox.code.clone(), |el, code| {
@@ -384,6 +494,11 @@ impl SessionView {
                                 Field::new()
                                     .label("邮箱")
                                     .child(Input::new(&self.mailbox.email)),
+                            )
+                            .child(
+                                Field::new()
+                                    .label("邮箱密码")
+                                    .child(Input::new(&self.mailbox.password)),
                             )
                             .child(
                                 Field::new()
@@ -445,5 +560,88 @@ impl SessionView {
                 el.child(div().text_xs().text_color(theme::muted(cx)).child(message))
             })
             .into_any_element()
+    }
+}
+
+fn parse_mailbox_text(text: &str) -> Result<(String, String, String, String), ()> {
+    let text = text.trim();
+    let (email, password, client_id, refresh_token) = if !text.contains(['\n', '\r']) {
+        let fields: Vec<_> = text.split("----").map(str::trim).collect();
+        if fields.len() != 4 {
+            return Err(());
+        }
+        (fields[0], fields[1], fields[2], fields[3])
+    } else {
+        let mut email = None;
+        let mut password = None;
+        let mut client_id = None;
+        let mut refresh_token = None;
+        for line in text.lines() {
+            let Some((key, value)) = line.split_once('=') else {
+                return Err(());
+            };
+            let slot = match key.trim() {
+                "邮箱" | "email" => &mut email,
+                "密码" | "password" => &mut password,
+                "客户端ID" | "client_id" => &mut client_id,
+                "刷新令牌" | "refresh_token" => &mut refresh_token,
+                _ => return Err(()),
+            };
+            if slot.replace(value.trim()).is_some() {
+                return Err(());
+            }
+        }
+        (
+            email.ok_or(())?,
+            password.unwrap_or_default(),
+            client_id.ok_or(())?,
+            refresh_token.ok_or(())?,
+        )
+    };
+    if email.is_empty() || client_id.is_empty() || refresh_token.is_empty() {
+        return Err(());
+    }
+    Ok((
+        email.to_owned(),
+        password.to_owned(),
+        client_id.to_owned(),
+        refresh_token.to_owned(),
+    ))
+}
+
+fn format_mailbox_text(account: &MailboxAccount) -> String {
+    format!(
+        "邮箱={}\n密码={}\n客户端ID={}\n刷新令牌={}",
+        account.email, account.password, account.client_id, account.refresh_token
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_mailbox_text;
+
+    #[test]
+    fn parses_four_part_and_named_mailbox_credentials() {
+        assert_eq!(
+            parse_mailbox_text("mail@example.test----pw----client----refresh").unwrap(),
+            (
+                "mail@example.test".into(),
+                "pw".into(),
+                "client".into(),
+                "refresh".into()
+            )
+        );
+        assert_eq!(
+            parse_mailbox_text(
+                "邮箱=mail@example.test\n密码=p----w\n客户端ID=client\n刷新令牌=refresh----part"
+            )
+            .unwrap(),
+            (
+                "mail@example.test".into(),
+                "p----w".into(),
+                "client".into(),
+                "refresh----part".into()
+            )
+        );
     }
 }
