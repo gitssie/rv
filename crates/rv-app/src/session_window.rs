@@ -1779,17 +1779,17 @@ impl Render for SessionView {
                         this.child(self.render_notifications(cx))
                     })
                     .when(self.mailbox.open, |this| {
-                        this.child(
-                            div()
-                                .id("mailbox-overlay")
-                                .absolute()
-                                .top(px(8.))
-                                .right(px(8.))
-                                .w(px(440f32.min((f32::from(width) - 16.).max(100.))))
-                                .max_h(px((f32::from(height) - 100.).max(100.)))
-                                .overflow_y_scroll()
-                                .child(self.render_mailbox_panel(cx)),
-                        )
+                        this.child(self.render_mailbox_panel(
+                            f32::from(width),
+                            f32::from(height)
+                                - f32::from(theme::toolbar_height())
+                                - if show_pinned {
+                                    f32::from(theme::toolbar_height())
+                                } else {
+                                    0.
+                                },
+                            cx,
+                        ))
                     })
                     .when(
                         self.phase == Phase::Ended

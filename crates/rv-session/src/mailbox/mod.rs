@@ -1,6 +1,7 @@
 //! Provider routing and bounded verification-code retrieval. No credentials are persisted.
 mod message;
 mod microsoft;
+mod strategies;
 use futures_util::future::BoxFuture;
 use serde_json::{Map, Value};
 use std::time::Duration;

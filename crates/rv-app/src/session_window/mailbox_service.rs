@@ -24,6 +24,7 @@ pub(super) struct Outcome {
     pub selected: Option<String>,
     pub code: Option<(String, String)>,
     pub message: Option<String>,
+    pub failed: bool,
 }
 
 impl MailboxDraft {
@@ -53,6 +54,7 @@ fn run_with_reader(
         selected: None,
         code: None,
         message: None,
+        failed: false,
     };
     let open = || {
         paths
@@ -128,6 +130,7 @@ fn run_with_reader(
                     outcome.message = Some("验证码已获取".into());
                 }
                 Err(error) => {
+                    outcome.failed = true;
                     tracing::warn!(stage = ?error, "mailbox fetch failed");
                     outcome.message = Some(error.message().into());
                 }
@@ -208,6 +211,7 @@ mod tests {
             )
             .unwrap();
             assert!(result.code.is_none());
+            assert!(result.failed);
             assert_eq!(
                 WorkspaceStore::open(&paths)
                     .unwrap()

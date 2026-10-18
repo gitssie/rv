@@ -191,19 +191,27 @@ fn graph_code_with_sender(
         {
             return None;
         }
-        if (apple_only && !message::apple_sender(m["from"]["emailAddress"]["address"].as_str()?))
-            || !m["toRecipients"].as_array()?.iter().any(|r| {
-                r["emailAddress"]["address"]
-                    .as_str()
-                    .is_some_and(|s| s.eq_ignore_ascii_case(email))
-            })
+        if apple_only
+            && (!message::apple_sender(m["from"]["emailAddress"]["address"].as_str()?)
+                || !m["toRecipients"].as_array()?.iter().any(|r| {
+                    r["emailAddress"]["address"]
+                        .as_str()
+                        .is_some_and(|s| s.eq_ignore_ascii_case(email))
+                }))
         {
             return None;
         }
         Some((m["subject"].as_str()?, m["body"]["content"].as_str()?))
     })();
     match candidate {
-        Some((subject, body)) => message::code(subject, body),
+        Some((subject, body)) if apple_only => message::code(subject, body),
+        Some((subject, body)) => Ok(super::strategies::extract(
+            m["from"]["emailAddress"]["address"]
+                .as_str()
+                .unwrap_or_default(),
+            subject,
+            body,
+        )),
         None => Ok(None),
     }
 }
@@ -368,11 +376,12 @@ fn mime_code_with_sender(
         return Ok(None);
     };
     let from = addresses(&mail.headers, "From");
-    if from.len() != 1
-        || (apple_only && !message::apple_sender(&from[0]))
-        || !addresses(&mail.headers, "To")
-            .iter()
-            .any(|s| s.eq_ignore_ascii_case(email))
+    if apple_only
+        && (from.len() != 1
+            || !message::apple_sender(&from[0])
+            || !addresses(&mail.headers, "To")
+                .iter()
+                .any(|s| s.eq_ignore_ascii_case(email)))
     {
         return Ok(None);
     }
@@ -381,10 +390,19 @@ fn mime_code_with_sender(
         matches!(p.ctype.mimetype.as_str(), "text/plain" | "text/html")
             && p.get_content_disposition().disposition != mailparse::DispositionType::Attachment
     }) {
-        if let Ok(body) = part.get_body()
-            && let Some(code) = message::code(&subject, &body)?
-        {
-            return Ok(Some(code));
+        if let Ok(body) = part.get_body() {
+            let code = if apple_only {
+                message::code(&subject, &body)?
+            } else {
+                super::strategies::extract(
+                    from.first().map(String::as_str).unwrap_or_default(),
+                    &subject,
+                    &body,
+                )
+            };
+            if code.is_some() {
+                return Ok(code);
+            }
         }
     }
     Ok(None)
@@ -486,6 +504,41 @@ impl Imap {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn vinted_login_codes_work_directly_and_through_apple_relay() {
+        let now = Utc::now();
+        let body = "There's been a login attempt from a new device. Enter this 4-digit code to verify that it's you: 0427. One-time use. Valid for 15 minutes.";
+        for (sender, recipient) in [
+            ("no-reply@vinted.fr", "demo@outlook.com"),
+            ("sender@example.test", "other-alias@example.test"),
+            (
+                "no-reply_at_vinted_fr_alias123_hash@privaterelay.appleid.com",
+                "alias123@privaterelay.appleid.com",
+            ),
+        ] {
+            let mail = serde_json::json!({"id":"latest", "receivedDateTime":now.to_rfc3339(),
+                "from":{"emailAddress":{"address":sender}}, "toRecipients":[{"emailAddress":{"address":recipient}}],
+                "subject":"New login attempt", "body":{"content":body}});
+            assert_eq!(
+                graph_code_with_sender(&mail, "demo@outlook.com", now, &HashSet::new(), false),
+                Ok(Some("0427".into()))
+            );
+            assert_eq!(
+                graph_code(&mail, "demo@outlook.com", now, &HashSet::new()),
+                Ok(None)
+            );
+            let mime = format!(
+                "From: {sender}\r\nTo: {recipient}\r\nSubject: New login attempt\r\nContent-Type: text/html\r\n\r\n{}",
+                body.replace("0427", "<b>0427</b>")
+            );
+            assert_eq!(
+                mime_code_with_sender(mime.as_bytes(), "demo@outlook.com", false),
+                Ok(Some("0427".into()))
+            );
+            assert_eq!(mime_code(mime.as_bytes(), "demo@outlook.com"), Ok(None));
+        }
+    }
+
     #[test]
     fn independent_reads_accept_other_senders_but_apple_binding_does_not() {
         let email = "demo@outlook.com";

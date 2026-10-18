@@ -10,13 +10,17 @@ pub(super) fn code(subject: &str, body: &str) -> Result<Option<String>, String> 
     // Called only after the provider verifies sender, recipient and freshness.
     // The phone's pending email challenge scopes this read; message language
     // and localized purpose keywords must not prevent extracting its code.
+    let plain = plain_text(&format!("{subject} {body}"));
+    Ok(plain
+        .split(|c: char| !c.is_ascii_digit())
+        .find(|s| s.len() == 6 && s.bytes().all(|b| b.is_ascii_digit()))
+        .map(str::to_owned))
+}
+
+pub(super) fn plain_text(text: &str) -> String {
     let mut plain = String::new();
     let mut in_tag = false;
-    for c in subject
-        .chars()
-        .chain(std::iter::once(' '))
-        .chain(body.chars())
-    {
+    for c in text.chars() {
         match c {
             '<' => {
                 in_tag = true;
@@ -30,10 +34,7 @@ pub(super) fn code(subject: &str, body: &str) -> Result<Option<String>, String> 
             _ => (),
         }
     }
-    Ok(plain
-        .split(|c: char| !c.is_ascii_digit())
-        .find(|s| s.len() == 6 && s.bytes().all(|b| b.is_ascii_digit()))
-        .map(str::to_owned))
+    plain
 }
 #[cfg(test)]
 mod tests {
