@@ -2,7 +2,7 @@
 mod account;
 mod code_url;
 mod diagnostics;
-mod mailbox;
+use crate::mailbox;
 mod operation_stream;
 mod spec;
 use code_url::fetch_code;
@@ -10,14 +10,6 @@ pub use code_url::{extract_verification_code, validate_code_url};
 #[cfg(test)]
 mod tests;
 pub use spec::{OPERATIONS, OperationSpec, PreparedOperation, parse_operation, valid_code};
-
-pub fn validate_mailbox_credentials(
-    email: &str,
-    client_id: &str,
-    refresh_token: &str,
-) -> Result<(), String> {
-    mailbox::validate_credentials(email, client_id, refresh_token)
-}
 
 use crate::zxtouch::ControlEndpoint;
 use serde_json::{Value, json};
@@ -234,50 +226,6 @@ impl FunctionRuntime {
             FunctionCommand::Scoped { id, command } => (Some(id), *command),
             c => (None, c),
         };
-        if let FunctionCommand::ReadEmailCode { text } = command {
-            let id = scope.unwrap_or_else(|| "email-add".into());
-            let events = self.events.clone();
-            self.tasks.retain(|task| !task.is_finished());
-            self.tasks.push(tokio::spawn(async move {
-                let publish = |event| FunctionEvent::ForOperation {
-                    id: id.clone(),
-                    event: Box::new(event),
-                };
-                let spec = OPERATIONS.iter().find(|spec| spec.id == "email-add").unwrap();
-                let credentials = match parse_operation(spec, &text).and_then(|mut operation| {
-                    operation
-                        .mailbox
-                        .take()
-                        .ok_or_else(|| "邮箱资料缺少 OAuth 授权，无法自动取码".into())
-                }) {
-                    Ok(credentials) => credentials,
-                    Err(error) => {
-                        let _ = events.send(publish(FunctionEvent::Error(error))).await;
-                        return;
-                    }
-                };
-                let _ = events
-                    .send(publish(FunctionEvent::Progress(
-                        "正在获取邮件验证码…".into(),
-                    )))
-                    .await;
-                let read = async {
-                    let mut mailbox =
-                        mailbox::PreparedMailbox::prepare(credentials, &mailbox::Router).await?;
-                    mailbox.read_latest().await
-                };
-                let result = tokio::select! {
-                    result = read => result,
-                    _ = events.closed() => return,
-                };
-                let event = match result {
-                    Ok(code) => FunctionEvent::EmailCodeFetched(code),
-                    Err(error) => FunctionEvent::Error(error),
-                };
-                let _ = events.send(publish(event)).await;
-            }));
-            return;
-        }
         if !self.allowed || self.endpoint.is_none() {
             send(FunctionEvent::Error(
                 "功能连接不可用，请检查 ZXTouch 端口并重新连接".into(),
@@ -827,9 +775,7 @@ async fn worker_with_provider(
                     }
                 };
                 let _ = events
-                    .send(FunctionEvent::Progress(
-                        "正在获取邮件验证码…".into(),
-                    ))
+                    .send(FunctionEvent::Progress("正在获取邮件验证码…".into()))
                     .await;
                 let read = async {
                     let mut mailbox =

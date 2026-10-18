@@ -73,6 +73,10 @@ pub(super) trait CodeMailbox: Send {
     fn poll_latest(&mut self) -> BoxFuture<'_, Result<Option<String>, String>> {
         self.poll()
     }
+    /// Independent mailbox tools do not restrict the sender to Apple.
+    fn poll_latest_any(&mut self) -> BoxFuture<'_, Result<Option<String>, String>> {
+        self.poll_latest()
+    }
 }
 fn provider_for(email: &str) -> Result<&'static dyn MailboxProvider, String> {
     let (local, domain) = email.rsplit_once('@').ok_or("邮箱地址格式错误")?;
@@ -85,7 +89,7 @@ fn provider_for(email: &str) -> Result<&'static dyn MailboxProvider, String> {
         _ => Err("此邮箱服务尚未接入自动取码；可只填写邮箱并手动验证".into()),
     }
 }
-pub(crate) fn validate_credentials(
+pub fn validate_credentials(
     email: &str,
     client_id: &str,
     refresh_token: &str,
@@ -130,13 +134,15 @@ impl PreparedMailbox {
             .await
             .map_err(|_| "邮箱检查超时；尚未添加邮箱".to_string())?
     }
-    pub async fn read_latest(&mut self) -> Result<String, String> {
+    async fn latest_code(&mut self) -> Result<Option<String>, String> {
         tokio::time::timeout(Duration::from_secs(30), self.reader.poll_latest())
             .await
             .map_err(|_| "读取验证码超时，请稍后重新获取".to_string())?
-            .and_then(|code| {
-                code.ok_or_else(|| "最新一封邮件没有可用验证码，请稍后重新获取".into())
-            })
+    }
+    pub async fn read_latest(&mut self) -> Result<String, String> {
+        self.latest_code()
+            .await?
+            .ok_or_else(|| "最新一封邮件没有可用验证码，请稍后重新获取".into())
     }
     pub async fn wait_code(&mut self) -> Result<String, String> {
         tokio::time::timeout(Duration::from_secs(150), async {
@@ -186,5 +192,116 @@ mod tests {
             .unwrap()
             .clone();
         assert!(Credentials::take_from(&mut p).is_err());
+    }
+}
+
+/// Failure stages for the independent desktop mailbox tool.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ReadError {
+    InvalidCredentials,
+    Authorization,
+    Read,
+    NoCode,
+    Unavailable,
+}
+
+impl ReadError {
+    pub fn message(&self) -> &'static str {
+        match self {
+            Self::InvalidCredentials => "邮箱资料不完整或格式有误，请检查后重试",
+            Self::Authorization => "邮箱登录失败，请检查邮箱资料或稍后重试",
+            Self::Read => "邮件读取失败，请稍后重试",
+            Self::NoCode => "最新邮件中没有可用验证码，请稍后重试",
+            Self::Unavailable => "暂时无法获取邮件，请稍后重试",
+        }
+    }
+}
+
+/// Run on a background thread; this tool never sends commands to a phone.
+pub fn read_latest_blocking(
+    email: &str,
+    client_id: &str,
+    refresh_token: &str,
+) -> Result<String, ReadError> {
+    validate_credentials(email, client_id, refresh_token)
+        .map_err(|_| ReadError::InvalidCredentials)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| ReadError::Unavailable)?;
+    runtime.block_on(read_with_provider(
+        Credentials {
+            email: email.trim().to_owned(),
+            client_id: client_id.trim().to_owned(),
+            refresh_token: Zeroizing::new(refresh_token.to_owned()),
+        },
+        &Router,
+    ))
+}
+
+async fn read_with_provider(
+    credentials: Credentials,
+    provider: &dyn MailboxProvider,
+) -> Result<String, ReadError> {
+    let mut mailbox = PreparedMailbox::prepare(credentials, provider)
+        .await
+        .map_err(|_| ReadError::Authorization)?;
+    tokio::time::timeout(Duration::from_secs(30), mailbox.reader.poll_latest_any())
+        .await
+        .map_err(|_| ReadError::Read)?
+        .map_err(|_| ReadError::Read)?
+        .ok_or(ReadError::NoCode)
+}
+
+#[cfg(test)]
+mod read_tests {
+    use super::*;
+    struct Provider(u8);
+    impl MailboxProvider for Provider {
+        fn validate(&self, _: &Credentials) -> Result<(), String> {
+            Ok(())
+        }
+        fn prepare(&self, _: Credentials) -> BoxFuture<'_, Result<Box<dyn CodeMailbox>, String>> {
+            Box::pin(async move {
+                if self.0 == 0 {
+                    return Err("授权检查超时".into());
+                }
+                Ok(Box::new(Reader(self.0)) as Box<dyn CodeMailbox>)
+            })
+        }
+    }
+    struct Reader(u8);
+    impl CodeMailbox for Reader {
+        fn arm(&mut self) -> BoxFuture<'_, Result<(), String>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn poll(&mut self) -> BoxFuture<'_, Result<Option<String>, String>> {
+            Box::pin(async move {
+                match self.0 {
+                    1 => Err("读取超时".into()),
+                    2 => Ok(None),
+                    _ => Ok(Some("012345".into())),
+                }
+            })
+        }
+    }
+    #[tokio::test]
+    async fn separates_authorization_read_failure_and_missing_code() {
+        for (stage, expected) in [
+            (0, Err(ReadError::Authorization)),
+            (1, Err(ReadError::Read)),
+            (2, Err(ReadError::NoCode)),
+            (3, Ok("012345".into())),
+        ] {
+            let credentials = Credentials {
+                email: "mail@outlook.com".into(),
+                client_id: "client".into(),
+                refresh_token: Zeroizing::new("token".into()),
+            };
+            assert_eq!(
+                read_with_provider(credentials, &Provider(stage)).await,
+                expected
+            );
+        }
     }
 }

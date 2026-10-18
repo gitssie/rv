@@ -7,6 +7,7 @@ pub use karing::{KaringRequest, KaringResponse, karing_component};
 mod screen_control;
 pub use screen_control::{ScreenPasscode, ScreenProgress};
 pub mod functions;
+pub mod mailbox;
 pub use functions::{FunctionCommand, FunctionEvent};
 mod ard;
 mod phone_control;

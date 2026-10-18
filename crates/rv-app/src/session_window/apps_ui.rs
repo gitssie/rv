@@ -897,6 +897,7 @@ impl SessionView {
                                     this.apps.picker_open = *open;
                                     this.toolbar_open = *open || this.pin_toolbar;
                                     if *open {
+                                        this.mailbox.open = false;
                                         let keys = this.keys.release_all();
                                         this.send_keys(keys);
                                         if this.apps.caps.as_ref().is_some_and(|c| c.list) {

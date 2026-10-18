@@ -551,17 +551,7 @@ impl SessionView {
             changed = true;
             match ev {
                 SessionEvent::Apps(event) => self.apply_app_event(event, cx),
-                SessionEvent::Functions(event) => {
-                    if matches!(
-                        &event,
-                        rv_session::FunctionEvent::ForOperation { id, .. }
-                            if id == "mailbox-panel"
-                    ) {
-                        self.apply_mailbox_event(event, cx);
-                    } else {
-                        self.apply_function_event(event, cx);
-                    }
-                }
+                SessionEvent::Functions(event) => self.apply_function_event(event, cx),
                 SessionEvent::Status(s) => self.status = s.into(),
                 SessionEvent::ControlState(online) => {
                     if !online {
@@ -965,6 +955,14 @@ impl SessionView {
             }
             return;
         }
+        if self.mailbox.open {
+            if event.keystroke.key == "escape" {
+                self.mailbox.open = false;
+                self.focus.focus(window, cx);
+                cx.notify();
+            }
+            return;
+        }
         if self.notifications.open {
             if event.keystroke.key == "escape" {
                 self.notifications.open = false;
@@ -978,6 +976,7 @@ impl SessionView {
             || self.notifications.open
             || self.apps.picker_open
             || self.functions.open
+            || self.mailbox.open
             || !self.focus.is_focused(window)
         {
             return;
@@ -1035,6 +1034,7 @@ impl SessionView {
             || self.notifications.open
             || self.apps.picker_open
             || self.functions.open
+            || self.mailbox.open
             || !self.focus.is_focused(window)
         {
             return;
@@ -1067,6 +1067,7 @@ impl SessionView {
             || self.notifications.open
             || self.apps.picker_open
             || self.functions.open
+            || self.mailbox.open
             || !self.focus.is_focused(window)
         {
             return;
@@ -1099,15 +1100,6 @@ impl SessionView {
             .child(self.render_unlock_button(cx))
             .child(self.render_screenshot(cx))
             .child(self.render_app_toolbar(cx))
-            .when(cfg!(target_os = "windows"), |bar| {
-                bar.child(
-                    crate::ui::icon_button("files", IconName::Folder, "文件传输")
-                        .on_click(cx.listener(|this, _, _, cx| this.open_file_transfer(cx)))
-                        .disabled(self.phase != Phase::Connected),
-                )
-                .child(self.render_notification_button(cx))
-                .child(self.render_session_settings(cx))
-            })
             .child(
                 crate::ui::icon_button("clip", IconName::Copy, "发送剪贴板")
                     .on_click(cx.listener(|this, _, _, cx| {
@@ -1219,6 +1211,7 @@ impl SessionView {
             cx.notify();
             return;
         }
+        self.mailbox.open = false;
         self.functions.open = false;
         self.notifications.open = false;
         self.info_open = false;
@@ -1567,6 +1560,7 @@ impl Render for SessionView {
             && !self.notifications.open
             && !self.apps.picker_open
             && !self.functions.open
+            && !self.mailbox.open
             && self.focus.is_focused(window);
 
         v_flex()
@@ -1630,8 +1624,20 @@ impl Render for SessionView {
                             .items_center()
                             .child(div().text_sm().text_ellipsis().child(self.title.clone()))
                             .child(div().flex_1())
-                            .when(!cfg!(target_os = "windows"), |bar| {
-                                bar.child(self.render_keyboard_shortcuts(cx))
+                            .child(
+                                h_flex()
+                                    .id("session-titlebar-actions")
+                                    .items_center()
+                                    .when(cfg!(target_os = "windows"), |bar| {
+                                        bar.occlude()
+                                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                                cx.stop_propagation()
+                                            })
+                                    })
+                                    .child(self.render_keyboard_shortcuts(cx))
+                                    .when(cfg!(target_os = "windows"), |bar| {
+                                        bar.child(self.render_mailbox_launcher(cx))
+                                    })
                                     .child(
                                         crate::ui::icon_button(
                                             "files",
@@ -1646,8 +1652,8 @@ impl Render for SessionView {
                                         .disabled(self.phase != Phase::Connected),
                                     )
                                     .child(self.render_notification_button(cx))
-                                    .child(self.render_session_settings(cx))
-                            }),
+                                    .child(self.render_session_settings(cx)),
+                            ),
                     ),
             )
             .when(show_pinned, |this| {
@@ -1771,6 +1777,19 @@ impl Render for SessionView {
                     })
                     .when(self.notifications.open, |this| {
                         this.child(self.render_notifications(cx))
+                    })
+                    .when(self.mailbox.open, |this| {
+                        this.child(
+                            div()
+                                .id("mailbox-overlay")
+                                .absolute()
+                                .top(px(8.))
+                                .right(px(8.))
+                                .w(px(440f32.min((f32::from(width) - 16.).max(100.))))
+                                .max_h(px((f32::from(height) - 100.).max(100.)))
+                                .overflow_y_scroll()
+                                .child(self.render_mailbox_panel(cx)),
+                        )
                     })
                     .when(
                         self.phase == Phase::Ended
@@ -2096,6 +2115,7 @@ mod clipboard_ui;
 mod controls_ui;
 mod functions_ui;
 mod karing_ui;
+mod mailbox_service;
 mod mailbox_ui;
 mod reconnect;
 mod unlock_ui;

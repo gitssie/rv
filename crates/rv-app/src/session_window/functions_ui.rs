@@ -1269,6 +1269,7 @@ impl SessionView {
         }
         self.functions.open = !self.functions.open;
         self.notifications.open = false;
+        self.mailbox.open = false;
         self.show_menu = false;
         self.info_open = false;
         let keys = self.keys.release_all();
@@ -2398,13 +2399,6 @@ fn result_summary(record: &serde_json::Value) -> (String, String) {
 }
 
 pub(super) fn function_error_message(record: &serde_json::Value) -> String {
-    if let Some(message) = record["error"]["message"]
-        .as_str()
-        .map(str::trim)
-        .filter(|message| !message.is_empty())
-    {
-        return message.to_owned();
-    }
     let fallback = if record["error"]["domain"] == "org.trollvnc.apple" {
         match record["error"]["code"].as_i64() {
             Some(1) => "手机暂不支持此操作",
@@ -2549,6 +2543,17 @@ mod tests {
             view.apply_function_event(FunctionEvent::AccountState(Ok(account_fixture(false))), cx);
         });
     }
+    #[test]
+    fn user_errors_use_categories_instead_of_raw_service_messages() {
+        let record = serde_json::json!({"error": {"domain":"org.trollvnc.apple", "code":9,
+            "message":"AKAuthenticationError private backend failure"}});
+        assert_eq!(super::function_error_message(&record), "验证码无效或已过期");
+        assert_eq!(
+            super::function_error_message(&serde_json::json!({"error":{"message":"SQL failure"}})),
+            "操作未完成"
+        );
+    }
+
     #[test]
     fn menu_actions_follow_independent_account_domains() {
         use serde_json::json;

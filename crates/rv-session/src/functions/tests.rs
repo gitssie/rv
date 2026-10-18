@@ -1021,13 +1021,16 @@ async fn injected_shared_client_does_not_enable_unconfigured_or_view_only_functi
                 text: "test@example.com----secret".into(),
             },
             FunctionCommand::RefreshAccountState,
+            FunctionCommand::ReadEmailCode {
+                text: "mail@outlook.com".into(),
+            },
         ] {
             runtime.command(command, &|event| {
                 assert!(matches!(event, FunctionEvent::Error(_)));
                 errors.set(errors.get() + 1);
             });
         }
-        assert_eq!(errors.get(), 2);
+        assert_eq!(errors.get(), 3);
         assert!(runtime.workers.is_empty());
         assert!(runtime.tasks.is_empty());
     }

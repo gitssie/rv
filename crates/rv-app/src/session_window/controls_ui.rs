@@ -154,6 +154,7 @@ impl SessionView {
                     cx.listener(|this, _, _, cx| {
                         this.notifications.open = !this.notifications.open;
                         if this.notifications.open {
+                            this.mailbox.open = false;
                             let released = this.keys.release_all();
                             this.send_keys(released);
                             this.command_paste_pressed = false;

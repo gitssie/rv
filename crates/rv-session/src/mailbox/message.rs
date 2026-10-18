@@ -32,7 +32,7 @@ pub(super) fn code(subject: &str, body: &str) -> Result<Option<String>, String> 
     }
     Ok(plain
         .split(|c: char| !c.is_ascii_digit())
-        .find(|s| super::super::valid_code(s))
+        .find(|s| s.len() == 6 && s.bytes().all(|b| b.is_ascii_digit()))
         .map(str::to_owned))
 }
 #[cfg(test)]

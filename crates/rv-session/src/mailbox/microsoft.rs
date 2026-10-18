@@ -171,6 +171,15 @@ fn graph_code(
     since: DateTime<Utc>,
     baseline: &HashSet<String>,
 ) -> Result<Option<String>, String> {
+    graph_code_with_sender(m, email, since, baseline, true)
+}
+fn graph_code_with_sender(
+    m: &Value,
+    email: &str,
+    since: DateTime<Utc>,
+    baseline: &HashSet<String>,
+    apple_only: bool,
+) -> Result<Option<String>, String> {
     let candidate = (|| {
         let id = m["id"].as_str()?;
         let received = DateTime::parse_from_rfc3339(m["receivedDateTime"].as_str()?).ok()?;
@@ -182,7 +191,7 @@ fn graph_code(
         {
             return None;
         }
-        if !message::apple_sender(m["from"]["emailAddress"]["address"].as_str()?)
+        if (apple_only && !message::apple_sender(m["from"]["emailAddress"]["address"].as_str()?))
             || !m["toRecipients"].as_array()?.iter().any(|r| {
                 r["emailAddress"]["address"]
                     .as_str()
@@ -211,6 +220,21 @@ fn graph_first_code(
     }
 }
 impl CodeMailbox for Graph {
+    fn poll_latest_any(&mut self) -> BoxFuture<'_, Result<Option<String>, String>> {
+        Box::pin(async move {
+            match self.messages().await?.first() {
+                Some(message) => graph_code_with_sender(
+                    message,
+                    &self.email,
+                    chrono::DateTime::<Utc>::UNIX_EPOCH,
+                    &HashSet::new(),
+                    false,
+                ),
+                None => Ok(None),
+            }
+        })
+    }
+
     fn poll_latest(&mut self) -> BoxFuture<'_, Result<Option<String>, String>> {
         Box::pin(async move {
             graph_first_code(
@@ -333,12 +357,19 @@ fn addresses(headers: &[mailparse::MailHeader<'_>], name: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 fn mime_code(bytes: &[u8], email: &str) -> Result<Option<String>, String> {
+    mime_code_with_sender(bytes, email, true)
+}
+fn mime_code_with_sender(
+    bytes: &[u8],
+    email: &str,
+    apple_only: bool,
+) -> Result<Option<String>, String> {
     let Ok(mail) = mailparse::parse_mail(bytes) else {
         return Ok(None);
     };
     let from = addresses(&mail.headers, "From");
     if from.len() != 1
-        || !message::apple_sender(&from[0])
+        || (apple_only && !message::apple_sender(&from[0]))
         || !addresses(&mail.headers, "To")
             .iter()
             .any(|s| s.eq_ignore_ascii_case(email))
@@ -391,6 +422,23 @@ impl CodeMailbox for Imap {
         })
     }
     fn poll(&mut self) -> BoxFuture<'_, Result<Option<String>, String>> {
+        self.poll_with_sender(true)
+    }
+    fn poll_latest_any(&mut self) -> BoxFuture<'_, Result<Option<String>, String>> {
+        Box::pin(async move {
+            let previous = self.uid_next;
+            self.uid_next = 1;
+            let result = self.poll_with_sender(false).await;
+            self.uid_next = previous;
+            result
+        })
+    }
+}
+impl Imap {
+    fn poll_with_sender(
+        &mut self,
+        apple_only: bool,
+    ) -> BoxFuture<'_, Result<Option<String>, String>> {
         Box::pin(async move {
             let inbox = self
                 .session
@@ -424,13 +472,40 @@ impl CodeMailbox for Imap {
                     candidates.push((uid, Zeroizing::new(body.to_vec())));
                 }
             }
-            imap_first_code(candidates, &self.email)
+            if apple_only {
+                imap_first_code(candidates, &self.email)
+            } else {
+                match candidates.first() {
+                    Some((_, body)) => mime_code_with_sender(body, &self.email, false),
+                    None => Ok(None),
+                }
+            }
         })
     }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn independent_reads_accept_other_senders_but_apple_binding_does_not() {
+        let email = "demo@outlook.com";
+        let now = Utc::now();
+        let mail = serde_json::json!({"id":"latest","receivedDateTime":now.to_rfc3339(),
+            "from":{"emailAddress":{"address":"verify@example.com"}},
+            "toRecipients":[{"emailAddress":{"address":email}}],"subject":"Verify", "body":{"content":"012345"}});
+        assert_eq!(graph_code(&mail, email, now, &HashSet::new()), Ok(None));
+        assert_eq!(
+            graph_code_with_sender(&mail, email, now, &HashSet::new(), false),
+            Ok(Some("012345".into()))
+        );
+        let mime = b"From: verify@example.com\r\nTo: demo@outlook.com\r\nSubject: Verify\r\nContent-Type: text/plain\r\n\r\n012345";
+        assert_eq!(mime_code(mime, email), Ok(None));
+        assert_eq!(
+            mime_code_with_sender(mime, email, false),
+            Ok(Some("012345".into()))
+        );
+    }
+
     #[test]
     fn graph_reads_first_message_without_searching_older_mail() {
         let now = Utc::now();
