@@ -258,7 +258,7 @@ impl FunctionRuntime {
                 };
                 let _ = events
                     .send(publish(FunctionEvent::Progress(
-                        "正在读取最新邮件验证码…".into(),
+                        "正在获取邮件验证码…".into(),
                     )))
                     .await;
                 let read = async {
@@ -828,7 +828,7 @@ async fn worker_with_provider(
                 };
                 let _ = events
                     .send(FunctionEvent::Progress(
-                        "正在重新读取最新邮件验证码…".into(),
+                        "正在获取邮件验证码…".into(),
                     ))
                     .await;
                 let read = async {

@@ -85,6 +85,27 @@ impl MailboxUI {
     }
 }
 
+fn mailbox_validation_message(error: &str) -> String {
+    if error.contains("尚未接入") {
+        "暂不支持此邮箱自动获取验证码".into()
+    } else {
+        "邮箱资料不完整或格式有误，请检查后重试".into()
+    }
+}
+
+fn mailbox_fetch_error_message(error: &str) -> String {
+    if error.contains("超时")
+        || error.contains("没有可用验证码")
+        || error.contains("未收到新的邮箱验证码")
+    {
+        "暂时没有收到验证码，请稍后重试".into()
+    } else if error.contains("账户与填写的邮箱不一致") {
+        "邮箱资料与授权账户不一致，请检查邮箱地址".into()
+    } else {
+        "获取验证码失败，请检查邮箱资料后重试".into()
+    }
+}
+
 impl SessionView {
     pub(super) fn toggle_mailbox_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.mailbox.open = !self.mailbox.open;
@@ -99,7 +120,7 @@ impl SessionView {
         let result = self
             .store_paths
             .as_ref()
-            .ok_or_else(|| "本地数据目录不可用".to_string())
+            .ok_or_else(|| "store paths unavailable".to_string())
             .and_then(|paths| {
                 WorkspaceStore::open(paths)
                     .and_then(|store| store.mailbox_accounts())
@@ -128,7 +149,7 @@ impl SessionView {
                 });
                 self.mailbox.accounts = accounts;
             }
-            Err(error) => self.mailbox.message = Some(format!("读取邮箱列表失败：{error}")),
+            Err(_) => self.mailbox.message = Some("邮箱列表加载失败，请重试".into()),
         }
     }
 
@@ -146,12 +167,12 @@ impl SessionView {
         if let Err(error) =
             rv_session::functions::validate_mailbox_credentials(&email, &client_id, &refresh_token)
         {
-            self.mailbox.message = Some(error);
+            self.mailbox.message = Some(mailbox_validation_message(&error));
             cx.notify();
             return;
         }
         let Some(paths) = self.store_paths.as_ref() else {
-            self.mailbox.message = Some("本地数据目录不可用".into());
+            self.mailbox.message = Some("邮箱无法保存，请重试".into());
             cx.notify();
             return;
         };
@@ -177,9 +198,9 @@ impl SessionView {
                 self.mailbox.select.update(cx, |select, cx| {
                     select.set_selected_value(&selected, window, cx)
                 });
-                self.mailbox.message = Some("邮箱资料已保存到本地 SQLite".into());
+                self.mailbox.message = Some("邮箱已保存".into());
             }
-            Err(error) => self.mailbox.message = Some(format!("保存失败：{error}")),
+            Err(_) => self.mailbox.message = Some("邮箱保存失败，请检查资料后重试".into()),
         }
         cx.notify();
     }
@@ -188,7 +209,7 @@ impl SessionView {
         let result = self
             .store_paths
             .as_ref()
-            .ok_or_else(|| "本地数据目录不可用".to_string())
+            .ok_or_else(|| "store paths unavailable".to_string())
             .and_then(|paths| {
                 WorkspaceStore::open(paths)
                     .and_then(|mut store| store.delete_mailbox_account(id))
@@ -199,7 +220,7 @@ impl SessionView {
                 self.load_mailboxes(window, cx);
                 self.mailbox.message = Some("邮箱已删除".into());
             }
-            Err(error) => self.mailbox.message = Some(format!("删除失败：{error}")),
+            Err(_) => self.mailbox.message = Some("邮箱删除失败，请重试".into()),
         }
         cx.notify();
     }
@@ -217,7 +238,7 @@ impl SessionView {
             let id = id.clone();
             alert
                 .title("删除邮箱？")
-                .description(format!("删除 {email} 的本地 OAuth 凭据。"))
+                .description(format!("删除 {email} 后，它会从邮箱列表中移除。"))
                 .confirm()
                 .on_ok(move |_, window, cx| {
                     entity.update(cx, |this, cx| this.delete_mailbox(&id, window, cx));
@@ -251,8 +272,7 @@ impl SessionView {
         } else {
             let Ok((email, password, client_id, refresh_token)) = parse_mailbox_text(&pasted)
             else {
-                self.mailbox.message =
-                    Some("资料格式应为：邮箱----密码----客户端ID----刷新令牌".into());
+                self.mailbox.message = Some("邮箱资料格式不正确，请按示例填写".into());
                 cx.notify();
                 return;
             };
@@ -261,13 +281,13 @@ impl SessionView {
                 &client_id,
                 &refresh_token,
             ) {
-                self.mailbox.message = Some(error);
+                self.mailbox.message = Some(mailbox_validation_message(&error));
                 cx.notify();
                 return;
             }
             let message = if self.mailbox.save_on_fetch {
                 let Some(paths) = self.store_paths.as_ref() else {
-                    self.mailbox.message = Some("本地数据目录不可用，无法保存邮箱资料".into());
+                    self.mailbox.message = Some("邮箱无法保存，请重试".into());
                     cx.notify();
                     return;
                 };
@@ -281,10 +301,10 @@ impl SessionView {
                         self.mailbox
                             .select
                             .update(cx, |select, cx| select.set_selected_value(&id, window, cx));
-                        Some("邮箱资料已保存，正在读取邮件…".to_owned())
+                        Some("邮箱已保存，正在获取验证码…".to_owned())
                     }
-                    Err(error) => {
-                        self.mailbox.message = Some(format!("保存失败：{error}"));
+                    Err(_) => {
+                        self.mailbox.message = Some("邮箱保存失败，请检查资料后重试".into());
                         cx.notify();
                         return;
                     }
@@ -302,7 +322,7 @@ impl SessionView {
         self.mailbox.busy = true;
         self.mailbox.code = None;
         self.mailbox.message =
-            Some(selected_message.unwrap_or_else(|| "正在读取最新邮件验证码…".into()));
+            Some(selected_message.unwrap_or_else(|| "正在获取邮件验证码…".into()));
         self.handle.function(FunctionCommand::Scoped {
             id: "mailbox-panel".into(),
             command: Box::new(FunctionCommand::ReadEmailCode { text }),
@@ -329,11 +349,11 @@ impl SessionView {
             FunctionEvent::EmailCodeFetched(code) => {
                 self.mailbox.busy = false;
                 self.mailbox.code = Some(code);
-                self.mailbox.message = Some("已读取最新邮件中的验证码".into());
+                self.mailbox.message = Some("验证码已获取".into());
             }
             FunctionEvent::Error(error) | FunctionEvent::Uncertain(error) => {
                 self.mailbox.busy = false;
-                self.mailbox.message = Some(error);
+                self.mailbox.message = Some(mailbox_fetch_error_message(&error));
             }
             _ => return true,
         }
