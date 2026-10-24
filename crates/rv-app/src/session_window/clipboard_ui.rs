@@ -223,7 +223,16 @@ impl SessionView {
                 self.clipboard_transfer.post_paste = paste_touch::PasteTouch::new(
                     anchor, (self.fb_w, self.fb_h), entropy, std::time::Instant::now(),
                 );
+                if self.clipboard_transfer.post_paste.is_some() {
+                    tracing::debug!("post-paste touch scheduled");
+                } else {
+                    tracing::warn!("post-paste touch skipped: click anchor outside framebuffer");
+                }
+            } else {
+                tracing::warn!("post-paste touch skipped: no previous canvas click");
             }
+        } else {
+            tracing::warn!("post-paste touch skipped: mouse button held");
         }
         clear_sent_clipboard(&pending, cx);
         self.clipboard_transfer.feedback =
@@ -233,6 +242,7 @@ impl SessionView {
 
     pub(super) fn cancel_post_paste_touch(&mut self) {
         if let Some(plan) = self.clipboard_transfer.post_paste.take() {
+            tracing::debug!(pressed = plan.pressed(), "post-paste touch cancelled");
             if plan.pressed() {
                 self.handle.pointer(plan.point.0, plan.point.1, 0);
             }
@@ -247,9 +257,19 @@ impl SessionView {
             || self.notifications.open || self.apps.picker_open || self.show_menu
             || window.has_active_dialog(cx)
             || self.clipboard_transfer.post_paste.as_ref().is_some_and(|p| p.point.0 >= self.fb_w || p.point.1 >= self.fb_h);
-        if blocked { self.cancel_post_paste_touch(); return; }
+        if blocked {
+            tracing::debug!(
+                active = window.is_window_active(),
+                focused = self.focus.is_focused(window),
+                buttons = self.buttons,
+                "post-paste touch blocked by session state"
+            );
+            self.cancel_post_paste_touch();
+            return;
+        }
         let plan = self.clipboard_transfer.post_paste.as_mut().unwrap();
         if let Some(down) = plan.poll(now) {
+            tracing::debug!(down, "dispatching post-paste touch");
             self.handle.pointer(plan.point.0, plan.point.1, u8::from(down));
         }
         if plan.finished() { self.clipboard_transfer.post_paste = None; }

@@ -771,6 +771,11 @@ impl SessionView {
     }
 
     fn send_pointer(&mut self, x: u16, y: u16) {
+        // Hover is not a takeover. Its zero-button packet would also release
+        // a scripted long press, so suppress it until the sequence ends.
+        if self.buttons == 0 && self.clipboard_transfer.post_paste.is_some() {
+            return;
+        }
         self.cancel_post_paste_touch();
         if self.view_only() || self.unlock.blocks_input() || self.phase != Phase::Connected {
             return;
