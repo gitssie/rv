@@ -207,6 +207,7 @@ pub struct SessionView {
     keys: Keyboard,
     command_paste_pressed: bool,
     clipboard_transfer: clipboard_ui::ClipboardTransfer,
+    touch_gesture: touch_ui::TouchGesture,
     focus: FocusHandle,
     canvas_hovered: bool,
     pointer_in_window: bool,
@@ -399,6 +400,7 @@ impl SessionView {
             keys: Keyboard::new(),
             command_paste_pressed: false,
             clipboard_transfer: clipboard_ui::ClipboardTransfer::default(),
+            touch_gesture: touch_ui::TouchGesture::default(),
             focus,
             canvas_hovered: false,
             pointer_in_window: true,
@@ -557,6 +559,7 @@ impl SessionView {
                     if !online {
                         self.functions.cancel_cloud_preparations();
                         self.clipboard_transfer.disconnected();
+                        self.touch_gesture.disconnected();
                     }
                     self.phase = if online {
                         Phase::Connected
@@ -636,6 +639,7 @@ impl SessionView {
                     self.functions.disconnected();
                     self.assistant_clipboard = None;
                     self.clipboard_transfer.disconnected();
+                    self.touch_gesture.disconnected();
                     self.assistant_batch = None;
                     self.assistant_feedback(
                         "手机已断线，草稿仍保存在本地；待确认导入不会自动重试".into(),
@@ -771,6 +775,7 @@ impl SessionView {
     }
 
     fn send_pointer(&mut self, x: u16, y: u16) {
+        if self.touch_gesture.busy() { return; }
         // Hover is not a takeover. Its zero-button packet would also release
         // a scripted long press, so suppress it until the sequence ends.
         if self.buttons == 0 && self.clipboard_transfer.post_paste.is_some() {
@@ -790,6 +795,10 @@ impl SessionView {
     }
 
     fn button(&mut self, bit: u8, down: bool, position: Point<Pixels>) {
+        if self.touch_gesture.busy() {
+            self.cancel_touch_gesture();
+            return;
+        }
         self.cancel_post_paste_touch();
         if bit == 1 && down && !self.view_only() && !self.unlock.blocks_input() && self.phase == Phase::Connected {
             if let Some(point) = self.map_pointer(position) {
@@ -805,6 +814,10 @@ impl SessionView {
     }
 
     fn wheel(&mut self, ev: &ScrollWheelEvent) {
+        if self.touch_gesture.busy() {
+            self.cancel_touch_gesture();
+            return;
+        }
         let delta = ev.delta.pixel_delta(px(WHEEL_STEP));
         self.wheel_accum.x += f32::from(delta.x);
         self.wheel_accum.y += f32::from(delta.y);
@@ -838,6 +851,15 @@ impl SessionView {
     }
 
     fn send_keys(&mut self, events: impl IntoIterator<Item = (u32, bool)>) {
+        let mut events = events.into_iter().peekable();
+        if self.touch_gesture.busy() {
+            if events.peek().is_some() { self.cancel_touch_gesture(); }
+            // Callers may have updated Keyboard while constructing the suppressed
+            // events. Remote keys were released before playback; keep that state
+            // so the next real input resends any physically held modifiers.
+            self.keys.release_all();
+            return;
+        }
         if self.view_only() || self.unlock.blocks_input() || self.phase != Phase::Connected {
             return;
         }
@@ -871,6 +893,7 @@ impl SessionView {
     }
 
     fn disconnect(&mut self, cx: &mut Context<Self>) {
+        self.cancel_touch_gesture();
         self.cancel_post_paste_touch();
         self.recovery.stop();
         if matches!(self.phase, Phase::Disconnecting | Phase::Ended) {
@@ -897,6 +920,8 @@ impl SessionView {
     }
 
     fn start_reconnect(&mut self, cx: &mut Context<Self>) {
+        self.cancel_touch_gesture();
+        self.touch_gesture.disconnected();
         self.cancel_post_paste_touch();
         self.clipboard_transfer.last_click = None;
         self.recovery.deadline = None;
@@ -997,6 +1022,11 @@ impl SessionView {
             return;
         }
         let key = event.keystroke.key.as_str();
+        if self.touch_gesture.busy() {
+            self.cancel_touch_gesture();
+            self.consume_key(window, cx);
+            return;
+        }
         tracing::debug!(
             key,
             key_char = ?event.keystroke.key_char,
@@ -1116,6 +1146,7 @@ impl SessionView {
             .child(self.render_unlock_button(cx))
             .child(self.render_screenshot(cx))
             .child(self.render_app_toolbar(cx))
+            .child(self.render_touch_gesture(cx))
             .child(
                 crate::ui::icon_button("clip", IconName::Copy, "发送剪贴板")
                     .on_click(cx.listener(|this, _, _, cx| {
@@ -1123,7 +1154,7 @@ impl SessionView {
                         cx.notify();
                     }))
                     .text_color(self.clipboard_transfer.color(cx))
-                    .disabled(!live || self.clipboard_transfer.busy()),
+                    .disabled(!live || self.clipboard_transfer.busy() || self.touch_gesture.busy()),
             )
             .child(div().flex_1())
             .child(self.render_function_button(true, cx))
@@ -1566,6 +1597,7 @@ impl Render for SessionView {
         }
         self.update_local_cursor(window, cx);
         self.finish_keyboard_paste(window, cx);
+        self.guard_touch_gesture(window, cx);
         self.advance_post_paste_touch(window, cx, std::time::Instant::now());
         let width = window.viewport_size().width;
         let height = window.viewport_size().height;
@@ -2130,6 +2162,7 @@ mod apps_ui;
 mod assistant_bridge;
 mod clipboard_ui;
 mod paste_touch;
+mod touch_ui;
 mod controls_ui;
 mod functions_ui;
 mod karing_ui;

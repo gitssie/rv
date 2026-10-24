@@ -22,6 +22,7 @@ mod error;
 mod file_transfer;
 mod notifications;
 mod pointer_timing;
+mod touch_gesture;
 mod session;
 pub use notifications::{NotificationSnapshot, PhoneNotification};
 mod vencrypt;

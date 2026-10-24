@@ -41,6 +41,8 @@ pub struct RemoteApp {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppCommand {
     List,
+    RandomTouch(u32),
+    CancelTouch(u32),
     Karing(crate::KaringRequest),
     CancelKaring,
     Launch(String),
@@ -91,6 +93,7 @@ impl AppCommand {
     }
     fn op(&self) -> u8 {
         match self {
+            Self::RandomTouch(_) | Self::CancelTouch(_) => 0,
             Self::HttpUnlock(_, _) | Self::HttpLock(_) | Self::CancelScreen(_) => 0,
             Self::Karing(_) | Self::CancelKaring => 0,
             Self::List => 1,
@@ -117,7 +120,8 @@ impl AppCommand {
         }
         matches!(
             self,
-            Self::Launch(_)
+            Self::RandomTouch(_)
+                | Self::Launch(_)
                 | Self::Terminate(_)
                 | Self::Restart(_)
                 | Self::PrepareUnlock(_)
@@ -189,6 +193,7 @@ pub(crate) struct AppRuntime {
     screen_operation: Option<crate::screen_control::ScreenOperation>,
     karing_operations: Vec<crate::karing::KaringOperation>,
     profile_operations: Vec<crate::app_profile::ProfileOperation>,
+    gesture: Option<crate::touch_gesture::GestureOperation>,
 }
 
 impl AppRuntime {
@@ -207,11 +212,14 @@ impl AppRuntime {
             screen_operation: None,
             karing_operations: Vec::new(),
             profile_operations: Vec::new(),
+            gesture: None,
         }
     }
     fn supported(&self, cmd: &AppCommand) -> bool {
         (!cmd.mutates() || (self.allowed && self.caps.control))
             && match cmd {
+                AppCommand::RandomTouch(_) => self.caps.control && self.caps.zx_control.is_some(),
+                AppCommand::CancelTouch(_) => true,
                 AppCommand::HttpUnlock(_, _) => self.caps.http_screen_control && self.caps.unlock,
                 AppCommand::HttpLock(_) => self.caps.http_screen_control && self.caps.lock,
                 AppCommand::CancelKaring => true,
@@ -238,6 +246,35 @@ impl AppRuntime {
             }
     }
     pub fn command(&mut self, command: AppCommand, send: &impl Fn(AppEvent)) {
+        if let AppCommand::CancelTouch(id) = command {
+            if let Some(operation) = &self.gesture
+                && operation.command == AppCommand::RandomTouch(id)
+            {
+                operation.cancel();
+            }
+            return;
+        }
+        if let AppCommand::RandomTouch(id) = command {
+            let result = if !self.supported(&command) || !self.control_ready
+                || self.gesture.is_some() || self.screen_operation.is_some()
+                || self.pending.values().any(|(cmd, _)| cmd.mutates())
+                || self.queue.iter().any(AppCommand::mutates)
+            {
+                Err("触摸控制不可用或手机正在执行其他操作".to_string())
+            } else {
+                self.http_client.clone().ok_or_else(|| "HTTP/2 控制尚未就绪".to_string())
+                    .and_then(|client| crate::touch_gesture::GestureOperation::start(client, id))
+            };
+            match result {
+                Ok(operation) => self.gesture = Some(operation),
+                Err(message) => send(AppEvent::Failed { command, message }),
+            }
+            return;
+        }
+        if self.gesture.is_some() && command.mutates() {
+            send(AppEvent::Failed { command, message: "请先停止触摸测试".into() });
+            return;
+        }
         if let AppCommand::ReadProfile {
             app_id,
             bundle,
@@ -417,6 +454,21 @@ impl AppRuntime {
         self.control_ready
     }
     async fn advance_transport(&mut self, client: Option<&VncClient>, send: &impl Fn(AppEvent)) {
+        if let Some(operation) = &mut self.gesture {
+            let result = match operation.result.try_recv() {
+                Ok(result) => Some(result),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => None,
+                Err(_) => Some(Err("触摸测试已停止；请检查手机".into())),
+            };
+            if let Some(result) = result {
+                let command = operation.command.clone();
+                self.gesture = None;
+                send(match result {
+                    Ok(()) => AppEvent::Finished(command),
+                    Err(message) => AppEvent::Failed { command, message },
+                });
+            }
+        }
         self.profile_operations
             .retain_mut(|operation| match operation.result.try_recv() {
                 Ok(Ok(response)) => {
@@ -816,6 +868,7 @@ impl AppRuntime {
         self.http_client.clone()
     }
     fn control_unavailable(&mut self, send: &impl Fn(AppEvent)) {
+        if let Some(operation) = &self.gesture { operation.cancel(); }
         let queued = std::mem::take(&mut self.queue);
         for command in queued {
             if command.mutates() {

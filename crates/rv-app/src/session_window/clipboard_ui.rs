@@ -104,7 +104,9 @@ fn fingerprint(text: &str) -> u64 {
 impl SessionView {
     pub(super) fn begin_clipboard_transfer(&mut self, paste: bool, cx: &App) {
         self.cancel_post_paste_touch();
-        if self.view_only() || self.phase != Phase::Connected || self.clipboard_transfer.busy() {
+        if self.view_only() || self.phase != Phase::Connected || self.clipboard_transfer.busy()
+            || self.touch_gesture.busy()
+        {
             return;
         }
         if paste

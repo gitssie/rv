@@ -319,6 +319,10 @@ fn app_action_button(
 
 impl SessionView {
     pub(super) fn apply_app_event(&mut self, event: AppEvent, cx: &mut Context<Self>) {
+        if self.touch_gesture_event(&event) {
+            cx.notify();
+            return;
+        }
         match event {
             AppEvent::Profile(profile) => {
                 if let Some(book) = self.address_book.as_ref().and_then(WeakEntity::upgrade) {

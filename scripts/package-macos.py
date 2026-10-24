@@ -31,6 +31,12 @@ def main():
         shutil.copy2(args.binary, contents / "MacOS/rv")
         assets = Path(__file__).resolve().parent.parent / "assets"
         shutil.copy2(assets / "app-icon.icns", contents / "Resources/app-icon.icns")
+        source_root = Path(__file__).resolve().parent.parent
+        shutil.copytree(
+            source_root / "crates/rv-session/assets/cursory",
+            contents / "Resources/licenses/cursory",
+            ignore=shutil.ignore_patterns("trajectories.json.gz"),
+        )
         info = {
             "CFBundleName": "RV", "CFBundleDisplayName": "RV",
             "CFBundleIdentifier": bundle_id, "CFBundleExecutable": "rv",

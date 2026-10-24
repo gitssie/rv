@@ -2,7 +2,8 @@ use gpui::{AssetSource, Result, SharedString};
 use gpui_component::IconNamed;
 use std::borrow::Cow;
 
-const ICONS: [(&str, &[u8]); 21] = [
+const ICONS: [(&str, &[u8]); 22] = [
+    ("rv-icons/move.svg", include_bytes!("../../../assets/icons/move.svg")),
     (
         "rv-icons/trash.svg",
         include_bytes!("../../../assets/icons/trash.svg"),
@@ -154,6 +155,7 @@ mod tests {
             assert!(Assets.list("rv-icons/").unwrap().contains(&path));
         }
         for icon in [
+            FunctionIcon::Move,
             FunctionIcon::Cloud,
             FunctionIcon::Mail,
             FunctionIcon::LogOut,
@@ -170,6 +172,7 @@ mod tests {
 
 #[derive(Clone)]
 pub enum FunctionIcon {
+    Move,
     Edit,
     Trash,
     Products,
@@ -195,6 +198,7 @@ pub enum FunctionIcon {
 impl IconNamed for FunctionIcon {
     fn path(self) -> SharedString {
         match self {
+            Self::Move => "rv-icons/move.svg",
             Self::Edit => "rv-icons/pencil.svg",
             Self::Trash => "rv-icons/trash.svg",
             Self::Products => "rv-icons/shopping-bag.svg",

@@ -10,6 +10,26 @@ pub struct PhoneHttpClient {
     token: Arc<RwLock<String>>,
 }
 impl PhoneHttpClient {
+    fn transport() -> Result<Client, reqwest::Error> {
+        Client::builder()
+            .http2_prior_knowledge()
+            .no_proxy()
+            .retry(reqwest::retry::never())
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(5))
+            .build()
+    }
+
+    /// A touch sequence owns its TCP connection so disconnect cleanup cannot
+    /// affect another controller's fingers. Authentication is still shared.
+    pub(crate) fn isolated(&self) -> Result<Self, reqwest::Error> {
+        Ok(Self {
+            client: Self::transport()?,
+            origin: self.origin.clone(),
+            token: self.token.clone(),
+        })
+    }
+
     pub fn new(host: &str, port: u16, token: String) -> Result<Self, reqwest::Error> {
         let host = if host.contains(':') && !host.starts_with('[') {
             format!("[{host}]")
@@ -17,13 +37,7 @@ impl PhoneHttpClient {
             host.to_owned()
         };
         Ok(Self {
-            client: Client::builder()
-                .http2_prior_knowledge()
-                .no_proxy()
-                .retry(reqwest::retry::never())
-                .redirect(reqwest::redirect::Policy::none())
-                .connect_timeout(Duration::from_secs(5))
-                .build()?,
+            client: Self::transport()?,
             origin: format!("http://{host}:{port}"),
             token: Arc::new(RwLock::new(token)),
         })

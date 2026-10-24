@@ -398,6 +398,54 @@ fn offscreen_keyboard_forwards_pairs_and_consumes_menu_shortcuts(cx: &mut TestAp
 }
 
 #[gpui::test]
+fn offscreen_random_touch_is_explicit_single_flight_and_hover_does_not_cancel(cx: &mut TestAppContext) {
+    let (view, cx, mut peer) = setup(cx, false);
+    let caps = serde_json::from_value(serde_json::json!({
+        "control":true,"zx_control":{"version":3,"port":6000,"token":"fixture"}
+    })).unwrap();
+    view.update(cx, |view, cx| view.apply_app_event(rv_session::AppEvent::Capabilities(caps), cx));
+    commands(&mut peer);
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let button = cx.debug_bounds("random-touch").unwrap();
+    cx.simulate_click(button.center(), Modifiers::default());
+    let sent = commands(&mut peer);
+    let ids: Vec<_> = sent.iter().filter_map(|command| match command {
+        SessionCommand::App(rv_session::AppCommand::RandomTouch(id)) => Some(*id),
+        _ => None,
+    }).collect();
+    assert_eq!(ids.len(), 1);
+    view.update(cx, |view, _| view.send_pointer(10, 20));
+    assert!(commands(&mut peer).is_empty());
+    cx.simulate_click(button.center(), Modifiers::default());
+    assert!(matches!(commands(&mut peer).as_slice(),
+        [SessionCommand::App(rv_session::AppCommand::CancelTouch(id))] if *id == ids[0]));
+    view.update(cx, |view, cx| view.apply_app_event(rv_session::AppEvent::Finished(
+        rv_session::AppCommand::RandomTouch(ids[0].wrapping_add(1))), cx));
+    view.read_with(cx, |view, _| assert!(view.touch_gesture.busy()));
+    view.update(cx, |view, cx| view.apply_app_event(rv_session::AppEvent::Finished(
+        rv_session::AppCommand::RandomTouch(ids[0])), cx));
+    view.read_with(cx, |view, _| assert!(!view.touch_gesture.busy()));
+    // Modifier callbacks construct events by updating Keyboard before send_keys.
+    // Cancelling playback must discard that unsent state as well as the events.
+    cx.simulate_click(button.center(), Modifiers::default());
+    let sent = commands(&mut peer);
+    let id = sent.iter().find_map(|command| match command {
+        SessionCommand::App(rv_session::AppCommand::RandomTouch(id)) => Some(*id),
+        _ => None,
+    }).unwrap();
+    view.update(cx, |view, _| {
+        let events = view.keys.set_modifiers(true, false, false);
+        view.send_keys(events);
+    });
+    assert!(matches!(commands(&mut peer).as_slice(),
+        [SessionCommand::App(rv_session::AppCommand::CancelTouch(cancelled))] if *cancelled == id));
+    view.update(cx, |view, cx| {
+        view.apply_app_event(rv_session::AppEvent::Finished(rv_session::AppCommand::RandomTouch(id)), cx);
+        assert!(!view.keys.set_modifiers(true, false, false).is_empty());
+    });
+}
+
+#[gpui::test]
 fn offscreen_trollvnc_paste_waits_for_ack_and_does_not_repeat(cx: &mut TestAppContext) {
     let (view, cx, mut peer) = setup(cx, false);
     view.update(cx, |view, _| view.clipboard_transfer.last_click = Some((100, 100)));
