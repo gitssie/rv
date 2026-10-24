@@ -3,15 +3,27 @@ use std::time::{Duration, Instant};
 
 use vnc::ClientMouseEvent;
 
-const MIN_CLICK_HOLD: Duration = Duration::from_millis(100);
+const MIN_CLICK_HOLD: Duration = Duration::from_millis(60);
+const MAX_CLICK_HOLD: Duration = Duration::from_millis(200);
 
-/// Preserve pointer ordering while holding a stationary left click for at least
-/// 100 ms. Keys, frame decoding and connection shutdown never wait on this timer.
+fn random_click_hold() -> Duration {
+    // Rejection sampling gives every integer millisecond in 60..=200 the
+    // same probability. UUID byte 0 contains no fixed version/variant bits.
+    loop {
+        let sample = uuid::Uuid::new_v4().as_bytes()[0];
+        if u128::from(sample) <= (MAX_CLICK_HOLD - MIN_CLICK_HOLD).as_millis() {
+            return MIN_CLICK_HOLD + Duration::from_millis(u64::from(sample));
+        }
+    }
+}
+
+/// Preserve pointer ordering with a fresh 60–200 ms minimum hold per left click.
+/// Longer holds and drags retain their timing. Keys, frames and shutdown do not wait.
 #[derive(Default)]
 pub(crate) struct PointerTiming {
     pending: VecDeque<ClientMouseEvent>,
     sent: Option<ClientMouseEvent>,
-    down_at: Option<Instant>,
+    release_at: Option<Instant>,
     dragged: bool,
 }
 
@@ -21,6 +33,14 @@ impl PointerTiming {
     }
 
     pub fn pop_ready(&mut self, now: Instant) -> Option<ClientMouseEvent> {
+        self.pop_ready_with_hold(now, random_click_hold)
+    }
+
+    fn pop_ready_with_hold(
+        &mut self,
+        now: Instant,
+        next_hold: impl FnOnce() -> Duration,
+    ) -> Option<ClientMouseEvent> {
         let next = self.pending.front()?;
         let was_down = self.sent.as_ref().is_some_and(|e| e.bottons & 1 != 0);
         let is_down = next.bottons & 1 != 0;
@@ -32,7 +52,7 @@ impl PointerTiming {
             && !is_down
             && !self.dragged
             && !changed_position
-            && self.down_at.is_some_and(|at| now < at + MIN_CLICK_HOLD)
+            && self.release_at.is_some_and(|at| now < at)
         {
             return None;
         }
@@ -40,12 +60,12 @@ impl PointerTiming {
         if is_down && !was_down {
             // Start from actual dispatch, not enqueue time: a busy network loop
             // must not compress a queued down/up pair into a zero-length click.
-            self.down_at = Some(now);
+            self.release_at = Some(now + next_hold());
             self.dragged = false;
         } else if is_down && changed_position {
             self.dragged = true;
         } else if !is_down {
-            self.down_at = None;
+            self.release_at = None;
         }
         self.sent = Some(event.clone());
         Some(event)
@@ -53,7 +73,7 @@ impl PointerTiming {
 
     pub fn cancel(&mut self) -> Option<ClientMouseEvent> {
         self.pending.clear();
-        self.down_at = None;
+        self.release_at = None;
         let mut event = self.sent.take()?;
         if event.bottons == 0 {
             return None;
@@ -68,6 +88,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn each_press_samples_once_and_keeps_its_deadline_including_range_endpoints() {
+        let mut timing = PointerTiming::default();
+        let mut now = Instant::now();
+        for hold in [MIN_CLICK_HOLD, MAX_CLICK_HOLD, Duration::from_millis(137)] {
+            timing.push((10, 20, 1).into());
+            timing.push((10, 20, 0).into());
+            assert_eq!(timing.pop_ready_with_hold(now, || hold).unwrap().bottons, 1);
+            let deadline = now + hold;
+            for offset in [0, 1, 30] {
+                assert!(
+                    timing
+                        .pop_ready_with_hold(now + Duration::from_millis(offset), || {
+                            panic!("must not resample while polling release")
+                        })
+                        .is_none()
+                );
+            }
+            assert!(
+                timing
+                    .pop_ready(deadline - Duration::from_millis(1))
+                    .is_none()
+            );
+            assert_eq!(timing.pop_ready(deadline).unwrap().bottons, 0);
+            now = deadline;
+        }
+    }
+
+    #[test]
+    fn random_holds_stay_in_requested_range() {
+        for _ in 0..1000 {
+            assert!((MIN_CLICK_HOLD..=MAX_CLICK_HOLD).contains(&random_click_hold()));
+        }
+    }
+
+    #[test]
     fn quick_click_waits_and_hover_does_not_overtake_release() {
         let mut timing = PointerTiming::default();
         let now = Instant::now();
@@ -75,13 +130,16 @@ mod tests {
         timing.push((10, 20, 0).into());
         timing.push((90, 80, 0).into());
         assert_eq!(timing.pop_ready(now).unwrap().bottons, 1);
-        assert!(timing.pop_ready(now + Duration::from_millis(99)).is_none());
-        let up = timing.pop_ready(now + MIN_CLICK_HOLD).unwrap();
-        assert_eq!((up.position_x, up.position_y, up.bottons), (10, 20, 0));
-        assert_eq!(
-            timing.pop_ready(now + MIN_CLICK_HOLD).unwrap().position_x,
-            90
+        let deadline = timing.release_at.unwrap();
+        assert!((MIN_CLICK_HOLD..=MAX_CLICK_HOLD).contains(&deadline.duration_since(now)));
+        assert!(
+            timing
+                .pop_ready(deadline - Duration::from_millis(1))
+                .is_none()
         );
+        let up = timing.pop_ready(deadline).unwrap();
+        assert_eq!((up.position_x, up.position_y, up.bottons), (10, 20, 0));
+        assert_eq!(timing.pop_ready(deadline).unwrap().position_x, 90);
     }
 
     #[test]
@@ -95,14 +153,25 @@ mod tests {
         // Dispatch starts late; enqueue time must not count toward the hold.
         let late = now + Duration::from_secs(1);
         timing.pop_ready(late).unwrap();
-        assert!(timing.pop_ready(late).is_none());
-        assert_eq!(timing.pop_ready(late + MIN_CLICK_HOLD).unwrap().bottons, 0);
-        assert_eq!(timing.pop_ready(late + MIN_CLICK_HOLD).unwrap().bottons, 1);
-        assert!(timing.pop_ready(late + MIN_CLICK_HOLD).is_none());
-        assert_eq!(
-            timing.pop_ready(late + MIN_CLICK_HOLD * 2).unwrap().bottons,
-            0
+        let first_deadline = timing.release_at.unwrap();
+        assert!(
+            timing
+                .pop_ready(first_deadline - Duration::from_millis(1))
+                .is_none()
         );
+        assert_eq!(timing.pop_ready(first_deadline).unwrap().bottons, 0);
+        assert_eq!(timing.pop_ready(first_deadline).unwrap().bottons, 1);
+        let second_deadline = timing.release_at.unwrap();
+        assert!(
+            (MIN_CLICK_HOLD..=MAX_CLICK_HOLD)
+                .contains(&second_deadline.duration_since(first_deadline))
+        );
+        assert!(
+            timing
+                .pop_ready(second_deadline - Duration::from_millis(1))
+                .is_none()
+        );
+        assert_eq!(timing.pop_ready(second_deadline).unwrap().bottons, 0);
     }
 
     #[test]

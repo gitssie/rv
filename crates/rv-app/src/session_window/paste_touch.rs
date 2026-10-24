@@ -34,7 +34,7 @@ impl PasteTouch {
         Some(Self {
             point: (coordinate(anchor.0, size.0, normals[2]), coordinate(anchor.1, size.1, normals[3])),
             long_hold: Duration::from_millis((1000.0 + normals[0] * 100.0).round() as u64),
-            // Respect the user's 100 ms minimum click hold in the RFB sender.
+            // Keep the post-paste short tap in its own 100–120 ms range.
             short_hold: Duration::from_millis((110.0 + normals[1] * 10.0).round() as u64),
             stage: 0,
             deadline: now + Duration::from_millis(150),

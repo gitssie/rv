@@ -88,7 +88,7 @@ fn quick_click_release_is_delayed_on_wire_without_delaying_keys() {
         pointers.iter().map(|e| (e.0, e.1)).collect::<Vec<_>>(),
         [(1, 1), (0, 1), (0, 7)]
     );
-    assert!(pointers[1].2.duration_since(pointers[0].2) >= Duration::from_millis(90));
+    assert!(pointers[1].2.duration_since(pointers[0].2) >= Duration::from_millis(50));
     assert!(
         key_at < pointers[1].2,
         "key-up must not wait for pointer release"
