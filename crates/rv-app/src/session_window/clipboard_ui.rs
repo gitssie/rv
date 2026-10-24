@@ -24,6 +24,8 @@ pub(super) struct ClipboardTransfer {
     pending: Option<PendingClipboard>,
     feedback: Feedback,
     outbound_echo: Option<(u64, std::time::Instant)>,
+    pub(super) last_click: Option<(u16, u16)>,
+    pub(super) post_paste: Option<paste_touch::PasteTouch>,
 }
 impl ClipboardTransfer {
     pub(super) fn expire_feedback(&mut self, now: std::time::Instant) -> bool {
@@ -52,6 +54,8 @@ impl ClipboardTransfer {
         }
     }
     pub(super) fn disconnected(&mut self) {
+        self.post_paste = None;
+        self.last_click = None;
         if self.pending.take().is_some() {
             self.feedback = Feedback::Failed;
         }
@@ -99,6 +103,7 @@ fn fingerprint(text: &str) -> u64 {
 
 impl SessionView {
     pub(super) fn begin_clipboard_transfer(&mut self, paste: bool, cx: &App) {
+        self.cancel_post_paste_touch();
         if self.view_only() || self.phase != Phase::Connected || self.clipboard_transfer.busy() {
             return;
         }
@@ -210,10 +215,44 @@ impl SessionView {
                 .set_modifiers(mods.control, mods.alt, mods.platform),
         );
         self.send_keys(events);
+        if self.buttons == 0 {
+            if let Some(anchor) = self.clipboard_transfer.last_click {
+                let mut entropy = [0; 32];
+                entropy[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+                entropy[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+                self.clipboard_transfer.post_paste = paste_touch::PasteTouch::new(
+                    anchor, (self.fb_w, self.fb_h), entropy, std::time::Instant::now(),
+                );
+            }
+        }
         clear_sent_clipboard(&pending, cx);
         self.clipboard_transfer.feedback =
             Feedback::Sent(std::time::Instant::now() + Duration::from_secs(3));
         self.status = "剪贴板已发送".into();
+    }
+
+    pub(super) fn cancel_post_paste_touch(&mut self) {
+        if let Some(plan) = self.clipboard_transfer.post_paste.take() {
+            if plan.pressed() {
+                self.handle.pointer(plan.point.0, plan.point.1, 0);
+            }
+        }
+    }
+
+    pub(super) fn advance_post_paste_touch(&mut self, window: &mut Window, cx: &mut App, now: std::time::Instant) {
+        if self.clipboard_transfer.post_paste.is_none() { return; }
+        let blocked = !window.is_window_active() || !self.focus.is_focused(window)
+            || self.phase != Phase::Connected || self.view_only() || self.buttons != 0
+            || self.unlock.blocks_input() || self.functions.open || self.mailbox.open
+            || self.notifications.open || self.apps.picker_open || self.show_menu
+            || window.has_active_dialog(cx)
+            || self.clipboard_transfer.post_paste.as_ref().is_some_and(|p| p.point.0 >= self.fb_w || p.point.1 >= self.fb_h);
+        if blocked { self.cancel_post_paste_touch(); return; }
+        let plan = self.clipboard_transfer.post_paste.as_mut().unwrap();
+        if let Some(down) = plan.poll(now) {
+            self.handle.pointer(plan.point.0, plan.point.1, u8::from(down));
+        }
+        if plan.finished() { self.clipboard_transfer.post_paste = None; }
     }
 }
 
@@ -264,6 +303,8 @@ mod tests {
             }),
             feedback: Feedback::Sending,
             outbound_echo: None,
+            last_click: None,
+            post_paste: None,
         }
     }
     #[test]

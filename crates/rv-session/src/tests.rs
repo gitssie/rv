@@ -29,6 +29,71 @@ fn read_exact(s: &mut TcpStream, n: usize) -> Vec<u8> {
 }
 
 const EXTENDED_CLIPBOARD_ENCODING: u32 = 0xC0A1_E5CE;
+
+#[test]
+fn quick_click_release_is_delayed_on_wire_without_delaying_keys() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let (mut sock, _) = listener.accept().unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        rfb_handshake(&mut sock, 8, 8, b"timing");
+        let mut ready = Some(ready_tx);
+        let mut pointers = Vec::new();
+        let mut key_at = None;
+        while pointers.len() < 3 {
+            let typ = read_exact(&mut sock, 1)[0];
+            match typ {
+                0 => {
+                    read_exact(&mut sock, 19);
+                }
+                2 => {
+                    read_exact(&mut sock, 1);
+                    let count = u16::from_be_bytes(read_exact(&mut sock, 2).try_into().unwrap());
+                    read_exact(&mut sock, count as usize * 4);
+                }
+                3 => {
+                    read_exact(&mut sock, 9);
+                    if let Some(tx) = ready.take() {
+                        tx.send(()).unwrap();
+                    }
+                }
+                4 => {
+                    read_exact(&mut sock, 7);
+                    key_at = Some(Instant::now());
+                }
+                5 => {
+                    let data = read_exact(&mut sock, 5);
+                    pointers.push((
+                        data[0],
+                        u16::from_be_bytes([data[1], data[2]]),
+                        Instant::now(),
+                    ));
+                }
+                other => panic!("unexpected RFB message {other}"),
+            }
+        }
+        (pointers, key_at.unwrap())
+    });
+    let handle = SessionHandle::spawn(request_for(port));
+    ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    handle.pointer(1, 1, 1);
+    handle.pointer(1, 1, 0);
+    handle.pointer(7, 7, 0);
+    handle.key(0xff0d, false);
+    let (pointers, key_at) = server.join().unwrap();
+    handle.close();
+    assert_eq!(
+        pointers.iter().map(|e| (e.0, e.1)).collect::<Vec<_>>(),
+        [(1, 1), (0, 1), (0, 7)]
+    );
+    assert!(pointers[1].2.duration_since(pointers[0].2) >= Duration::from_millis(90));
+    assert!(
+        key_at < pointers[1].2,
+        "key-up must not wait for pointer release"
+    );
+}
 const CLIPBOARD_TEXT: u32 = 1;
 const CLIPBOARD_CAPS: u32 = 1 << 24;
 const CLIPBOARD_REQUEST: u32 = 1 << 25;

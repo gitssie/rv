@@ -6,6 +6,7 @@ use gpui::{
 };
 use rv_core::{ClipboardMode, ConnectRequest, LocalCursorMode, ScaleMode};
 use rv_session::{SessionCommand, SessionEvent, SessionHandle, SessionTestPeer};
+use std::time::Duration;
 
 pub(super) fn setup(
     cx: &mut TestAppContext,
@@ -399,6 +400,7 @@ fn offscreen_keyboard_forwards_pairs_and_consumes_menu_shortcuts(cx: &mut TestAp
 #[gpui::test]
 fn offscreen_trollvnc_paste_waits_for_ack_and_does_not_repeat(cx: &mut TestAppContext) {
     let (view, cx, mut peer) = setup(cx, false);
+    view.update(cx, |view, _| view.clipboard_transfer.last_click = Some((100, 100)));
     peer.events.send(SessionEvent::Apps(rv_session::AppEvent::Capabilities(
         rv_session::AppCapabilities { control: true, clipboard_write: true, ..Default::default() }
     ))).unwrap();
@@ -421,6 +423,7 @@ fn offscreen_trollvnc_paste_waits_for_ack_and_does_not_repeat(cx: &mut TestAppCo
         SessionCommand::Input(vnc::X11Event::KeyEvent(event)) if event.keycode == u32::from(b'v'))));
     view.update(cx, |view, cx| view.apply_app_event(rv_session::AppEvent::Finished(writes[0].clone()), cx));
     cx.update(|window, cx| { view.update(cx, |view, cx| view.finish_keyboard_paste(window, cx)); });
+    view.read_with(cx, |view, _| assert!(view.clipboard_transfer.post_paste.is_some()));
     let sent = commands(&mut peer);
     assert_eq!(sent.iter().filter(|command| matches!(command,
         SessionCommand::Input(vnc::X11Event::KeyEvent(event)) if event.keycode == u32::from(b'v'))).count(), 2);
@@ -429,6 +432,52 @@ fn offscreen_trollvnc_paste_waits_for_ack_and_does_not_repeat(cx: &mut TestAppCo
     assert!(!commands(&mut peer).iter().any(|command| matches!(command,
         SessionCommand::App(rv_session::AppCommand::WriteClipboard { .. })) || matches!(command,
         SessionCommand::Input(vnc::X11Event::KeyEvent(event)) if event.keycode == u32::from(b'v'))));
+}
+
+#[gpui::test]
+fn offscreen_post_paste_touch_is_paired_and_manual_input_cancels(cx: &mut TestAppContext) {
+    let (view, cx, mut peer) = setup(cx, false);
+    commands(&mut peer);
+    let now = std::time::Instant::now();
+    view.update(cx, |view, _| {
+        view.clipboard_transfer.post_paste = super::paste_touch::PasteTouch::new(
+            (100, 100), (view.fb_w, view.fb_h), [42; 32], now,
+        );
+    });
+    let later = now + Duration::from_secs(10);
+    cx.update(|window, cx| view.update(cx, |view, cx| view.advance_post_paste_touch(window, cx, later)));
+    let sent = commands(&mut peer);
+    assert_eq!(sent.len(), 1);
+    assert!(matches!(&sent[0], SessionCommand::Input(vnc::X11Event::PointerEvent(ev)) if ev.bottons == 1));
+    // Manual pointer input releases the scripted finger before forwarding itself.
+    view.update(cx, |view, _| view.send_pointer(200, 200));
+    let sent = commands(&mut peer);
+    assert_eq!(sent.len(), 2);
+    assert!(matches!(&sent[0], SessionCommand::Input(vnc::X11Event::PointerEvent(ev)) if ev.bottons == 0 && ev.position_x.abs_diff(100) <= 2));
+    assert!(matches!(&sent[1], SessionCommand::Input(vnc::X11Event::PointerEvent(ev)) if ev.bottons == 0 && ev.position_x == 200));
+    cx.update(|window, cx| view.update(cx, |view, cx| view.advance_post_paste_touch(window, cx, later + Duration::from_secs(10))));
+    assert!(commands(&mut peer).is_empty());
+}
+
+#[gpui::test]
+fn offscreen_post_paste_touch_stops_when_remote_focus_is_lost(cx: &mut TestAppContext) {
+    let (view, cx, mut peer) = setup(cx, false);
+    commands(&mut peer);
+    let now = std::time::Instant::now();
+    view.update(cx, |view, _| {
+        view.clipboard_transfer.post_paste = super::paste_touch::PasteTouch::new(
+            (100, 100), (view.fb_w, view.fb_h), [42; 32], now,
+        );
+    });
+    let later = now + Duration::from_secs(10);
+    cx.update(|window, cx| view.update(cx, |view, cx| view.advance_post_paste_touch(window, cx, later)));
+    commands(&mut peer);
+    view.update(cx, |view, _| view.show_menu = true);
+    cx.update(|window, cx| view.update(cx, |view, cx| view.advance_post_paste_touch(window, cx, later)));
+    let sent = commands(&mut peer);
+    assert_eq!(sent.len(), 1);
+    assert!(matches!(&sent[0], SessionCommand::Input(vnc::X11Event::PointerEvent(ev)) if ev.bottons == 0));
+    view.read_with(cx, |view, _| assert!(view.clipboard_transfer.post_paste.is_none()));
 }
 
 #[gpui::test]

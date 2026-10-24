@@ -21,6 +21,7 @@ mod encodings;
 mod error;
 mod file_transfer;
 mod notifications;
+mod pointer_timing;
 mod session;
 pub use notifications::{NotificationSnapshot, PhoneNotification};
 mod vencrypt;

@@ -699,7 +699,7 @@ impl SessionView {
             self.last_generation = generation;
             self.rebuild_image(cx);
         }
-        if changed {
+        if changed || self.clipboard_transfer.post_paste.is_some() {
             cx.notify();
         }
     }
@@ -771,6 +771,7 @@ impl SessionView {
     }
 
     fn send_pointer(&mut self, x: u16, y: u16) {
+        self.cancel_post_paste_touch();
         if self.view_only() || self.unlock.blocks_input() || self.phase != Phase::Connected {
             return;
         }
@@ -784,6 +785,12 @@ impl SessionView {
     }
 
     fn button(&mut self, bit: u8, down: bool, position: Point<Pixels>) {
+        self.cancel_post_paste_touch();
+        if bit == 1 && down && !self.view_only() && !self.unlock.blocks_input() && self.phase == Phase::Connected {
+            if let Some(point) = self.map_pointer(position) {
+                self.clipboard_transfer.last_click = Some(point);
+            }
+        }
         if down {
             self.buttons |= bit;
         } else {
@@ -859,6 +866,7 @@ impl SessionView {
     }
 
     fn disconnect(&mut self, cx: &mut Context<Self>) {
+        self.cancel_post_paste_touch();
         self.recovery.stop();
         if matches!(self.phase, Phase::Disconnecting | Phase::Ended) {
             return;
@@ -884,6 +892,8 @@ impl SessionView {
     }
 
     fn start_reconnect(&mut self, cx: &mut Context<Self>) {
+        self.cancel_post_paste_touch();
+        self.clipboard_transfer.last_click = None;
         self.recovery.deadline = None;
         self.apps.disconnected(cx);
         self.karing.disconnected();
@@ -1013,6 +1023,7 @@ impl SessionView {
             self.consume_key(window, cx);
             return;
         }
+        self.cancel_post_paste_touch();
         let mut events = self
             .keys
             .set_modifiers(mods.control, mods.alt, mods.platform);
@@ -1550,6 +1561,7 @@ impl Render for SessionView {
         }
         self.update_local_cursor(window, cx);
         self.finish_keyboard_paste(window, cx);
+        self.advance_post_paste_touch(window, cx, std::time::Instant::now());
         let width = window.viewport_size().width;
         let height = window.viewport_size().height;
         let fullscreen = window.is_fullscreen();
@@ -2112,6 +2124,7 @@ mod tests {
 mod apps_ui;
 mod assistant_bridge;
 mod clipboard_ui;
+mod paste_touch;
 mod controls_ui;
 mod functions_ui;
 mod karing_ui;

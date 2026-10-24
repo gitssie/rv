@@ -23,6 +23,7 @@ use crate::file_transfer::{
     self, FileCommand, FileTransferClient, FileTransferSnapshot, PHOTO_PAGE_SIZE, PhotoAlbum,
     PhotoDeleteStatus, PhotoEntry, PhotoFailure, TransferDirection, TransferRecord, TransferStatus,
 };
+use crate::pointer_timing::PointerTiming;
 use crate::vencrypt;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -481,6 +482,7 @@ async fn session_loop(
     // Firing them unconditionally queues every key event behind a backlog of
     // requests the server has not answered yet.
     let mut refresh_answered = false; // The connector already requested the first frame.
+    let mut pointer_timing = PointerTiming::default();
     let mut files = FileRuntime::new(file_state, !request.view_only);
     let mut apps = crate::apps::AppRuntime::new(!request.view_only);
     if independent_allowed {
@@ -496,11 +498,12 @@ async fn session_loop(
     loop {
         // Input first: a key-up queued behind frame decoding turns into
         // auto-repeat on the server, so pixels never take priority over commands.
-        loop {
+        for _ in 0..MAX_EVENTS_PER_SLOT {
             match cmd_rx.try_recv() {
                 Ok(cmd) => {
                     if !apply_command(
                         &mut client,
+                        &mut pointer_timing,
                         cmd,
                         &mut files,
                         &mut apps,
@@ -515,10 +518,15 @@ async fn session_loop(
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
+                    release_pointer(&mut client, &mut pointer_timing).await;
                     let _ = client.close().await;
                     return Ok(());
                 }
             }
+        }
+
+        while let Some(pointer) = pointer_timing.pop_ready(Instant::now()) {
+            client.input(X11Event::PointerEvent(pointer)).await?;
         }
 
         let mut applied = 0;
@@ -588,11 +596,12 @@ async fn session_loop(
             cmd = cmd_rx.recv() => {
                 match cmd {
                     None => {
+                        release_pointer(&mut client, &mut pointer_timing).await;
                         let _ = client.close().await;
                         return Ok(());
                     }
                     Some(cmd) => {
-                        if !apply_command(&mut client, cmd, &mut files, &mut apps, &app_send, &mut functions, &function_send).await? {
+                        if !apply_command(&mut client, &mut pointer_timing, cmd, &mut files, &mut apps, &app_send, &mut functions, &function_send).await? {
                             return Ok(());
                         }
                     }
@@ -606,6 +615,7 @@ async fn session_loop(
 /// Returns `Ok(false)` once the session should end.
 async fn apply_command(
     client: &mut vnc::VncClient,
+    pointer_timing: &mut PointerTiming,
     cmd: SessionCommand,
     files: &mut FileRuntime,
     apps: &mut crate::apps::AppRuntime,
@@ -615,8 +625,16 @@ async fn apply_command(
 ) -> Result<bool, SessionError> {
     match cmd {
         SessionCommand::Close => {
+            release_pointer(client, pointer_timing).await;
             let _ = client.close().await;
             Ok(false)
+        }
+        SessionCommand::Input(X11Event::PointerEvent(ev)) => {
+            pointer_timing.push(ev);
+            while let Some(pointer) = pointer_timing.pop_ready(Instant::now()) {
+                client.input(X11Event::PointerEvent(pointer)).await?;
+            }
+            Ok(true)
         }
         SessionCommand::Input(ev) => {
             client.input(ev).await?;
@@ -637,6 +655,12 @@ async fn apply_command(
             });
             Ok(true)
         }
+    }
+}
+
+async fn release_pointer(client: &mut vnc::VncClient, timing: &mut PointerTiming) {
+    if let Some(release) = timing.cancel() {
+        let _ = client.input(X11Event::PointerEvent(release)).await;
     }
 }
 
