@@ -203,6 +203,10 @@ async fn live_sdk_probe_single_gesture() {
         if status != 200 || app["bundle_id"] != "local.sdkprobe.app" {
             return Err("SDK Probe is not foreground; no touch sent".into());
         }
+        let require_callbacks = std::env::var("RV_TOUCH_REQUIRE_CALLBACKS").as_deref() == Ok("1");
+        if require_callbacks && visible_probe_callbacks(&client).await? != 0 {
+            return Err("Clear the SDK Probe event display before the live test".into());
+        }
         let size = screen_size(&client).await?;
         println!("Native screenshot dimensions: {} x {}", size.0, size.1);
         let mut operation = GestureOperation::start(client.clone(), 1)?;
@@ -211,9 +215,68 @@ async fn live_sdk_probe_single_gesture() {
             .map_err(|_| "live gesture deadline".to_string())?
             .map_err(|_| "live gesture task closed".to_string())??;
         println!("One begin/move/end sequence acknowledged; inspect SDK Probe for UIKit delivery.");
+        if require_callbacks {
+            tokio::time::sleep(Duration::from_millis(350)).await;
+            let count = visible_probe_callbacks(&client).await?;
+            if count < 3 {
+                return Err(format!(
+                    "HTTP acknowledged but SDK Probe shows only {count} touch callbacks"
+                ));
+            }
+            println!("SDK Probe visible callback count after isolated stroke: {count}");
+        }
         Ok(())
     }
     .await;
     let _ = client.json("/api/control/disconnect", &json!({})).await;
     result.unwrap();
+}
+
+// Live diagnostic only, never part of normal gesture dispatch. Read the owned
+// Probe's actual counter so a successful HTTP ACK cannot pass UIKit acceptance.
+async fn visible_probe_callbacks(client: &PhoneHttpClient) -> Result<u32, String> {
+    let (status, response) = client
+        .json(
+            "/api/device/ocr",
+            &json!({"fields":[
+                "1", "0,,0,,0,,0", "", "0.008", "0", "en-US,,zh-Hans", "1", ""
+            ]}),
+        )
+        .await?;
+    let text = response["value"]
+        .as_str()
+        .ok_or("Probe OCR reply missing")?;
+    if status != 200 {
+        return Err("Probe OCR rejected".into());
+    }
+    parse_probe_counter(text)
+}
+
+fn parse_probe_counter(text: &str) -> Result<u32, String> {
+    // Vision can read the small blue zero as a parenthesis. The Probe's empty
+    // event-log placeholder is a separate, unambiguous indication of zero.
+    if text.contains("等待触摸回调") {
+        return Ok(0);
+    }
+    let pattern = regex::Regex::new(r"当前显示\s*(\d+)\s*条回调").unwrap();
+    pattern
+        .captures(text)
+        .and_then(|value| value[1].parse().ok())
+        .ok_or_else(|| "SDK Probe event counter not visible; no UIKit acceptance claim".into())
+}
+
+#[test]
+fn live_counter_requires_real_probe_text_and_accepts_empty_log_placeholder() {
+    assert_eq!(
+        parse_probe_counter("当前显示 59 条回调/0 份请求 events,,46,,1407,,605,,41").unwrap(),
+        59
+    );
+    assert_eq!(
+        parse_probe_counter(
+            "当前显示 （条回调/0份请求 events;;等待触摸回调。可点击表单或在页面滑动。"
+        )
+        .unwrap(),
+        0
+    );
+    assert!(parse_probe_counter("SDK 已启动").is_err());
 }

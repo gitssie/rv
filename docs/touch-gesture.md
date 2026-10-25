@@ -40,3 +40,13 @@ begin → move → end 顺序发送，并等待每次回复。以按下确认后
 一次完整轨迹的 begin/move/end 均获得 HTTP 成功确认，但之后 Probe 画面仍为 0 条触摸回调。
 现有 `/api/device/tap` 对照也返回 `{ok:true}`，随后截图没有观察到输入框焦点或回调变化。
 因此不能将这次传输通过记作触摸生效；需继续区分手机注入与 Probe 采集问题。
+
+后续已完成真机修复与验收：TrollVNC4.0-5将 normalized HID 的 contact index 从32起
+改为预留10–29，并对齐经典 VNC 的 mask 和 finger identity。4.0-3仅对齐mask、
+4.0-4仅进一步调整identity时仍为0回调；4.0-5一次独立RV轨迹使Probe从0变为59条
+真实SDK回调，最新为touchUp。用户另行确认从RV工具栏图标触发后出现新的touchMove。
+该结论限于本次iPhone14,5/iOS16.3的输入投递，不推断其他iOS版本的通用索引上限。
+
+真机 ignored 测试可额外设置 `RV_TOUCH_REQUIRE_CALLBACKS=1`，在Probe已清空显示时，
+通过只读OCR检查其原生计数器变化；少于3条回调或计数不可读均不能当作验收通过。
+生产手势功能不依赖OCR或Probe。
