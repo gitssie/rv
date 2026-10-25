@@ -1,6 +1,7 @@
 //! Tokio-backed VNC session for RV.
 
 mod apps;
+pub mod automation;
 mod karing;
 mod photo_confirmation;
 pub use karing::{KaringRequest, KaringResponse, karing_component};

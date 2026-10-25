@@ -6038,6 +6038,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rv-automation"
+version = "0.2.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
 name = "rv-business"
 version = "0.2.0"
 dependencies = [
@@ -6091,6 +6102,7 @@ dependencies = [
  "regex",
  "reqwest",
  "rustls",
+ "rv-automation",
  "rv-core",
  "serde",
  "serde_json",
