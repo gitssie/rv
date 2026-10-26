@@ -1,10 +1,12 @@
-//! Finite RV requests through the existing raw Karing HTTP proxy.
-//! No phone-side routes, JSON envelopes, retries, or inferred write success.
+//! Finite authenticated HTTP/2 requests to Karing's raw proxy or native helper.
 use crate::phone_http::PhoneHttpClient;
+mod config;
+pub use config::{KaringCatalogue, KaringSelection, KaringSubscription};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KaringRequest {
     pub id: u32,
+    pub native: bool,
     pub method: String,
     /// Original Karing path and query, without the proxy prefix.
     pub path: String,
@@ -42,20 +44,36 @@ impl KaringOperation {
             return Err("Karing 请求路径无效".into());
         }
         let command = crate::AppCommand::Karing(request.clone());
+        let path = if request.native {
+            if method != reqwest::Method::POST
+                || !matches!(
+                    request.path.as_str(),
+                    "/connection"
+                        | "/connect"
+                        | "/disconnect"
+                        | "/profiles"
+                        | "/config"
+                        | "/status"
+                        | "/reload"
+                        | "/select"
+                )
+            {
+                return Err("Karing 原生操作无效".into());
+            }
+            format!("/api/karing-native{}", request.path)
+        } else {
+            format!("/api/karing{}", request.path)
+        };
+        let timeout = if request.native { 60 } else { 15 };
         let (tx, result) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
-            let value = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            let value = tokio::time::timeout(std::time::Duration::from_secs(timeout), async {
                 let mut headers = reqwest::header::HeaderMap::new();
                 if !request.body.is_empty() {
                     headers.insert("content-type", "application/json".parse().unwrap());
                 }
                 let mut response = client
-                    .request(
-                        method,
-                        &format!("/api/karing{}", request.path),
-                        headers,
-                        request.body,
-                    )
+                    .request(method, &path, headers, request.body)
                     .await
                     .map_err(|_| "Karing 请求中断；修改结果可能未知".to_string())?;
                 let status = response.status().as_u16();
@@ -70,7 +88,7 @@ impl KaringOperation {
                     .await
                     .map_err(|_| "Karing 回复中断".to_string())?
                 {
-                    if body.len() + chunk.len() > 4 * 1024 * 1024 {
+                    if body.len() + chunk.len() > 32 * 1024 * 1024 {
                         return Err("Karing 回复超过面板读取上限".into());
                     }
                     body.extend_from_slice(&chunk);
@@ -112,6 +130,61 @@ pub fn karing_component(value: &str) -> String {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn native_selection_uses_authenticated_http2_and_preserves_unknown_result() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let peer = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut connection = h2::server::handshake(socket).await.unwrap();
+            let (request, mut respond) = connection.accept().await.unwrap().unwrap();
+            assert_eq!(request.method(), "POST");
+            assert_eq!(request.uri().path(), "/api/karing-native/select");
+            assert_eq!(request.headers()["authorization"], "Bearer fixture-token");
+            let handler = tokio::spawn(async move {
+                let mut stream = request.into_body();
+                let mut body = Vec::new();
+                while let Some(data) = stream.data().await {
+                    let data = data.unwrap();
+                    stream.flow_control().release_capacity(data.len()).unwrap();
+                    body.extend_from_slice(&data);
+                }
+                assert_eq!(
+                    serde_json::from_slice::<serde_json::Value>(&body).unwrap()["exit_tag"],
+                    "任意出口"
+                );
+                let response = hyper::Response::builder().status(504).body(()).unwrap();
+                respond
+                    .send_response(response, false)
+                    .unwrap()
+                    .send_data(
+                        hyper::body::Bytes::from_static(b"{\"outcome\":\"unknown\"}"),
+                        true,
+                    )
+                    .unwrap();
+            });
+            while connection.accept().await.is_some() {}
+            handler.await.unwrap();
+        });
+        let mut operation = KaringOperation::start(
+            PhoneHttpClient::new("127.0.0.1", port, "fixture-token".into()).unwrap(),
+            KaringRequest { id: 3, native: true, method: "POST".into(), path: "/select".into(),
+                body: serde_json::json!({"exit_tag":"任意出口","relay_tag":null,"upstream_group":null}).to_string().into_bytes() }
+        ).unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(2), &mut operation.result)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status, 504);
+        assert_eq!(response.body, b"{\"outcome\":\"unknown\"}");
+        drop(operation);
+        tokio::time::timeout(Duration::from_secs(2), peer)
+            .await
+            .unwrap()
+            .unwrap();
+    }
 
     #[tokio::test]
     async fn karing_preserves_method_encoded_query_body_and_error_response() {
@@ -159,6 +232,7 @@ mod tests {
             PhoneHttpClient::new("127.0.0.1", port, "fixture-token".into()).unwrap(),
             KaringRequest {
                 id: 8,
+                native: false,
                 method: "PUT".into(),
                 path: "/providers/proxies/a%2Fb?unknown=x+y&unknown=%25".into(),
                 body: b"{ \"unknown\": [1,2] }\n".to_vec(),
@@ -213,6 +287,7 @@ mod tests {
             PhoneHttpClient::new("127.0.0.1", port, "fixture-token".into()).unwrap(),
             KaringRequest {
                 id: 9,
+                native: false,
                 method: "GET".into(),
                 path: "/proxies".into(),
                 body: vec![],

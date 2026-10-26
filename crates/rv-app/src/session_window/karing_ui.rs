@@ -1,11 +1,14 @@
 use super::*;
-use rv_session::{AppCommand, KaringRequest, KaringResponse, karing_component};
+use rv_session::{
+    AppCommand, KaringCatalogue, KaringRequest, KaringResponse, KaringSelection, karing_component,
+};
 use serde_json::Value;
 use std::collections::HashMap;
 
 #[derive(Clone)]
 struct Provider {
     name: String,
+    label: String,
     nodes: Vec<String>,
     refreshable: bool,
 }
@@ -14,6 +17,13 @@ enum Pending {
     Proxies,
     Refresh,
     Delay(String),
+    NativeProfiles,
+    Connection,
+    Control,
+    Selection(String),
+    VerifySelection(String),
+    PrepareRelay,
+    RestoreSelection,
 }
 #[derive(Default)]
 pub(super) struct KaringUI {
@@ -33,6 +43,15 @@ pub(super) struct KaringUI {
     show_providers: bool,
     show_results: bool,
     delay_queue: std::collections::VecDeque<String>,
+    catalogue: KaringCatalogue,
+    exit: Option<String>,
+    chain: bool,
+    show_exits: bool,
+    vpn_connected: Option<bool>,
+    selecting_best: bool,
+    samples: HashMap<String, u64>,
+    applied_selection: Option<KaringSelection>,
+    restore_selection: Option<KaringSelection>,
 }
 impl KaringUI {
     pub(super) fn disconnected(&mut self) {
@@ -63,6 +82,133 @@ pub(super) fn is_karing(id: &str, name: &str) -> bool {
     id == "com.nebula.karing" || name.eq_ignore_ascii_case("karing")
 }
 impl SessionView {
+    fn karing_native(&self) -> bool {
+        self.apps
+            .caps
+            .as_ref()
+            .is_some_and(|caps| caps.karing_node_control)
+    }
+    fn karing_native_request(&mut self, kind: Pending, operation: &str, body: Value) {
+        self.karing.sequence = self.karing.sequence.wrapping_add(1);
+        let id = self.karing.sequence;
+        self.karing.pending.insert(id, kind);
+        self.handle.app(AppCommand::Karing(KaringRequest {
+            id,
+            native: true,
+            method: "POST".into(),
+            path: format!("/{operation}"),
+            body: body.to_string().into_bytes(),
+        }));
+    }
+    fn connect_karing(&mut self, cx: &mut Context<Self>) {
+        if !self.karing_allowed() || !self.karing.pending.is_empty() {
+            return;
+        }
+        let operation = if self.karing.vpn_connected == Some(true) {
+            "disconnect"
+        } else {
+            "connect"
+        };
+        self.karing.message = if operation == "connect" {
+            "连接 VPN…"
+        } else {
+            "断开 VPN…"
+        }
+        .into();
+        self.karing_native_request(Pending::Control, operation, serde_json::json!({}));
+        cx.notify();
+    }
+    fn apply_karing_selection(&mut self, cx: &mut Context<Self>) {
+        if !self.karing_allowed()
+            || !self.karing.pending.is_empty()
+            || self.karing.vpn_connected != Some(true)
+        {
+            return;
+        }
+        let Some(exit) = self.karing.exit.clone() else {
+            return;
+        };
+        self.karing.samples.clear();
+        self.karing.restore_selection = None;
+        if self.karing.chain {
+            let Some(upstream) = self.karing.selected.as_deref() else {
+                return;
+            };
+            match self.karing.catalogue.relay_candidates(upstream, &exit) {
+                Ok(nodes) => {
+                    let Some(previous) = self.karing.applied_selection.clone() else {
+                        self.karing.message = "请先读取配置；多跳或后置链需先应用单节点出口".into();
+                        cx.notify();
+                        return;
+                    };
+                    self.karing.delay_queue = nodes.into();
+                    self.karing.selecting_best = true;
+                    self.karing.delays.clear();
+                    self.karing.delay_successes = 0;
+                    self.karing.restore_selection = Some(previous.clone());
+                    self.karing.message = "准备节点独立测速…".into();
+                    // Existing global detours would bias relay measurements.
+                    // Prepare direct candidates first, retaining the previous
+                    // exit. If every candidate fails, restore the prior choice.
+                    let direct = KaringSelection {
+                        exit_tag: previous.exit_tag,
+                        upstream_group: None,
+                        relay_tag: None,
+                    };
+                    self.karing_native_request(
+                        Pending::PrepareRelay,
+                        "select",
+                        serde_json::to_value(direct).unwrap(),
+                    );
+                }
+                Err(error) => self.karing.message = error,
+            }
+        } else {
+            self.submit_karing_selection();
+        }
+        cx.notify();
+    }
+    fn submit_karing_selection(&mut self) {
+        self.karing.selecting_best = false;
+        let Some(exit) = self.karing.exit.as_deref() else {
+            return;
+        };
+        let upstream = self
+            .karing
+            .chain
+            .then_some(self.karing.selected.as_deref())
+            .flatten();
+        if self.karing.chain && upstream.is_none() {
+            self.karing.message = "请选择前置订阅".into();
+            return;
+        }
+        match self
+            .karing
+            .catalogue
+            .select(exit, upstream, &self.karing.samples)
+        {
+            Ok(selection) => {
+                self.karing.message = "保存配置并重载…".into();
+                self.karing_native_request(
+                    Pending::Selection(selection.exit_tag.clone()),
+                    "select",
+                    serde_json::to_value(selection).unwrap(),
+                );
+            }
+            Err(error) => {
+                if let Some(previous) = self.karing.restore_selection.take() {
+                    self.karing.message = format!("{error}；恢复原配置…");
+                    self.karing_native_request(
+                        Pending::RestoreSelection,
+                        "select",
+                        serde_json::to_value(previous).unwrap(),
+                    );
+                } else {
+                    self.karing.message = error;
+                }
+            }
+        }
+    }
     fn karing_allowed(&self) -> bool {
         self.phase == Phase::Connected
             && !self.view_only()
@@ -78,6 +224,7 @@ impl SessionView {
         self.karing.pending.insert(id, kind);
         self.handle.app(AppCommand::Karing(KaringRequest {
             id,
+            native: false,
             method: method.into(),
             path,
             body: vec![],
@@ -92,7 +239,12 @@ impl SessionView {
         self.karing.providers_loaded = false;
         self.karing.current_node = None;
         self.karing.message = "读取中…".into();
-        self.karing_request(Pending::Providers, "GET", "/providers/proxies".into());
+        if self.karing_native() {
+            self.karing_native_request(Pending::NativeProfiles, "profiles", serde_json::json!({}));
+            self.karing_native_request(Pending::Connection, "connection", serde_json::json!({}));
+        } else {
+            self.karing_request(Pending::Providers, "GET", "/providers/proxies".into());
+        }
         self.karing_request(Pending::Proxies, "GET", "/proxies".into());
         cx.notify();
     }
@@ -113,6 +265,9 @@ impl SessionView {
             self.handle.app(AppCommand::CancelKaring);
             self.karing.pending.clear();
             self.karing.delay_queue.clear();
+            self.karing.selecting_best = false;
+            self.karing.applied_selection = None;
+            self.karing.restore_selection = None;
             self.karing.message = "请求已停止；未确认的修改请在 Karing 检查".into();
         }
         self.karing.show_providers = false;
@@ -137,6 +292,8 @@ impl SessionView {
             return;
         }
         self.karing.delays.clear();
+        self.karing.samples.clear();
+        self.karing.selecting_best = false;
         self.karing.delay_successes = 0;
         self.karing.delay_queue = nodes.into();
         self.karing.message = "测速中…".into();
@@ -153,6 +310,10 @@ impl SessionView {
             self.karing_request(Pending::Delay(node.clone()), "GET", format!(
                 "/proxies/{}/delay?url=https%3A%2F%2Fwww.gstatic.com%2Fgenerate_204&timeout=5000", karing_component(&node)));
         } else {
+            if self.karing.selecting_best {
+                self.submit_karing_selection();
+                return;
+            }
             let count = self.karing.delays.len();
             self.karing.message = format!(
                 "{} 成功 · {} 失败",
@@ -165,9 +326,36 @@ impl SessionView {
         let Some(kind) = self.karing.pending.remove(&id) else {
             return;
         };
+        if matches!(
+            kind,
+            Pending::Selection(_) | Pending::PrepareRelay | Pending::RestoreSelection
+        ) {
+            self.karing.applied_selection = None;
+            self.karing.restore_selection = None;
+            self.karing.selecting_best = false;
+            self.karing.delay_queue.clear();
+        }
         if let Pending::Delay(node) = kind {
             self.karing.delays.push(format!("{node}: {message}"));
             self.karing.delay_queue.clear();
+            if self.karing.selecting_best {
+                self.karing.selecting_best = false;
+                if let Some(previous) = self.karing.restore_selection.take() {
+                    self.karing.message = "测速请求中断，恢复原出口配置…".into();
+                    self.karing_native_request(
+                        Pending::RestoreSelection,
+                        "select",
+                        serde_json::to_value(previous).unwrap(),
+                    );
+                } else {
+                    self.karing.applied_selection = None;
+                    self.karing.message =
+                        "测速请求中断，临时单节点配置的恢复待确认，请重新读取".into();
+                }
+                cx.notify();
+                return;
+            }
+            self.karing.selecting_best = false;
         }
         self.karing.load_error = Some(message.clone());
         self.karing.message = message;
@@ -182,6 +370,15 @@ impl SessionView {
             return;
         };
         if !(200..300).contains(&response.status) {
+            if matches!(
+                kind,
+                Pending::Selection(_) | Pending::PrepareRelay | Pending::RestoreSelection
+            ) {
+                self.karing.applied_selection = None;
+                self.karing.restore_selection = None;
+                self.karing.selecting_best = false;
+                self.karing.delay_queue.clear();
+            }
             let message = format!("Karing 返回 HTTP {}", response.status);
             if let Pending::Delay(node) = kind {
                 self.karing.delays.push(format!("{node}: {message}"));
@@ -195,6 +392,146 @@ impl SessionView {
         }
         let value = serde_json::from_slice::<Value>(&response.body);
         match kind {
+            Pending::NativeProfiles => {
+                match value
+                    .as_ref()
+                    .ok()
+                    .and_then(|v| v.get("data"))
+                    .ok_or_else(|| "Karing 订阅返回格式不正确".to_string())
+                    .and_then(|documents| {
+                        KaringCatalogue::from_profiles(documents)
+                            .map(|catalogue| (documents, catalogue))
+                    }) {
+                    Ok((documents, catalogue)) => {
+                        self.karing.providers = catalogue
+                            .subscriptions
+                            .iter()
+                            .map(|s| Provider {
+                                name: s.id.clone(),
+                                label: s.name.clone(),
+                                nodes: s.nodes.clone(),
+                                refreshable: false,
+                            })
+                            .collect();
+                        if !catalogue
+                            .nodes
+                            .iter()
+                            .any(|tag| Some(tag) == self.karing.exit.as_ref())
+                        {
+                            self.karing.exit =
+                                documents["karing_subscribe_use.json"]["select_default"]
+                                    .as_str()
+                                    .filter(|tag| catalogue.nodes.iter().any(|node| node == tag))
+                                    .map(str::to_owned);
+                        }
+                        let relay = documents["karing_setting.json"]["chain_proxy"]
+                            .as_array()
+                            .and_then(|chain| chain.first())
+                            .and_then(Value::as_str);
+                        self.karing.applied_selection = catalogue.saved_selection(documents);
+                        self.karing.chain = relay.is_some();
+                        if !catalogue
+                            .subscriptions
+                            .iter()
+                            .any(|s| Some(&s.id) == self.karing.selected.as_ref())
+                        {
+                            self.karing.selected = catalogue
+                                .subscriptions
+                                .iter()
+                                .find(|s| {
+                                    relay.is_some_and(|tag| s.nodes.iter().any(|node| node == tag))
+                                })
+                                .or_else(|| catalogue.subscriptions.first())
+                                .map(|s| s.id.clone());
+                        }
+                        self.karing.catalogue = catalogue;
+                        self.karing.providers_loaded = true;
+                        self.karing.loaded_message();
+                    }
+                    Err(error) => {
+                        self.karing.load_error = Some(error.clone());
+                        self.karing.message = error;
+                    }
+                }
+            }
+            Pending::Connection | Pending::Control => {
+                let connected = value
+                    .ok()
+                    .and_then(|v| v["data"]["vpn_connected"].as_bool());
+                self.karing.vpn_connected = connected;
+                if connected.is_none() {
+                    self.karing.message = "VPN 状态未确认，请重新读取".into();
+                } else if matches!(kind, Pending::Control) {
+                    self.karing.message = if connected == Some(true) {
+                        "VPN 已连接"
+                    } else {
+                        "VPN 已断开"
+                    }
+                    .into();
+                    if connected == Some(true) {
+                        self.karing_request(Pending::Proxies, "GET", "/proxies".into());
+                    }
+                }
+            }
+            Pending::Selection(exit) => {
+                if value
+                    .ok()
+                    .is_some_and(|v| v["outcome"] == "succeeded" && v["reloadVerified"] == true)
+                {
+                    self.karing.message = "重载完成，核对当前出口…".into();
+                    self.karing_request(Pending::VerifySelection(exit), "GET", "/proxies".into());
+                } else {
+                    self.karing.message = "修改结果未确认，请读取实际配置后再操作".into();
+                }
+            }
+            Pending::PrepareRelay => {
+                if value
+                    .ok()
+                    .is_some_and(|v| v["outcome"] == "succeeded" && v["reloadVerified"] == true)
+                {
+                    self.karing.message = "选择最快中介…".into();
+                    self.next_karing_delay();
+                } else {
+                    self.karing.selecting_best = false;
+                    self.karing.delay_queue.clear();
+                    self.karing.applied_selection = None;
+                    self.karing.message = "测速准备结果未确认，请重新读取配置".into();
+                }
+            }
+            Pending::RestoreSelection => {
+                self.karing.message = if value
+                    .ok()
+                    .is_some_and(|v| v["outcome"] == "succeeded" && v["reloadVerified"] == true)
+                {
+                    "中介测速未完成，已恢复原出口配置".into()
+                } else {
+                    self.karing.applied_selection = None;
+                    "中介测速失败，恢复结果未确认，请重新读取配置".into()
+                };
+            }
+            Pending::VerifySelection(exit) => {
+                self.karing.current_node = value
+                    .ok()
+                    .and_then(|v| v["proxies"].as_object().and_then(current_node));
+                self.karing.message = if self.karing.current_node.as_deref() == Some(&exit) {
+                    self.karing.applied_selection = self
+                        .karing
+                        .catalogue
+                        .select(
+                            &exit,
+                            self.karing
+                                .chain
+                                .then_some(self.karing.selected.as_deref())
+                                .flatten(),
+                            &self.karing.samples,
+                        )
+                        .ok();
+                    self.karing.restore_selection = None;
+                    "出口切换完成".into()
+                } else {
+                    "配置已保存，但当前出口未确认，请重新读取".into()
+                };
+            }
             Pending::Providers => {
                 if let Ok(value) = value
                     && let Some(providers) = value["providers"].as_object()
@@ -203,6 +540,7 @@ impl SessionView {
                         .iter()
                         .map(|(name, p)| Provider {
                             name: name.clone(),
+                            label: name.clone(),
                             nodes: proxy_names(&p["proxies"]),
                             refreshable: p["vehicleType"].as_str() == Some("HTTP"),
                         })
@@ -248,6 +586,10 @@ impl SessionView {
             Pending::Delay(node) => {
                 self.karing.delays.push(match value {
                     Ok(value) if value["delay"].as_u64().is_some() => {
+                        let delay = value["delay"].as_u64().unwrap();
+                        if delay > 0 {
+                            self.karing.samples.insert(node.clone(), delay);
+                        }
                         self.karing.delay_successes += 1;
                         format!("{node}: {} ms", value["delay"])
                     }
@@ -281,7 +623,7 @@ impl SessionView {
             chips = chips.child(
                 Button::new(SharedString::from(format!("karing-provider-{name}")))
                     .ghost()
-                    .label(format!("{} · {}", provider.name, provider.nodes.len()))
+                    .label(format!("{} · {}", provider.label, provider.nodes.len()))
                     .w(px(if self.karing.providers.len() > 2 {
                         72.
                     } else {
@@ -339,7 +681,20 @@ impl SessionView {
                             theme::muted(cx)
                         },
                     ))
-                    .child(div().text_color(theme::muted(cx)).child(status)),
+                    .child(div().text_color(theme::muted(cx)).child(status))
+                    .when(self.karing_native(), |row| {
+                        row.child(
+                            Button::new("karing-vpn-toggle")
+                                .ghost()
+                                .label(match self.karing.vpn_connected {
+                                    Some(true) => "断开 VPN",
+                                    Some(false) => "连接 VPN",
+                                    None => "读取 VPN",
+                                })
+                                .disabled(!enabled || self.karing.vpn_connected.is_none())
+                                .on_click(cx.listener(|this, _, _, cx| this.connect_karing(cx))),
+                        )
+                    }),
             )
             .child(
                 h_flex()
@@ -380,7 +735,7 @@ impl SessionView {
                             self.karing.providers.clone().into_iter().map(|p| {
                                 Button::new(SharedString::from(p.name.clone()))
                                     .ghost()
-                                    .label(p.name.clone())
+                                    .label(p.label.clone())
                                     .w_full()
                                     .debug_selector({
                                         let name = p.name.clone();
@@ -414,31 +769,88 @@ impl SessionView {
                         ),
                 )
             })
-            .child(
-                h_flex()
-                    .items_center()
-                    .gap_2()
-                    .child(div().w(px(32.)).text_color(theme::muted(cx)).child("链式"))
+            .when(self.karing_native(), |panel| {
+                panel
                     .child(
-                        crate::ui::icon_button(
-                            "karing-chain-toggle",
-                            IconName::Network,
-                            "链式代理",
-                        )
-                        .disabled(true)
-                        .tooltip("Karing 当前管理接口未提供链式代理配置"),
+                        h_flex().gap_1().items_center().child(
+                            Button::new("karing-chain-toggle")
+                                .ghost()
+                                .label(if self.karing.chain {
+                                    "链式代理：开启"
+                                } else {
+                                    "链式代理：关闭"
+                                })
+                                .selected(self.karing.chain)
+                                .disabled(!enabled)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.karing.chain = !this.karing.chain;
+                                    cx.notify();
+                                })),
+                        ),
                     )
-                    .child(div().flex_1().text_color(theme::muted(cx)).child("未提供"))
-                    .child(
-                        crate::ui::icon_button(
-                            "karing-chain-order",
-                            IconName::ChevronsUpDown,
-                            "链式顺序",
+                    .when(self.karing.chain, |panel| {
+                        panel.child(
+                            div()
+                                .text_xs()
+                                .text_color(theme::muted(cx))
+                                .child("从上方所选订阅中测速选择最快中介，再经下方出口联网"),
                         )
-                        .disabled(true)
-                        .tooltip("Karing 当前管理接口未提供链式顺序修改"),
-                    ),
-            )
+                    })
+                    .child(
+                        Button::new("karing-exit-select")
+                            .ghost()
+                            .w_full()
+                            .label(format!(
+                                "出口：{}",
+                                self.karing.exit.as_deref().unwrap_or("请选择节点")
+                            ))
+                            .disabled(!enabled || self.karing.catalogue.nodes.is_empty())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.karing.show_exits = !this.karing.show_exits;
+                                cx.notify();
+                            })),
+                    )
+                    .when(self.karing.show_exits, |panel| {
+                        panel.child(
+                            div()
+                                .id("karing-exit-list")
+                                .max_h(px(160.))
+                                .overflow_y_scroll()
+                                .child(v_flex().gap_1().children(
+                                    self.karing.catalogue.nodes.iter().cloned().map(|tag| {
+                                        Button::new(SharedString::from(format!(
+                                            "karing-exit-{tag}"
+                                        )))
+                                        .ghost()
+                                        .label(tag.clone())
+                                        .w_full()
+                                        .selected(self.karing.exit.as_ref() == Some(&tag))
+                                        .disabled(!enabled)
+                                        .on_click(
+                                            cx.listener(move |this, _, _, cx| {
+                                                this.karing.exit = Some(tag.clone());
+                                                this.karing.show_exits = false;
+                                                cx.notify();
+                                            }),
+                                        )
+                                    }),
+                                )),
+                        )
+                    })
+                    .child(
+                        Button::new("karing-apply-selection")
+                            .primary()
+                            .label("应用出口")
+                            .disabled(
+                                !enabled
+                                    || self.karing.exit.is_none()
+                                    || self.karing.vpn_connected != Some(true),
+                            )
+                            .on_click(
+                                cx.listener(|this, _, _, cx| this.apply_karing_selection(cx)),
+                            ),
+                    )
+            })
             .child(
                 h_flex()
                     .border_t_1()

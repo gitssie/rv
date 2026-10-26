@@ -1,35 +1,55 @@
-# Karing 紧凑控制面板
+# Karing 控制面板
 
-Karing 快捷图标左键保留打开 App；右键打开控制浮层。默认布局不超过
-320 × 170 逻辑像素，跟随 RV 工具栏主题。更多配置和测速结果按需在浮层内
-展开，选择配置后收起；不会打开第二个浮层。
+快捷图标左键打开 App，右键打开控制浮层。所有控制走既有认证 HTTP/2；
+不借用 VNC 或旧 TCP 作为回退。界面使用 GPUI Component 的按钮和主题。
 
-RV 直接通过已有 HTTP2 `/api/karing/*` 代理调用管理端口，不新增手机端接口。
-面板请求保留 HTTP 状态、响应头与原始响应字节；仅展示层读取所需 JSON 字段。
-每次有限请求最多读取 4 MiB、15 秒超时，不自动重发。关闭浮层或控制断连会
-取消请求并停止后续测速；取消不能撤销已经到达手机的修改。
+## 出口与链式代理
 
-| 操作 | Karing 原始请求 |
+支持新能力 `karing_node_control` 的 daemon 会读取原生 profiles 和 VPN 状态。
+订阅标识、显示名称与节点均来自手机，不能写死测试用的 M4、FR 或节点标签。
+
+- 单节点模式：全部已启用配置中的真实节点都可以作为出口，应用时清除旧链。
+- 链式模式：用户选择前置订阅与最终出口；从该订阅排除出口自身，逐个测速，
+  选取成功且延迟最低的节点作为中介。延迟 0 或失败不是成功候选。
+- 测速前先清除旧全局 detour、保留原出口，避免旧中介使候选测速失真。
+  测速全部失败或传输中断时尝试恢复原选择；无法确认恢复则要求重新读取。
+  既有多跳/后置链无法无损恢复，须先明确应用单节点出口。
+- 切换同时保存原生 setting、subscribe_use 与 service_core，保留未知字段、
+  节点凭据和不属于所选默认节点的规则；只更新已识别的默认路由规则和 DNS。
+  旧 final 必须为已确认的真实选中节点；内置或自定义默认出口不猜测改写。
+- 原生重载必须观察到新的 core startTime；面板继续读取实际 GLOBAL.now，
+  核对最终出口才显示切换完成。超时和未确认修改不会自动重放。
+
+原生写入前仅停止 Karing 主程序，防止 App 内存中的旧设置覆盖文件；
+独立 packet tunnel 保留。下次打开 Karing 会重新读取保存的设置。
+
+## 接口与兼容
+
+| 操作 | 认证 HTTP/2 请求 |
 | --- | --- |
-| 读取配置与节点 | `GET /providers/proxies`、`GET /proxies` |
-| 刷新所选 HTTP provider | `PUT /providers/proxies/{name}` |
-| 节点延迟测速 | `GET /proxies/{name}/delay?url=…&timeout=5000` |
+| 原生订阅/节点 | `POST /api/karing-native/profiles` |
+| VPN 状态/连接/断开 | `POST /api/karing-native/connection|connect|disconnect` |
+| 应用选择 | `POST /api/karing-native/select`，exit_tag、relay_tag、upstream_group |
+| 运行节点/当前出口 | 原始 `GET /api/karing/proxies` |
+| 延迟测速 | 原始 `GET /api/karing/proxies/{name}/delay?url=…&timeout=5000` |
 
-配置标签来自实际返回的 providers，选择标签决定刷新与测速范围，**不代表
-切换 Karing App 的「我的配置」**。没有 providers 时展示实际节点数量，
-禁用订阅刷新，仍可对运行中的真实节点逐个测速（排除 Direct/Reject/代理组）。
-当前节点从 `/proxies` 的 `GLOBAL.now` 读取；选中代理组时沿其 `now`
-解析到真实节点，不把 URLTest 的结果冒充 GLOBAL 的选择。
-延迟结果保留节点名称，并分别统计成功和失败。更多 provider 可展开选择。
+raw 请求限时 15 秒，原生 helper 请求限时 60 秒；回复最多 32 MiB。
+取消不能撤销已经提交的操作。配置响应含私密节点信息，不写日志。
+不支持新能力的 daemon 保留原只读节点面板和真实 HTTP provider 刷新。
+当前手机没有 Clash providers，**App 原生订阅下载刷新尚未接入**，不能将
+重新读取缓存叫作订阅刷新，也不能将 disabled 刷新按钮说成可用功能。
 
-当前已核实管理端口没有 App 配置切换、链式代理修改接口，链式控件禁用；
-不将 `connections[].chains` 当成可写链式配置，不编造成功返回。VPN 开关不做。
-标题状态表示管理接口可用性，不表示系统 VPN 状态。
+## 2026-10-27 验证
 
-保留验证：`cargo test -p rv-session --locked` 与
-`cargo test -p rv-app --locked -- --test-threads=1`。新增 3 项 HTTP2 请求测试
-覆盖方法/编码路径/查询/请求体/错误返回原样传递及取消；5 项 GPUI 测试覆盖
-紧凑尺寸、空配置、provider 刷新失败、只读、关闭取消、长名称更多配置点击、
-结果展开及断连停止队列。这些检查不代表手机上已完成新面板的写入验收。
+通过 Wi-Fi6000 的已认证 HTTP/2 shell 调用同一签名 production helper：
+单节点切换确认后，对当前所选订阅六个节点独立测速，171/173/179/68/184/166 ms；
+以 68 ms 候选为中介、所选出口为最终出口，重载和 raw GLOBAL 都确认。
+两次选择分别约 0.689/0.795 秒。经 Karing mixed 入口的 HTTPS 公网请求成功。
+手机端已部署 4.0-7，并通过正式 `/api/karing-native/select` 验证另一 M4 节点
+作为单节点出口、再恢复最快中介 → FR；耗时约 0.684/0.293 秒。
+正式 connection/connect 接口确认 VPN 仍连接。这不代表运行中旧 RV GUI 已更新。
 
-构建只生成 `target/debug/rv`，不打包 `.app`。
+原生 Documents/Client 回归、rv-session Karing 模块测试、独立快照的
+`cargo check -p rv-app --tests` 和 UI 样式检查通过；rootless 手机包构建通过。
+共享工作区的完整检查目前受其它未完成的 automation API 变更影响，独立快照
+只覆盖已提交基线加本次 Karing 代码。按 AGENTS.md 未构建或打包 RV。

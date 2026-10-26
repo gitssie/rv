@@ -27,6 +27,7 @@ pub struct AppCapabilities {
     pub photo_tasks: bool,
     pub device_info: bool,
     pub app_profile: bool,
+    pub karing_node_control: bool,
     pub zx_control: Option<ControlEndpoint>,
 }
 
@@ -954,6 +955,7 @@ mod tests {
             token: "fixture-token".into(),
         });
         let karing = AppCommand::Karing(crate::KaringRequest {
+            native: false,
             id: 1,
             method: "GET".into(),
             path: "/proxies".into(),

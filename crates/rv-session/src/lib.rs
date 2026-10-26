@@ -4,7 +4,7 @@ mod apps;
 pub mod automation;
 mod karing;
 mod photo_confirmation;
-pub use karing::{KaringRequest, KaringResponse, karing_component};
+pub use karing::{KaringCatalogue, KaringSelection, KaringSubscription, KaringRequest, KaringResponse, karing_component};
 mod screen_control;
 pub use screen_control::{ScreenPasscode, ScreenProgress};
 pub mod functions;
