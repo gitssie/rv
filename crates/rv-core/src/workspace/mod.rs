@@ -1,4 +1,6 @@
-//! Backup-derived App identities. All keys come from real IDFV values.
+//! Local device, App and account repositories. App keys come from real IDFV values.
+mod apple_accounts;
+pub use apple_accounts::*;
 mod mailboxes;
 mod models;
 mod offline;

@@ -67,5 +67,13 @@
 ## 设置页面
 
 - 已确认设置布局参照 `docs/designs/rv-settings-v1.png`：主窗口全页设置，左侧分类导航与返回主界面，右侧内容；不再用设置 Dialog 或顶栏 Tabs。
-- 设置主布局使用 GPUI Component `setting::{Settings, SettingPage, SettingGroup, SettingItem}`；左侧只保留通用、代理菜单，不显示搜索设置；内容页不重复显示通用/代理标题栏。返回主界面按钮放在窗口 TitleBar 中，不另占设置内容高度。表单控件继续使用库内 GroupBox、Form/Field、Select、Input、Switch、Button，保留默认控件尺寸和样式；设置页面的背景、边框和控件颜色遵循 RV 主题调色板。
+- 设置主布局使用 GPUI Component `setting::{Settings, SettingPage, SettingGroup, SettingItem}`；左侧保留通用、代理和 Apple ID 菜单，不显示搜索设置；内容页不重复显示通用/代理标题栏。返回主界面按钮放在窗口 TitleBar 中，不另占设置内容高度。表单控件继续使用库内 GroupBox、Form/Field、Select、Input、Switch、Button，保留默认控件尺寸和样式；设置页面的背景、边框和控件颜色遵循 RV 主题调色板。
 - 切换设置分类后转移焦点，返回主界面保留设备选择、筛选与折叠状态；设置页的快捷键不能操作隐藏的手机列表或创建 VNC 连接。
+
+
+## Apple ID 账户资料与改密（2026-10-27）
+
+- 设置 Apple ID 分类使用 gpui_component 的 DataTable，读取 apple_accounts SQLite 表，支持元数据搜索、刷新和密码显隐；不把界面模拟数据作为实际账户。
+- 当前密码、首次原密码与待用新密码分别保存；用户已明确要求 Apple ID 密码明文，VNC/锁屏密码仍按原有本地加密配置读取。
+- 手动「修改密码」放在 Apple 工具面板，与首次登录自动改密共用候选先落盘和原生 changePassword 接口。手动操作不强制登录 App Store，不切换不同媒体账号；设备关联为可空非唯一弱关联。
+- 隔离 HTTP2 真机改密及随后正式 Wi-Fi6000 退出/新密码登录已通过；不能将这些结果说成运行中的旧 RV GUI 已包含新界面或手机 daemon 已更新。详见 docs/apple-accounts.md。

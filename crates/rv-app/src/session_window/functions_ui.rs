@@ -2264,6 +2264,7 @@ fn account_action_requires_state(id: &str) -> bool {
             | "cloud-logout"
             | "apple-logout"
             | "findmy-off"
+            | "apple-password-change"
     ) || apple_profile_action(id)
         || matches!(id, "device-list" | "device-remove")
 }
@@ -2282,6 +2283,7 @@ fn apple_profile_action(id: &str) -> bool {
 }
 fn account_action_known(id: &str, state: Option<&serde_json::Value>) -> bool {
     match id {
+        "apple-password-change" => ["identity", "icloud", "app_store"].iter().all(|d| domain_signed(state, d).is_some()),
         "store-login" | "store-logout" => domain_signed(state, "app_store").is_some(),
         "cloud-login" => {
             domain_signed(state, "app_store") == Some(true)
@@ -2307,6 +2309,7 @@ fn account_action_known(id: &str, state: Option<&serde_json::Value>) -> bool {
 }
 fn account_action_visible(id: &str, state: Option<&serde_json::Value>) -> bool {
     match id {
+        "apple-password-change" => ["identity", "icloud", "app_store"].iter().any(|d| domain_signed(state, d) == Some(true)),
         "store-login" => domain_signed(state, "app_store") == Some(false),
         "store-logout" => domain_signed(state, "app_store") == Some(true),
         "cloud-login" => {
@@ -2357,6 +2360,7 @@ fn result_summary(record: &serde_json::Value) -> (String, String) {
         "signOutAppStore" => "已退出 App Store",
         "signOutAppleID" => "已退出 Apple 账户",
         "signInAppStore" => "已登录 App Store",
+        "changePassword" => "密码已修改",
         "enableICloud" => "已登录 iCloud",
         "disableFindMy" => "已关闭查找",
         "setName" => "姓名已更新",

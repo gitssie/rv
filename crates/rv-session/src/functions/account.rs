@@ -5,7 +5,7 @@ pub(super) fn needs_current_account(spec: &OperationSpec) -> bool {
     spec.task == 31
         && !matches!(
             spec.method,
-            "queryState" | "signInAppStore"
+            "queryState" | "signInAppStore" | "changePassword"
         )
 }
 
@@ -54,7 +54,7 @@ pub(super) fn current_account(method: &str, state: &Value) -> Result<String, Str
         return Ok(id.into());
     }
     // Complete Apple signout can also target a phone signed in to App Store only.
-    if method == "signOutAppleID"
+    if matches!(method, "signOutAppleID" | "changePassword")
         && let Some(id) = domain_account(state, "app_store")?
         && state["app_store"]["account"]["authenticated"] == true
     {

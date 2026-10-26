@@ -1,5 +1,6 @@
 //! Bounded ZXTouch native-service operations, separate from the RFB frame loop.
 mod account;
+mod apple_accounts;
 mod code_url;
 mod diagnostics;
 use crate::mailbox;
@@ -126,6 +127,7 @@ pub(crate) struct FunctionRuntime {
     announce: bool,
     account_refresh_pending: bool,
     account_refresh_again: bool,
+    apple_accounts: Option<apple_accounts::Context>,
 }
 impl Drop for FunctionRuntime {
     fn drop(&mut self) {
@@ -159,7 +161,11 @@ impl FunctionRuntime {
             announce: false,
             account_refresh_pending: false,
             account_refresh_again: false,
+            apple_accounts: None,
         }
+    }
+    pub(crate) fn enable_apple_account_storage(&mut self,request:&rv_core::ConnectRequest){
+        self.apple_accounts=Some(apple_accounts::Context::system(request));
     }
     pub(crate) fn set_http_client(&mut self, client: Option<crate::phone_http::PhoneHttpClient>) {
         self.http_client = client;
@@ -268,6 +274,7 @@ impl FunctionRuntime {
             let (events, mut rx) = mpsc::channel(32);
             let shared = self.events.clone();
             let key = family.clone();
+            let account_context=self.apple_accounts.clone();
             self.tasks.push(tokio::spawn(async move {
                 let forward = async move {
                     let mut diagnostics = diagnostics::OperationLog::default();
@@ -285,7 +292,11 @@ impl FunctionRuntime {
                         }
                     }
                 };
-                tokio::join!(worker(client, commands, events), forward);
+                let work=async move {
+                    if let Some(ctx)=account_context {apple_accounts::run(client,commands,events,ctx).await;}
+                    else {worker(client,commands,events).await;}
+                };
+                tokio::join!(work, forward);
             }));
             self.workers.insert(family.clone(), tx);
         }
@@ -387,6 +398,7 @@ fn accepted_code(response: &Value, id: &str) -> Result<(), String> {
 struct Wire {
     client: crate::phone_http::PhoneHttpClient,
     app_state_stream: bool,
+    apple_password_change: bool,
 }
 impl Wire {
     async fn connect(client: &crate::phone_http::PhoneHttpClient) -> Result<Self, String> {
@@ -398,6 +410,7 @@ impl Wire {
         Ok(Self {
             client,
             app_state_stream: capabilities["app_state_stream"] == 1,
+            apple_password_change: capabilities["apple_password_change"] == 1,
         })
     }
     async fn request(&mut self, module: u8, body: Value) -> Result<Value, String> {
@@ -483,9 +496,16 @@ async fn worker(
 }
 async fn worker_with_provider(
     client: crate::phone_http::PhoneHttpClient,
+    commands: mpsc::Receiver<FunctionCommand>,
+    events: mpsc::Sender<FunctionEvent>,
+    mailbox_provider: &dyn mailbox::MailboxProvider,
+) { worker_with_context(client,commands,events,mailbox_provider,None).await; }
+async fn worker_with_context(
+    client: crate::phone_http::PhoneHttpClient,
     mut commands: mpsc::Receiver<FunctionCommand>,
     events: mpsc::Sender<FunctionEvent>,
     mailbox_provider: &dyn mailbox::MailboxProvider,
+    account_context:Option<apple_accounts::Context>,
 ) {
     // Every invoke/query/code submission reuses the session HTTP/2 pool.
     let _ = events.send(FunctionEvent::Available(true)).await;
@@ -550,7 +570,7 @@ async fn worker_with_provider(
                         .await;
                     continue;
                 }
-                let Some(spec) = OPERATIONS.iter().find(|s| s.id == id) else {
+                let Some(spec) = spec::operation(&id) else {
                     continue;
                 };
                 let mut parsed = match parse_operation(spec, &text) {
@@ -629,6 +649,19 @@ async fn worker_with_provider(
                         email_target = Some(target.clone());
                     }
                     parsed.params["apple_id"] = json!(target);
+                }
+                if matches!(spec.method,"enableICloud"|"disableFindMy") {
+                    if let Some(ctx)=&account_context {
+                        if let Some(id)=parsed.params["apple_id"].as_str() {
+                            match ctx.load(id).await {
+                                Ok(Some(account))=>{parsed.params["password"]=json!(account.password);if parsed.code_url.is_none(){parsed.code_url=account.verification_code_url;}},
+                                Ok(None)=>(),Err(e)=>{let _=events.send(FunctionEvent::Error(e)).await;continue;}
+                            }
+                        }
+                    }
+                }
+                if matches!(spec.method,"signInAppStore"|"enableICloud"|"disableFindMy"|"changePassword") && parsed.params["password"].as_str().is_none_or(str::is_empty) {
+                    let _=events.send(FunctionEvent::Error("首次使用此 Apple ID，请提供登录密码".into())).await;continue;
                 }
                 if let Some(credentials) = parsed.mailbox.take() {
                     let _ = events
@@ -837,6 +870,9 @@ async fn worker_with_provider(
                     continue;
                 }
             };
+            if invocation && body["method"]=="changePassword" && !wire.apple_password_change {
+                let _=events.send(FunctionEvent::Error("手机版暂不支持 Apple ID 改密，请更新 TrollVNC 后再试；原密码保持不变".into())).await;continue;
+            }
             let action = body["action"].as_str().unwrap_or("").to_owned();
             let streaming = task == 32 && wire.app_state_stream;
             let response = match if streaming {

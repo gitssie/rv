@@ -19,6 +19,10 @@ macro_rules! op {
     };
 }
 
+static PASSWORD_CHANGE:OperationSpec=OperationSpec{id:"apple-password-change-internal",title:"首次登录修改密码",category:"Apple",task:31,method:"changePassword",fields:&["apple_id","password","new_password","device_passcode?","code_url?"],example:"",hint:""};
+pub(super) fn operation(id:&str)->Option<&'static OperationSpec>{
+ if id==PASSWORD_CHANGE.id{Some(&PASSWORD_CHANGE)}else{OPERATIONS.iter().find(|s|s.id==id)}
+}
 pub static OPERATIONS: &[OperationSpec] = &[
     op!(
         "store-login",
@@ -26,9 +30,13 @@ pub static OPERATIONS: &[OperationSpec] = &[
         "Apple",
         31,
         "signInAppStore",
-        ["apple_id", "password", "code_url?"],
+        ["apple_id", "password?", "code_url?"],
         "账号=demo@example.com\n密码=填写密码\n验证码链接=https://code.example.test/get?id=123",
         "也支持：账号----密码----验证码链接；链接可省略。"
+    ),
+    op!(
+        "apple-password-change", "修改密码", "Apple", 31, "changePassword",
+        ["password?", "code_url?"], "", "自动生成八位大小写字母和数字密码。已保存资料可留空；无记录时填写 密码=当前密码，验证码链接可选。"
     ),
     op!(
         "cloud-login",
@@ -36,7 +44,7 @@ pub static OPERATIONS: &[OperationSpec] = &[
         "Apple",
         31,
         "enableICloud",
-        ["password", "code_url?", "device_passcode?"],
+        ["password?", "code_url?", "device_passcode?"],
         "密码=填写密码",
         "登录密码；验证码链接可选。"
     ),

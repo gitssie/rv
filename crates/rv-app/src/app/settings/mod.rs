@@ -1,4 +1,5 @@
 //! Full-window settings use the component library's Settings hierarchy.
+mod apple_accounts;
 mod general;
 use super::{AddressBookApp, Modal};
 use gpui::*;
@@ -16,10 +17,12 @@ use rv_core::{ScaleMode, ThemePref};
 pub(super) enum SettingsPage {
     General,
     Proxies,
+    AppleAccounts,
 }
 pub(super) struct SettingsState {
     pub page: Option<SettingsPage>,
     pub revision: u64,
+    apple_accounts: apple_accounts::AppleAccountsView,
     pub theme: Entity<SelectState<Vec<String>>>,
     pub scale: Entity<SelectState<Vec<String>>>,
     pub menu_key: Entity<SelectState<Vec<String>>>,
@@ -28,6 +31,7 @@ impl SettingsState {
     pub fn new(window: &mut Window, cx: &mut Context<AddressBookApp>) -> Self {
         Self {
             page: None,
+            apple_accounts: apple_accounts::AppleAccountsView::new(window, cx),
             revision: 0,
             theme: cx.new(|cx| {
                 SelectState::new(
@@ -76,6 +80,7 @@ impl AddressBookApp {
             )
     }
     pub(super) fn subscribe_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.subscribe_apple_accounts(window, cx);
         self._subscriptions.push(cx.subscribe_in(
             &self.settings.theme,
             window,
@@ -187,6 +192,7 @@ impl AddressBookApp {
             state.update(cx, |s, cx| s.set_selected_value(&value, window, cx));
         }
         self.load_proxy_manager(window, cx);
+        self.load_apple_accounts(cx);
         self.settings.page = Some(SettingsPage::General);
         self.settings.revision = self.settings.revision.wrapping_add(1);
         self.focus.focus(window, cx);
@@ -225,11 +231,15 @@ impl AddressBookApp {
     ) -> AnyElement {
         if self.settings.page != Some(page) {
             self.settings.page = Some(page);
+            if page == SettingsPage::AppleAccounts {
+                self.load_apple_accounts(cx);
+            }
             self.focus.focus(window, cx);
         }
         match page {
             SettingsPage::General => self.render_general_settings(cx),
             SettingsPage::Proxies => self.render_proxy_manager(cx),
+            SettingsPage::AppleAccounts => self.render_apple_accounts(cx),
         }
     }
     pub(super) fn render_settings(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -251,10 +261,22 @@ impl AddressBookApp {
             .icon(IconName::Globe)
             .resettable(false)
             .header_style(&StyleRefinement::default().hidden())
+            .group(SettingGroup::new().item(SettingItem::render({
+                let owner = owner.clone();
+                move |_, window, cx| {
+                    owner.update(cx, |this, cx| {
+                        this.render_settings_content(SettingsPage::Proxies, window, cx)
+                    })
+                }
+            })));
+        let accounts = SettingPage::new("Apple ID")
+            .icon(IconName::User)
+            .resettable(false)
+            .header_style(&StyleRefinement::default().hidden())
             .group(
                 SettingGroup::new().item(SettingItem::render(move |_, window, cx| {
                     owner.update(cx, |this, cx| {
-                        this.render_settings_content(SettingsPage::Proxies, window, cx)
+                        this.render_settings_content(SettingsPage::AppleAccounts, window, cx)
                     })
                 })),
             );
@@ -270,11 +292,16 @@ impl AddressBookApp {
                     .sidebar_style(&StyleRefinement::default().bg(crate::theme::sidebar(cx)))
                     .header_style(&StyleRefinement::default().hidden())
                     .default_selected_index(SelectIndex {
-                        page_ix: if page == SettingsPage::General { 0 } else { 1 },
+                        page_ix: match page {
+                            SettingsPage::General => 0,
+                            SettingsPage::Proxies => 1,
+                            SettingsPage::AppleAccounts => 2,
+                        },
                         group_ix: None,
                     })
                     .page(general)
-                    .page(proxies),
+                    .page(proxies)
+                    .page(accounts),
             )
             .into_any_element()
     }

@@ -15,6 +15,7 @@ fn operation_account<'a>(
 ) -> Option<&'a str> {
     match spec.id {
         "store-login" | "apple-query" => None,
+        "apple-password-change" => account_id(state, "identity").or_else(|| account_id(state, "icloud")).or_else(|| account_id(state, "app_store")),
         "cloud-login" | "store-logout" => account_id(state, "app_store"),
         "cloud-logout" | "findmy-off" | "device-list" => account_id(state, "icloud"),
         "apple-logout" => account_id(state, "identity")
@@ -27,6 +28,7 @@ fn operation_account<'a>(
 fn operation_scope(id: &str) -> &'static str {
     match id {
         "store-login" => "登录 App Store，使用下方粘贴的账户资料。",
+        "apple-password-change" => "将当前 Apple ID 密码修改为随机八位大小写字母和数字，保留原密码与其他设备登录。",
         "cloud-login" => "使用当前 App Store 账户登录 iCloud。",
         "store-logout" => "仅退出 App Store。",
         "cloud-logout" => "退出 iCloud；请选择本机数据的处理方式。",

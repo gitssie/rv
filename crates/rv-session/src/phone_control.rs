@@ -29,6 +29,7 @@ pub(crate) async fn run(
         Some(port),
         !request.view_only,
     );
+    functions.enable_apple_account_storage(&request);
     let mut configured = false;
     let mut healthy = false;
     let mut online = false;

@@ -495,6 +495,7 @@ async fn session_loop(
         request.zxtouch_port,
         independent_allowed && !request.view_only,
     );
+    functions.enable_apple_account_storage(&request);
     loop {
         // Input first: a key-up queued behind frame decoding turns into
         // auto-repeat on the server, so pixels never take priority over commands.
