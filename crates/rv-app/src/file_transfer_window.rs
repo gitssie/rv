@@ -2950,10 +2950,11 @@ impl FileTransferView {
     }
 }
 
-impl Render for FileTransferView {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.sync_component_dialog(window, cx);
-        let fullscreen = window.is_fullscreen();
+impl FileTransferView {
+    // Explicit boundaries keep debug-mode GPUI builder temporaries out of one
+    // enormous render stack frame. Each completed subtree is heap-erased.
+    #[inline(never)]
+    fn render_transfer_actions(&self, cx: &mut Context<Self>) -> AnyElement {
         let caps = self.remote.caps.unwrap_or_default();
         let upload_enabled = self.allow_upload
             && caps.upload
@@ -3008,6 +3009,297 @@ impl Render for FileTransferView {
             && !self.remote.photo_busy
             && !self.photo_selected_ids.is_empty()
             && (self.photo_selected_ids.len() == 1 || self.remote.can_photo_batch_delete);
+
+        h_flex()
+            .px_2()
+            .gap_1()
+            .items_center()
+            .border_b_1()
+            .border_color(theme::line(cx))
+            .bg(theme::card(cx))
+            .child(if self.photo_mode {
+                Button::new("upload-to-photos")
+                    .ghost()
+                    .icon(IconName::ArrowUp)
+                    .label(if photo_upload_count > 1 {
+                        format!("Upload to Photos ({photo_upload_count})")
+                    } else {
+                        "Upload to Photos".into()
+                    })
+                    .disabled(!photo_upload_enabled)
+                    .on_click(cx.listener(|this, _, _, cx| this.upload_to_photos(cx)))
+                    .into_any_element()
+            } else {
+                Button::new("upload")
+                    .ghost()
+                    .icon(IconName::ArrowUp)
+                    .label("Upload")
+                    .disabled(!upload_enabled)
+                    .tooltip("Upload selected local file")
+                    .on_click(cx.listener(|this, _, _, cx| this.upload(cx)))
+                    .into_any_element()
+            })
+            .child(if self.photo_mode {
+                Button::new("download-photo")
+                    .ghost()
+                    .icon(IconName::ArrowDown)
+                    .label(if self.photo_selected_ids.len() > 1 {
+                        format!("Download ({})", self.photo_selected_ids.len())
+                    } else {
+                        "Download".into()
+                    })
+                    .disabled(!photo_download_enabled)
+                    .on_click(cx.listener(|this, _, _, cx| this.download_photo(cx)))
+                    .into_any_element()
+            } else {
+                Button::new("download")
+                    .ghost()
+                    .icon(IconName::ArrowDown)
+                    .label("Download")
+                    .disabled(!download_enabled)
+                    .tooltip("Download selected remote file into the local folder")
+                    .on_click(cx.listener(|this, _, _, cx| this.download(cx)))
+                    .into_any_element()
+            })
+            .when(self.photo_mode && self.remote.can_photo_delete, |this| {
+                this.child(
+                    Button::new("delete-selected-photos")
+                        .ghost()
+                        .icon(IconName::Delete)
+                        .label(if self.photo_selected_ids.len() > 1 {
+                            format!("Delete ({})", self.photo_selected_ids.len())
+                        } else {
+                            "Delete".into()
+                        })
+                        .disabled(!photo_delete_enabled)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if let Some(client) = &this.client {
+                                client.send(FileCommand::PhotoDelete(
+                                    this.photo_selected_ids.clone(),
+                                ));
+                            }
+                            cx.notify();
+                        })),
+                )
+            })
+            .when(
+                !self.photo_mode && !self.local_selected_paths.is_empty(),
+                |this| {
+                    this.child(
+                        Button::new("delete-local-selected")
+                            .ghost()
+                            .icon(IconName::Delete)
+                            .label(format!(
+                                "Delete local ({})",
+                                self.local_selected_paths.len()
+                            ))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.pending_batch_delete = Some(FileSide::Local);
+                                cx.notify();
+                            })),
+                    )
+                },
+            )
+            .when(
+                !self.photo_mode
+                    && self.allow_upload
+                    && self.remote.can_delete
+                    && !self.remote_selected_names.is_empty(),
+                |this| {
+                    this.child(
+                        Button::new("delete-remote-selected")
+                            .ghost()
+                            .icon(IconName::Delete)
+                            .label(format!(
+                                "Delete remote ({})",
+                                self.remote_selected_names.len()
+                            ))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.pending_batch_delete = Some(FileSide::Remote);
+                                cx.notify();
+                            })),
+                    )
+                },
+            )
+            .child(
+                Button::new("refresh")
+                    .ghost()
+                    .icon(IconName::Replace)
+                    .label("Refresh")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.reload_local(cx);
+                        if this.photo_mode {
+                            if let Some(client) = &this.client {
+                                client.send(FileCommand::PhotoList {
+                                    offset: this.remote.photo_offset,
+                                    album: this.remote.photo_album.clone(),
+                                });
+                            }
+                        } else {
+                            this.refresh_remote();
+                        }
+                    })),
+            )
+            .when(active, |this| {
+                this.child(
+                    Button::new("cancel-transfer")
+                        .ghost()
+                        .icon(IconName::Close)
+                        .label("Cancel")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if let Some(client) = &this.client {
+                                client.send(FileCommand::Cancel);
+                            }
+                            cx.notify();
+                        })),
+                )
+            })
+            .child(div().flex_1())
+            .child(
+                Button::new("transfers-toggle")
+                    .ghost()
+                    .icon(if self.transfers_open {
+                        IconName::ChevronDown
+                    } else {
+                        IconName::ChevronRight
+                    })
+                    .accessibility_label("Transfers")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.transfers_open = !this.transfers_open;
+                        this.auto_collapse_armed = false;
+                        cx.notify();
+                    })),
+            )
+            .into_any_element()
+    }
+
+    #[inline(never)]
+    fn render_file_panes(&self, cx: &mut Context<Self>) -> AnyElement {
+        h_flex()
+            .flex_1()
+            .min_h_0()
+            .items_stretch()
+            .child(self.render_local_pane(cx))
+            .child(div().w(px(1.)).h_full().bg(theme::line(cx)))
+            .child(if self.photo_mode {
+                self.render_photos_pane(cx)
+            } else {
+                self.render_remote_pane(cx)
+            })
+            .into_any_element()
+    }
+
+    #[inline(never)]
+    fn render_transfer_history(&self, cx: &mut Context<Self>) -> AnyElement {
+        v_flex()
+            .h(px(112.))
+            .border_t_1()
+            .border_color(theme::line(cx))
+            .bg(theme::card(cx))
+            .child(
+                h_flex()
+                    .py_1()
+                    .px_2()
+                    .items_center()
+                    .font_semibold()
+                    .text_xs()
+                    .child(format!(
+                        "Transfers ({})",
+                        if self.queue.is_empty() {
+                            self.remote.transfers.len()
+                        } else {
+                            self.queue.len()
+                        }
+                    )),
+            )
+            .child(if !self.queue.is_empty() {
+                uniform_list(
+                    "transfer-queue",
+                    self.queue.len(),
+                    cx.processor(|this, range: Range<usize>, _, cx| {
+                        range
+                            .map(|row| this.render_queue_row(this.queue.len() - 1 - row, cx))
+                            .collect::<Vec<_>>()
+                    }),
+                )
+                .flex_1()
+                .min_h_0()
+                .into_any_element()
+            } else if self.remote.transfers.is_empty() {
+                crate::ui::empty_state("No transfers yet", cx).into_any_element()
+            } else {
+                v_flex()
+                    .flex_1()
+                    .overflow_hidden()
+                    .children(self.remote.transfers.iter().rev().take(3).map(|transfer| {
+                        let status = match &transfer.status {
+                            TransferStatus::Running => transfer.total.map_or_else(
+                                || format_size(transfer.bytes),
+                                |total| {
+                                    format!(
+                                        "{} / {}",
+                                        format_size(transfer.bytes),
+                                        format_size(total)
+                                    )
+                                },
+                            ),
+                            TransferStatus::Complete => {
+                                if matches!(transfer.direction, TransferDirection::Upload) {
+                                    "Complete · listed".into()
+                                } else {
+                                    "Complete".into()
+                                }
+                            }
+                            TransferStatus::Verified => "Verified · SHA-256".into(),
+                            TransferStatus::Sent => {
+                                if matches!(transfer.direction, TransferDirection::Upload) {
+                                    "Sent · verifying".into()
+                                } else {
+                                    "Received · verifying".into()
+                                }
+                            }
+                            TransferStatus::Cancelled => "Cancelled".into(),
+                            TransferStatus::Failed(reason) => {
+                                format!("Failed: {reason}")
+                            }
+                        };
+                        h_flex()
+                            .px_2()
+                            .gap_2()
+                            .items_center()
+                            .text_xs()
+                            .child(Icon::new(
+                                if matches!(transfer.direction, TransferDirection::Upload) {
+                                    IconName::ArrowUp
+                                } else {
+                                    IconName::ArrowDown
+                                },
+                            ))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_ellipsis()
+                                    .child(transfer.name.clone()),
+                            )
+                            .child(
+                                div()
+                                    .w(px(170.))
+                                    .text_color(theme::muted(cx))
+                                    .text_ellipsis()
+                                    .child(status),
+                            )
+                    }))
+                    .into_any_element()
+            })
+            .into_any_element()
+    }
+}
+
+impl Render for FileTransferView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_component_dialog(window, cx);
+        let fullscreen = window.is_fullscreen();
         v_flex()
             .id("file-transfer-drop-target")
             .debug_selector(|| "file-transfer-drop-target".into())
@@ -3045,303 +3337,16 @@ impl Render for FileTransferView {
                     ),
                 )
             })
-            .child(
-                h_flex()
-                    .px_2()
-                    .gap_1()
-                    .items_center()
-                    .border_b_1()
-                    .border_color(theme::line(cx))
-                    .bg(theme::card(cx))
-                    .child(if self.photo_mode {
-                        Button::new("upload-to-photos")
-                            .ghost()
-                            .icon(IconName::ArrowUp)
-                            .label(if photo_upload_count > 1 {
-                                format!("Upload to Photos ({photo_upload_count})")
-                            } else {
-                                "Upload to Photos".into()
-                            })
-                            .disabled(!photo_upload_enabled)
-                            .on_click(cx.listener(|this, _, _, cx| this.upload_to_photos(cx)))
-                            .into_any_element()
-                    } else {
-                        Button::new("upload")
-                            .ghost()
-                            .icon(IconName::ArrowUp)
-                            .label("Upload")
-                            .disabled(!upload_enabled)
-                            .tooltip("Upload selected local file")
-                            .on_click(cx.listener(|this, _, _, cx| this.upload(cx)))
-                            .into_any_element()
-                    })
-                    .child(if self.photo_mode {
-                        Button::new("download-photo")
-                            .ghost()
-                            .icon(IconName::ArrowDown)
-                            .label(if self.photo_selected_ids.len() > 1 {
-                                format!("Download ({})", self.photo_selected_ids.len())
-                            } else {
-                                "Download".into()
-                            })
-                            .disabled(!photo_download_enabled)
-                            .on_click(cx.listener(|this, _, _, cx| this.download_photo(cx)))
-                            .into_any_element()
-                    } else {
-                        Button::new("download")
-                            .ghost()
-                            .icon(IconName::ArrowDown)
-                            .label("Download")
-                            .disabled(!download_enabled)
-                            .tooltip("Download selected remote file into the local folder")
-                            .on_click(cx.listener(|this, _, _, cx| this.download(cx)))
-                            .into_any_element()
-                    })
-                    .when(self.photo_mode && self.remote.can_photo_delete, |this| {
-                        this.child(
-                            Button::new("delete-selected-photos")
-                                .ghost()
-                                .icon(IconName::Delete)
-                                .label(if self.photo_selected_ids.len() > 1 {
-                                    format!("Delete ({})", self.photo_selected_ids.len())
-                                } else {
-                                    "Delete".into()
-                                })
-                                .disabled(!photo_delete_enabled)
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    if let Some(client) = &this.client {
-                                        client.send(FileCommand::PhotoDelete(
-                                            this.photo_selected_ids.clone(),
-                                        ));
-                                    }
-                                    cx.notify();
-                                })),
-                        )
-                    })
-                    .when(
-                        !self.photo_mode && !self.local_selected_paths.is_empty(),
-                        |this| {
-                            this.child(
-                                Button::new("delete-local-selected")
-                                    .ghost()
-                                    .icon(IconName::Delete)
-                                    .label(format!(
-                                        "Delete local ({})",
-                                        self.local_selected_paths.len()
-                                    ))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.pending_batch_delete = Some(FileSide::Local);
-                                        cx.notify();
-                                    })),
-                            )
-                        },
-                    )
-                    .when(
-                        !self.photo_mode
-                            && self.allow_upload
-                            && self.remote.can_delete
-                            && !self.remote_selected_names.is_empty(),
-                        |this| {
-                            this.child(
-                                Button::new("delete-remote-selected")
-                                    .ghost()
-                                    .icon(IconName::Delete)
-                                    .label(format!(
-                                        "Delete remote ({})",
-                                        self.remote_selected_names.len()
-                                    ))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.pending_batch_delete = Some(FileSide::Remote);
-                                        cx.notify();
-                                    })),
-                            )
-                        },
-                    )
-                    .child(
-                        Button::new("refresh")
-                            .ghost()
-                            .icon(IconName::Replace)
-                            .label("Refresh")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.reload_local(cx);
-                                if this.photo_mode {
-                                    if let Some(client) = &this.client {
-                                        client.send(FileCommand::PhotoList {
-                                            offset: this.remote.photo_offset,
-                                            album: this.remote.photo_album.clone(),
-                                        });
-                                    }
-                                } else {
-                                    this.refresh_remote();
-                                }
-                            })),
-                    )
-                    .when(active, |this| {
-                        this.child(
-                            Button::new("cancel-transfer")
-                                .ghost()
-                                .icon(IconName::Close)
-                                .label("Cancel")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    if let Some(client) = &this.client {
-                                        client.send(FileCommand::Cancel);
-                                    }
-                                    cx.notify();
-                                })),
-                        )
-                    })
-                    .child(div().flex_1())
-                    .child(
-                        Button::new("transfers-toggle")
-                            .ghost()
-                            .icon(if self.transfers_open {
-                                IconName::ChevronDown
-                            } else {
-                                IconName::ChevronRight
-                            })
-                            .accessibility_label("Transfers")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.transfers_open = !this.transfers_open;
-                                this.auto_collapse_armed = false;
-                                cx.notify();
-                            })),
-                    ),
-            )
-            .child(
-                h_flex()
-                    .flex_1()
-                    .min_h_0()
-                    .items_stretch()
-                    .child(self.render_local_pane(cx))
-                    .child(div().w(px(1.)).h_full().bg(theme::line(cx)))
-                    .child(if self.photo_mode {
-                        self.render_photos_pane(cx)
-                    } else {
-                        self.render_remote_pane(cx)
-                    }),
-            )
+            .child(self.render_transfer_actions(cx))
+            .child(self.render_file_panes(cx))
             .when(self.transfers_open, |this| {
-                this.child(
-                    v_flex()
-                        .h(px(112.))
-                        .border_t_1()
-                        .border_color(theme::line(cx))
-                        .bg(theme::card(cx))
-                        .child(
-                            h_flex()
-                                .py_1()
-                                .px_2()
-                                .items_center()
-                                .font_semibold()
-                                .text_xs()
-                                .child(format!(
-                                    "Transfers ({})",
-                                    if self.queue.is_empty() {
-                                        self.remote.transfers.len()
-                                    } else {
-                                        self.queue.len()
-                                    }
-                                )),
-                        )
-                        .child(if !self.queue.is_empty() {
-                            uniform_list(
-                                "transfer-queue",
-                                self.queue.len(),
-                                cx.processor(|this, range: Range<usize>, _, cx| {
-                                    range
-                                        .map(|row| {
-                                            this.render_queue_row(this.queue.len() - 1 - row, cx)
-                                        })
-                                        .collect::<Vec<_>>()
-                                }),
-                            )
-                            .flex_1()
-                            .min_h_0()
-                            .into_any_element()
-                        } else if self.remote.transfers.is_empty() {
-                            crate::ui::empty_state("No transfers yet", cx).into_any_element()
-                        } else {
-                            v_flex()
-                                .flex_1()
-                                .overflow_hidden()
-                                .children(self.remote.transfers.iter().rev().take(3).map(
-                                    |transfer| {
-                                        let status = match &transfer.status {
-                                            TransferStatus::Running => transfer.total.map_or_else(
-                                                || format_size(transfer.bytes),
-                                                |total| {
-                                                    format!(
-                                                        "{} / {}",
-                                                        format_size(transfer.bytes),
-                                                        format_size(total)
-                                                    )
-                                                },
-                                            ),
-                                            TransferStatus::Complete => {
-                                                if matches!(
-                                                    transfer.direction,
-                                                    TransferDirection::Upload
-                                                ) {
-                                                    "Complete · listed".into()
-                                                } else {
-                                                    "Complete".into()
-                                                }
-                                            }
-                                            TransferStatus::Verified => "Verified · SHA-256".into(),
-                                            TransferStatus::Sent => {
-                                                if matches!(
-                                                    transfer.direction,
-                                                    TransferDirection::Upload
-                                                ) {
-                                                    "Sent · verifying".into()
-                                                } else {
-                                                    "Received · verifying".into()
-                                                }
-                                            }
-                                            TransferStatus::Cancelled => "Cancelled".into(),
-                                            TransferStatus::Failed(reason) => {
-                                                format!("Failed: {reason}")
-                                            }
-                                        };
-                                        h_flex()
-                                            .px_2()
-                                            .gap_2()
-                                            .items_center()
-                                            .text_xs()
-                                            .child(Icon::new(
-                                                if matches!(
-                                                    transfer.direction,
-                                                    TransferDirection::Upload
-                                                ) {
-                                                    IconName::ArrowUp
-                                                } else {
-                                                    IconName::ArrowDown
-                                                },
-                                            ))
-                                            .child(
-                                                div()
-                                                    .flex_1()
-                                                    .min_w_0()
-                                                    .text_ellipsis()
-                                                    .child(transfer.name.clone()),
-                                            )
-                                            .child(
-                                                div()
-                                                    .w(px(170.))
-                                                    .text_color(theme::muted(cx))
-                                                    .text_ellipsis()
-                                                    .child(status),
-                                            )
-                                    },
-                                ))
-                                .into_any_element()
-                        }),
-                )
+                this.child(self.render_transfer_history(cx))
             })
             .child(self.render_status_bar(cx))
             .when(fullscreen, |this| {
                 this.child(self.render_fullscreen_toolbar(cx))
             })
+            .into_any_element()
     }
 }
 
