@@ -1,0 +1,9 @@
+BEGIN IMMEDIATE;
+CREATE TABLE IF NOT EXISTS proxy_ip_history(
+ ip TEXT PRIMARY KEY NOT NULL,
+ first_seen INTEGER NOT NULL,
+ proxy_id TEXT REFERENCES socks_proxies(id) ON DELETE SET NULL,
+ owner_id TEXT NOT NULL
+);
+PRAGMA user_version=6;
+COMMIT;
