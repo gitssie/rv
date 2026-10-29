@@ -14,3 +14,5 @@ commit `5a92b9ba262de5bf10e864219883267672c05db8`:
 
 The complete upstream license and Feather attribution are in `LUCIDE-LICENSE`.
 RV embeds these SVGs alongside the existing component icon assets.
+
+| Post-paste touch toggle | [mouse-pointer-click.svg](https://github.com/lucide-icons/lucide/blob/5a92b9ba262de5bf10e864219883267672c05db8/icons/mouse-pointer-click.svg) |

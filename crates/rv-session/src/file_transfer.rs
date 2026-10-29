@@ -28,6 +28,13 @@ pub struct PhotoEntry {
 }
 
 #[derive(Debug, Clone)]
+pub struct SafariFolder {
+    pub path: String,
+    pub modified: i64,
+    pub downloads: bool,
+}
+
+#[derive(Debug, Clone)]
 pub struct PhotoAlbum {
     pub id: String,
     pub name: String,
@@ -98,6 +105,10 @@ pub struct FileTransferSnapshot {
     pub photo_task_id: Option<String>,
     pub management_busy: bool,
     pub management_revision: u64,
+    pub safari_folders: Vec<SafariFolder>,
+    pub safari_path: Option<String>,
+    pub safari_busy: bool,
+    pub safari_error: Option<String>,
     pub remote_path: String,
     pub listed_path: Option<String>,
     pub entries: Vec<TightFileEntry>,
@@ -139,6 +150,10 @@ impl Default for FileTransferSnapshot {
             photo_task_id: None,
             management_busy: false,
             management_revision: 0,
+            safari_folders: Vec::new(),
+            safari_path: None,
+            safari_busy: false,
+            safari_error: None,
             remote_path: "/".into(),
             listed_path: None,
             entries: Vec::new(),
@@ -152,6 +167,7 @@ impl Default for FileTransferSnapshot {
 
 #[derive(Debug, Clone)]
 pub enum FileCommand {
+    SafariDownloads,
     List(String),
     Download {
         remote: String,
@@ -235,6 +251,10 @@ impl FileTransferClient {
         {
             return false;
         }
+        let safari = matches!(command, FileCommand::SafariDownloads);
+        if safari && state.safari_busy {
+            return false;
+        }
         let photo_list = if let FileCommand::PhotoList { offset, album } = &command {
             if state.photo_busy {
                 return false;
@@ -247,6 +267,13 @@ impl FileTransferClient {
             return false;
         }
         state.pending_commands += 1;
+        if safari {
+            state.safari_busy = true;
+            state.safari_folders.clear();
+            state.safari_path = None;
+            state.safari_error = None;
+            state.revision = state.revision.wrapping_add(1);
+        }
         if let Some((offset, album)) = photo_list {
             // Publish busy before another click (or another client clone) can
             // enqueue a second navigation request.
@@ -274,6 +301,7 @@ impl FileTransferClient {
         if state.reserved_owner.is_some()
             || state.pending_commands > 0
             || state.photo_busy
+            || state.safari_busy
             || state.management_busy
             || state.listing
             || state

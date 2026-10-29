@@ -27,25 +27,40 @@ mod toolbar;
 
 /// Window body: address book plus GPUI Component overlay layers.
 ///
-/// Dialogs must not be painted from inside `AddressBookApp::render` — the
-/// dialog builder would `read` that entity while it is still being updated.
+/// Synchronize the owned modal stack before composing its layers. Builders read
+/// AddressBookApp, so both steps stay outside that entity's render/borrow.
 pub struct WindowRoot {
     address_book: Entity<AddressBookApp>,
+    _updates: Subscription,
 }
 
 impl WindowRoot {
-    pub fn new(address_book: Entity<AddressBookApp>) -> Self {
-        Self { address_book }
+    pub fn new(address_book: Entity<AddressBookApp>, cx: &mut Context<Self>) -> Self {
+        let updates = cx.observe(&address_book, |_, _, cx| cx.notify());
+        Self {
+            address_book,
+            _updates: updates,
+        }
     }
 }
 
 impl Render for WindowRoot {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.address_book
+            .update(cx, |app, cx| {
+                app.sync_component_dialog(window, cx);
+                app.sync_phone_unlock_dialogs(window, cx);
+            });
         div()
             .size_full()
             .relative()
             .child(self.address_book.clone())
-            .children(Root::render_dialog_layer(window, cx))
+            .children(Root::render_dialog_layer(window, cx).map(|layer| {
+                div()
+                    .id("management-dialog-layer")
+                    .debug_selector(|| "management-dialog-layer".into())
+                    .child(layer)
+            }))
             .children(Root::render_notification_layer(window, cx))
     }
 }
@@ -64,7 +79,6 @@ enum Modal {
     App,
     AppDelete,
     Shop,
-    Chat,
     PhoneControl(ConnectionId),
 }
 
@@ -98,6 +112,7 @@ pub struct AddressBookApp {
     modal: Modal,
     status: SharedString,
     notified_status: Option<SharedString>,
+    error_status: Option<SharedString>,
     notification_close_task: Option<Task<()>>,
     password_hint_task: Option<Task<()>>,
     credential_busy: bool,
@@ -217,6 +232,7 @@ impl AddressBookApp {
             modal: Modal::None,
             status,
             notified_status: None,
+            error_status: None,
             notification_close_task: None,
             password_hint_task: None,
             credential_busy: false,
@@ -291,6 +307,74 @@ impl AddressBookApp {
             }
         }
         self.reload_home(cx);
+    }
+
+    pub(crate) fn reimport_phone_backup(
+        &mut self,
+        device: ConnectionId,
+        bundle: &str,
+        id: &rv_core::workspace::AppId,
+        backup: &str,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        if self.read_only {
+            return Err("当前为只读模式".into());
+        }
+        let result =
+            rv_core::workspace::WorkspaceStore::open(self.book.paths()).and_then(|mut store| {
+                let catalog = store
+                    .phone_state(device, bundle)?
+                    .ok_or_else(|| rv_core::StoreError::Invalid("请先刷新手机备份列表".into()))?;
+                store.reimport_backup(device, bundle, &catalog, id, backup)
+            });
+        match result {
+            Ok(_) => {
+                self.reload_home(cx);
+                self.set_status("备份信息已同步，账号 state 尚待读取", cx);
+                Ok(())
+            }
+            Err(error) => {
+                tracing::error!(device_id=%device,app_id=id.as_str(),error=%error,"Phone backup reimport failed");
+                Err("同步到本地失败，请查看日志".into())
+            }
+        }
+    }
+
+    /// Complete the import with a validated state before provisioning API tasks.
+    pub(crate) fn missing_backup_profiles(
+        &self,
+        bundle: &str,
+        result: &serde_json::Value,
+    ) -> Vec<rv_session::AppCommand> {
+        if self.read_only || bundle != "lt.manodrabuziai.fr" {
+            return vec![];
+        }
+        let Ok(store) = rv_core::workspace::WorkspaceStore::open(self.book.paths()) else {
+            return vec![];
+        };
+        result["backups"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|row| {
+                if row["kind"] != "snapshot" {
+                    return None;
+                }
+                let id = rv_core::workspace::AppId::from_idfv(row["idfv"].as_str()?).ok()?;
+                if store.load(&id).ok()?.archived || store.app_state_info(&id).ok()?.is_some() {
+                    return None;
+                }
+                let backup = row["backup_id"].as_str()?;
+                if backup != format!("snapshot:{}", id.as_str()) {
+                    return None;
+                }
+                Some(rv_session::AppCommand::ReadProfile {
+                    app_id: id,
+                    bundle: bundle.into(),
+                    backup: backup.into(),
+                })
+            })
+            .collect()
     }
 
     fn persist(&mut self) {
@@ -427,6 +511,7 @@ impl AddressBookApp {
 
     fn set_status(&mut self, text: impl Into<SharedString>, cx: &mut Context<Self>) {
         self.status = text.into();
+        self.error_status = None;
         self.notified_status = None;
         cx.notify();
     }
@@ -652,7 +737,7 @@ impl AddressBookApp {
             Modal::Connection => self.submit_connect(true, window, cx),
             Modal::DeleteConfirm { id, .. } => self.confirm_delete(id, cx),
             Modal::AppDelete => self.confirm_app_delete(cx),
-            Modal::App | Modal::Shop | Modal::Chat | Modal::PhoneControl(_) => {}
+            Modal::App | Modal::Shop | Modal::PhoneControl(_) => {}
             Modal::None => {
                 let Some(id) = self.selected else {
                     self.set_status("Select a connection to connect", cx);

@@ -1,5 +1,5 @@
 use super::*;
-use crate::{AddressBook, Connection, StorePaths};
+use crate::{AddressBook, Connection, StoreError, StorePaths};
 use serde_json::json;
 const ID: &str = "C9EB7804-2062-4519-AC8D-6F68972574F3";
 fn fixture() -> (WorkspaceStore, Connection, tempfile::TempDir) {
@@ -337,7 +337,7 @@ fn task_commit_rolls_back_credentials_and_projection_when_terminal_write_fails()
 }
 
 #[test]
-fn unknown_refresh_blocks_replay_beyond_recent_history_and_import_preserves_rotated_credentials() {
+fn old_unknown_history_does_not_block_explicit_retry_or_overwrite_rotated_credentials() {
     let (mut store, device, _) = fixture();
     store
         .sync_backups(device.id, "lt.manodrabuziai.fr", &result(ID))
@@ -355,10 +355,11 @@ fn unknown_refresh_blocks_replay_beyond_recent_history_and_import_preserves_rota
     let task = store.start_task(&id, "refresh").unwrap();
     store
         .db
-        .execute("UPDATE app_tasks SET deadline=0 WHERE id=?1", [&task])
+        .execute("UPDATE tasks SET deadline=0 WHERE id=?1", [&task])
         .unwrap();
-    assert!(store.start_task(&id, "refresh").is_err());
-    assert_eq!(store.tasks(&id).unwrap()[0].status, "unknown");
+    let retry=store.start_task(&id,"refresh").unwrap();
+    assert_eq!(store.task(&task).unwrap().status,"unknown");
+    store.finish_task(&retry,"completed",&json!({})).unwrap();
     for _ in 0..51 {
         let query = store.start_task(&id, "session").unwrap();
         store.finish_task(&query, "completed", &json!({})).unwrap();
@@ -370,7 +371,7 @@ fn unknown_refresh_blocks_replay_beyond_recent_history_and_import_preserves_rota
             .iter()
             .all(|task| task.kind != "refresh")
     );
-    assert!(store.start_task(&id, "refresh").is_err());
+    assert!(store.start_task(&id,"refresh").is_ok());
 }
 
 #[test]
@@ -423,6 +424,8 @@ fn proxy_binding_is_persistent_idfv_scoped_and_bound_proxy_cannot_be_deleted() {
         .unwrap();
     let id = AppId::from_idfv(ID).unwrap();
     let proxy = SocksProxy {
+        protocol: Default::default(),
+        front_proxy_id: None,
         id: uuid::Uuid::new_v4().to_string(),
         name: "France".into(),
         host: "127.0.0.1".into(),
@@ -430,6 +433,7 @@ fn proxy_binding_is_persistent_idfv_scoped_and_bound_proxy_cannot_be_deleted() {
         username: "account".into(),
         password: "proxy-secret".into(),
         mode: ProxyMode::Exclusive,
+        ip: Default::default(),
     };
     store.save_proxy(&proxy).unwrap();
     store.bind_proxy(&id, Some(&proxy.id)).unwrap();
@@ -517,4 +521,164 @@ fn profile_supplements_matching_tokens_but_never_attaches_old_expiry_to_rotated_
     let retained = store.auth(&id).unwrap().unwrap();
     assert_eq!(retained.access_token, "rotated");
     assert_eq!(retained.expires_at, Some(2100000000));
+}
+
+#[test]
+fn explicit_reimport_restores_selected_deleted_card_without_restoring_other_dismissals() {
+    let (mut store, device, _dir) = fixture();
+    let id = AppId::from_idfv(ID).unwrap();
+    let other = AppId::from_idfv("7A70B21A-2F9D-4F66-81C4-6D21355758D7").unwrap();
+    let backup = format!("snapshot:{}", id.as_str());
+    let mut catalog = result(ID);
+    catalog["backups"][0]["backup_id"] = json!(backup);
+    let mut row = catalog["backups"][0].clone();
+    row["idfv"] = json!(other.as_str());
+    row["backup_id"] = json!(format!("snapshot:{}", other.as_str()));
+    catalog["backups"].as_array_mut().unwrap().push(row);
+    store
+        .sync_backups(device.id, "lt.manodrabuziai.fr", &catalog)
+        .unwrap();
+    store.delete_app(&id).unwrap();
+    store.delete_app(&other).unwrap();
+    store
+        .sync_backups(device.id, "lt.manodrabuziai.fr", &catalog)
+        .unwrap();
+    assert!(store.list(&AppQuery::default()).unwrap().is_empty());
+    store
+        .reimport_backup(device.id, "lt.manodrabuziai.fr", &catalog, &id, &backup)
+        .unwrap();
+    assert!(store.load(&id).is_ok());
+    assert!(store.load(&other).is_err());
+    assert_eq!(store.backups(&id).unwrap().len(), 1);
+    store.delete_app(&id).unwrap();
+    let mut broken = catalog.clone();
+    broken["backups"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"kind":"bad"}));
+    assert!(
+        store
+            .reimport_backup(device.id, "lt.manodrabuziai.fr", &broken, &id, &backup)
+            .is_err()
+    );
+    store
+        .sync_backups(device.id, "lt.manodrabuziai.fr", &catalog)
+        .unwrap();
+    assert!(store.load(&id).is_err());
+}
+
+#[test]
+fn token_expiry_projection_uses_actual_times_and_never_invents_opaque_refresh_expiry() {
+    use base64::Engine as _;
+    let jwt = |expiry: i64| {
+        format!(
+            "header.{}.signature",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(json!({"exp":expiry}).to_string())
+        )
+    };
+    let mut auth = AppAuth {
+        access_token: jwt(1_800_000_100),
+        refresh_token: Some(jwt(1_802_000_100)),
+        ..Default::default()
+    };
+    assert_eq!(
+        auth.token_expirations(),
+        TokenExpirations {
+            access: Some(1_800_000_100),
+            refresh: Some(1_802_000_100)
+        }
+    );
+    auth.expires_at = Some(1_800_000_200);
+    assert_eq!(auth.token_expirations().access, Some(1_800_000_200));
+    auth.refresh_token = Some("opaque-token".into());
+    assert_eq!(auth.token_expirations().refresh, None);
+    auth.extra
+        .insert("refresh_token_expires_in".into(), json!(3600));
+    assert_eq!(auth.token_expirations().refresh, None);
+    auth.extra
+        .insert("credentials_received_at".into(), json!(1_800_000_000));
+    assert_eq!(auth.token_expirations().refresh, Some(1_800_003_600));
+    auth.extra
+        .insert("refresh_token_expires_at".into(), json!(1_800_005_000));
+    assert_eq!(auth.token_expirations().refresh, Some(1_800_005_000));
+    auth.refresh_token = None;
+    assert_eq!(auth.token_expirations().refresh, None);
+    let malformed = AppAuth {
+        access_token: "not.jwt".into(),
+        refresh_token: Some("a.invalid.c".into()),
+        ..Default::default()
+    };
+    assert_eq!(malformed.token_expirations(), TokenExpirations::default());
+}
+
+#[test]
+fn committed_changes_are_immediate_scoped_and_readable_from_another_connection() {
+    use crate::events::*;
+    let (mut store, device, dir) = fixture();
+    store
+        .sync_backups(device.id, "lt.manodrabuziai.fr", &result(ID))
+        .unwrap();
+    let paths = StorePaths::in_dir(dir.path().into());
+    let events = workspace_bus(&paths)
+        .unwrap()
+        .subscribe::<WorkspaceChanged>();
+    store
+        .business_transaction(|db| {
+            db.execute(
+                "UPDATE app_instances SET note='committed' WHERE id=?1",
+                [ID],
+            )?;
+            db.execute("UPDATE app_instances SET title='updated' WHERE id=?1", [ID])?;
+            assert!(events.try_recv().is_err());
+            Ok(())
+        })
+        .unwrap();
+    let event = events.try_recv().unwrap();
+    assert_eq!(event.changes.len(), 1);
+    assert_eq!(event.changes[0].domain, ChangeDomain::Apps);
+    assert_eq!(event.changes[0].app_id.as_deref(), Some(ID));
+    let reader = WorkspaceStore::open(&paths).unwrap();
+    assert_eq!(
+        reader.load(&AppId::from_idfv(ID).unwrap()).unwrap().note,
+        "committed"
+    );
+    let failed: Result<(), StoreError> = store.business_transaction(|db| {
+        db.execute("UPDATE app_instances SET note='rollback' WHERE id=?1", [ID])?;
+        Err(StoreError::Conflict)
+    });
+    assert!(failed.is_err());
+    assert!(events.try_recv().is_err());
+    drop(store);
+    assert!(events.try_recv().is_err());
+    assert_eq!(
+        reader.load(&AppId::from_idfv(ID).unwrap()).unwrap().note,
+        "committed"
+    );
+}
+
+#[test]
+fn nested_profile_savepoint_failure_does_not_publish_credentials() {
+    use crate::events::*;
+    let (mut store, device, dir) = fixture();
+    store
+        .sync_backups(device.id, "lt.manodrabuziai.fr", &result(ID))
+        .unwrap();
+    let id = AppId::from_idfv(ID).unwrap();
+    // Force the final app save to fail after its nested credential save succeeds.
+    store.db.execute_batch("CREATE TRIGGER fail_profile BEFORE UPDATE ON app_instances BEGIN SELECT RAISE(ABORT,'test failure'); END;").unwrap();
+    let paths = StorePaths::in_dir(dir.path().into());
+    let events = workspace_bus(&paths)
+        .unwrap()
+        .subscribe::<WorkspaceChanged>();
+    let profile = json!({"bundle_id":"lt.manodrabuziai.fr","idfv":ID,"supported":true,"credentials":{"access_token":"test-token","refresh_token":"test-refresh"},"metadata":{}});
+    assert!(store.import_profile(&id, &profile).is_err());
+    assert!(store.auth(&id).unwrap().is_none());
+    assert!(events.try_recv().is_err());
+    // A later committed mutation must not leak rolled-back credential changes.
+    store.db.execute_batch("DROP TRIGGER fail_profile").unwrap();
+    let app = store.load(&id).unwrap();
+    store.save(&app).unwrap();
+    let event = events.try_recv().unwrap();
+    assert!(event.changes.iter().all(|c| c.domain == ChangeDomain::Apps));
 }

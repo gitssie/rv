@@ -1,31 +1,25 @@
-//! Bundle UI strategies. The shell renders only the unified chat contract.
-use crate::theme;
-use gpui::prelude::FluentBuilder as _;
-use gpui::*;
-use gpui_component::{StyledExt, h_flex, v_flex};
+//! Bundle rendering hooks compose upstream Message/Bubble surfaces and local resources only.
+use crate::{assets::FunctionIcon, theme};
+use gpui::{prelude::FluentBuilder as _, *};
+use gpui_component::{Icon, IconName, avatar::Avatar, h_flex, tooltip::Tooltip, v_flex};
 use rv_business::chat::{ChatImage, ContextItem, Conversation, Message};
+use rv_gpui_chat::{
+    bubble::{Bubble, BubbleVariant},
+    message::{Message as MessageView, MessageAlignment, MessageContent, MessageFooter},
+};
 use std::collections::HashMap;
 pub(super) trait Renderer {
-    fn identity(&self) -> (&'static str, &'static str, u32);
-    fn message(&self, m: &Message, cx: &App) -> AnyElement {
-        bubble(m, cx)
+    fn message(&self, m: &Message, conversation: &Conversation, cx: &App) -> AnyElement {
+        message(m, conversation, cx)
     }
     fn context(&self, item: &ContextItem, cx: &App) -> AnyElement {
         context(item, cx)
     }
 }
-struct Generic;
 struct Vinted;
-impl Renderer for Generic {
-    fn identity(&self) -> (&'static str, &'static str, u32) {
-        ("App", "A", 0x607080)
-    }
-}
-impl Renderer for Vinted {
-    fn identity(&self) -> (&'static str, &'static str, u32) {
-        ("Vinted", "V", 0x007e8d)
-    }
-}
+impl Renderer for Vinted {}
+struct Generic;
+impl Renderer for Generic {}
 pub(super) struct Registry {
     plugins: HashMap<&'static str, Box<dyn Renderer>>,
     fallback: Box<dyn Renderer>,
@@ -48,41 +42,53 @@ impl Registry {
             .unwrap_or(self.fallback.as_ref())
     }
 }
-pub(super) fn thumbnail(image: Option<&ChatImage>, size: f32, cx: &App) -> Div {
-    let mut el = div()
+pub(super) fn thumbnail(image: Option<&ChatImage>, size: f32, fit: ObjectFit, cx: &App) -> Div {
+    div()
         .size(px(size))
         .flex_shrink_0()
-        .rounded(theme::radius(cx))
         .overflow_hidden()
-        .bg(theme::selected(cx));
-    if let Some(path) = image.and_then(|i| i.path.as_ref()) {
-        el = el.child(img(path.clone()).size_full().object_fit(ObjectFit::Cover));
-    }
-    el
+        .bg(theme::selected(cx))
+        .when_some(image, |el, image| {
+            if let Some(path) = image.path.clone() {
+                el.child(img(path).size_full().object_fit(fit))
+            } else if let Some(bytes) = image.bytes.as_ref() {
+                el.child(
+                    img(std::sync::Arc::new(Image::from_bytes(
+                        ImageFormat::Jpeg,
+                        bytes.clone(),
+                    )))
+                    .size_full()
+                    .object_fit(fit),
+                )
+            } else {
+                el
+            }
+        })
 }
-pub(super) fn avatar(c: &Conversation, size: f32, cx: &App) -> Div {
-    thumbnail(c.avatar.as_ref(), size, cx)
-        .rounded_full()
-        .flex()
-        .items_center()
-        .justify_center()
-        .when(
-            c.avatar.as_ref().and_then(|i| i.path.as_ref()).is_none(),
-            |el| el.child(c.title.chars().next().unwrap_or('·').to_string()),
-        )
+pub(super) fn avatar(c: &Conversation) -> Avatar {
+    let avatar = Avatar::new().name(c.title.clone());
+    match c.avatar.as_ref().and_then(|i| i.path.clone()) {
+        Some(path) => avatar.src(path),
+        None => avatar,
+    }
 }
 fn context(item: &ContextItem, cx: &App) -> AnyElement {
     h_flex()
         .gap_2()
         .items_center()
-        .child(thumbnail(item.image.as_ref(), 42., cx))
+        .child(thumbnail(item.image.as_ref(), 42., ObjectFit::Cover, cx))
         .child(
             v_flex()
                 .gap_1()
                 .min_w_0()
                 .flex_1()
                 .child(div().text_sm().text_ellipsis().child(item.title.clone()))
-                .children(item.price.iter().map(|p| div().text_xs().child(p.clone()))),
+                .children(item.price.iter().map(|p| {
+                    div()
+                        .text_xs()
+                        .text_color(theme::muted(cx))
+                        .child(p.clone())
+                })),
         )
         .into_any_element()
 }
@@ -97,52 +103,78 @@ pub(super) fn stamp(ts: i64) -> String {
 }
 pub(super) fn status(status: &str) -> &str {
     match status {
+        "pending" => "等待发送",
         "sending" => "发送中",
-        "submitted" => "已提交，等待确认",
+        "submitted" => "已提交，等待消息确认",
         "failed" => "发送失败",
         "unknown" => "结果未知，请核对",
-        _ => "",
+        "cancelled" => "已取消",
+        _ => "已发送",
     }
 }
-fn bubble(m: &Message, cx: &App) -> AnyElement {
-    let mut body = v_flex().max_w(relative(0.82)).gap_1();
-    if !m.body.is_empty() {
-        body = body.child(
-            div()
-                .px_3()
-                .py_2()
-                .rounded(theme::radius_large(cx))
-                .font_normal()
-                .whitespace_normal()
-                .bg(if m.outgoing {
-                    theme::accent(cx)
-                } else {
-                    theme::sidebar(cx)
-                })
-                .text_color(if m.outgoing {
-                    theme::accent_fg(cx)
-                } else {
-                    theme::ink(cx)
-                })
-                .child(m.body.clone()),
+fn message(m: &Message, conversation: &Conversation, cx: &App) -> AnyElement {
+    let main = m
+        .translation
+        .as_ref()
+        .filter(|_| m.outgoing)
+        .map(|t| t.original.clone())
+        .unwrap_or_else(|| m.body.clone());
+    let mut content = Bubble::new()
+        .with_variant(if m.outgoing {
+            BubbleVariant::Filled
+        } else {
+            BubbleVariant::Secondary
+        })
+        .child(div().whitespace_normal().child(main));
+    if let Some(translation) = &m.translation {
+        content = content.child(
+            h_flex()
+                .gap_2()
+                .items_start()
+                .border_t_1()
+                .border_color(theme::line(cx))
+                .child(Icon::new(FunctionIcon::Languages))
+                .child(
+                    div()
+                        .text_xs()
+                        .whitespace_normal()
+                        .child(translation.translated.clone()),
+                ),
         );
     }
-    body = body.children(
-        m.images
-            .iter()
-            .map(|image| thumbnail(Some(image), 150., cx)),
-    );
-    body = body.child(
-        h_flex()
-            .gap_2()
-            .text_xs()
-            .text_color(theme::muted(cx))
-            .child(stamp(m.created_at))
-            .child(status(&m.status).to_owned()),
-    );
-    h_flex()
-        .w_full()
-        .when(m.outgoing, |el| el.justify_end())
-        .child(body)
+    for image in &m.images {
+        content = content.child(thumbnail(Some(image), 150., ObjectFit::Contain, cx));
+    }
+    let footer = MessageFooter::new()
+        .child(crate::typography::caption(stamp(m.created_at), cx))
+        .when(m.outgoing, |footer| {
+            let icon: Icon = match m.status.as_str() {
+                "pending" | "submitted" => Icon::new(FunctionIcon::Recent),
+                "sending" => Icon::new(IconName::LoaderCircle),
+                "failed" | "unknown" => Icon::new(IconName::Info),
+                "cancelled" => Icon::new(IconName::Close),
+                _ => Icon::new(IconName::Check),
+            };
+            let label = status(&m.status).to_string();
+            footer.child(
+                div()
+                    .id(SharedString::from(format!("message-status-{}", m.id)))
+                    .tooltip(move |window, cx| Tooltip::new(label.clone()).build(window, cx))
+                    .child(icon)
+                    .when(matches!(m.status.as_str(), "failed" | "unknown"), |el| {
+                        el.text_color(theme::danger(cx))
+                    }),
+            )
+        });
+    MessageView::new()
+        .id(SharedString::from(format!("chat-message-{}", m.id)))
+        .alignment(if m.outgoing {
+            MessageAlignment::End
+        } else {
+            MessageAlignment::Start
+        })
+        .when(!m.outgoing, |row| row.avatar(avatar(conversation)))
+        .content(MessageContent::new().bubble(content))
+        .footer(footer)
         .into_any_element()
 }

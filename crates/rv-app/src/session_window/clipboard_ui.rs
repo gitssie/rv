@@ -26,6 +26,7 @@ pub(super) struct ClipboardTransfer {
     outbound_echo: Option<(u64, std::time::Instant)>,
     pub(super) last_click: Option<(u16, u16)>,
     pub(super) post_paste: Option<paste_touch::PasteTouch>,
+    pub(super) post_paste_enabled: bool,
 }
 impl ClipboardTransfer {
     pub(super) fn expire_feedback(&mut self, now: std::time::Instant) -> bool {
@@ -104,7 +105,9 @@ fn fingerprint(text: &str) -> u64 {
 impl SessionView {
     pub(super) fn begin_clipboard_transfer(&mut self, paste: bool, cx: &App) {
         self.cancel_post_paste_touch();
-        if self.view_only() || self.phase != Phase::Connected || self.clipboard_transfer.busy()
+        if self.view_only()
+            || self.phase != Phase::Connected
+            || self.clipboard_transfer.busy()
             || self.touch_gesture.busy()
         {
             return;
@@ -217,24 +220,31 @@ impl SessionView {
                 .set_modifiers(mods.control, mods.alt, mods.platform),
         );
         self.send_keys(events);
-        if self.buttons == 0 {
-            if let Some(anchor) = self.clipboard_transfer.last_click {
-                let mut entropy = [0; 32];
-                entropy[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
-                entropy[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
-                self.clipboard_transfer.post_paste = paste_touch::PasteTouch::new(
-                    anchor, (self.fb_w, self.fb_h), entropy, std::time::Instant::now(),
-                );
-                if self.clipboard_transfer.post_paste.is_some() {
-                    tracing::debug!("post-paste touch scheduled");
+        if self.clipboard_transfer.post_paste_enabled {
+            if self.buttons == 0 {
+                if let Some(anchor) = self.clipboard_transfer.last_click {
+                    let mut entropy = [0; 32];
+                    entropy[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+                    entropy[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+                    self.clipboard_transfer.post_paste = paste_touch::PasteTouch::new(
+                        anchor,
+                        (self.fb_w, self.fb_h),
+                        entropy,
+                        std::time::Instant::now(),
+                    );
+                    if self.clipboard_transfer.post_paste.is_some() {
+                        tracing::debug!("post-paste touch scheduled");
+                    } else {
+                        tracing::warn!(
+                            "post-paste touch skipped: click anchor outside framebuffer"
+                        );
+                    }
                 } else {
-                    tracing::warn!("post-paste touch skipped: click anchor outside framebuffer");
+                    tracing::warn!("post-paste touch skipped: no previous canvas click");
                 }
             } else {
-                tracing::warn!("post-paste touch skipped: no previous canvas click");
+                tracing::warn!("post-paste touch skipped: mouse button held");
             }
-        } else {
-            tracing::warn!("post-paste touch skipped: mouse button held");
         }
         clear_sent_clipboard(&pending, cx);
         self.clipboard_transfer.feedback =
@@ -251,14 +261,33 @@ impl SessionView {
         }
     }
 
-    pub(super) fn advance_post_paste_touch(&mut self, window: &mut Window, cx: &mut App, now: std::time::Instant) {
-        if self.clipboard_transfer.post_paste.is_none() { return; }
-        let blocked = !window.is_window_active() || !self.focus.is_focused(window)
-            || self.phase != Phase::Connected || self.view_only() || self.buttons != 0
-            || self.unlock.blocks_input() || self.functions.open || self.mailbox.open
-            || self.notifications.open || self.apps.picker_open || self.show_menu
+    pub(super) fn advance_post_paste_touch(
+        &mut self,
+        window: &mut Window,
+        cx: &mut App,
+        now: std::time::Instant,
+    ) {
+        if self.clipboard_transfer.post_paste.is_none() {
+            return;
+        }
+        let blocked = !self.clipboard_transfer.post_paste_enabled
+            || !window.is_window_active()
+            || !self.focus.is_focused(window)
+            || self.phase != Phase::Connected
+            || self.view_only()
+            || self.buttons != 0
+            || self.unlock.blocks_input()
+            || self.functions.open
+            || self.mailbox.open
+            || self.notifications.open
+            || self.apps.picker_open
+            || self.show_menu
             || window.has_active_dialog(cx)
-            || self.clipboard_transfer.post_paste.as_ref().is_some_and(|p| p.point.0 >= self.fb_w || p.point.1 >= self.fb_h);
+            || self
+                .clipboard_transfer
+                .post_paste
+                .as_ref()
+                .is_some_and(|p| p.point.0 >= self.fb_w || p.point.1 >= self.fb_h);
         if blocked {
             tracing::debug!(
                 active = window.is_window_active(),
@@ -272,9 +301,12 @@ impl SessionView {
         let plan = self.clipboard_transfer.post_paste.as_mut().unwrap();
         if let Some(down) = plan.poll(now) {
             tracing::debug!(down, "dispatching post-paste touch");
-            self.handle.pointer(plan.point.0, plan.point.1, u8::from(down));
+            self.handle
+                .pointer(plan.point.0, plan.point.1, u8::from(down));
         }
-        if plan.finished() { self.clipboard_transfer.post_paste = None; }
+        if plan.finished() {
+            self.clipboard_transfer.post_paste = None;
+        }
     }
 }
 
@@ -327,6 +359,7 @@ mod tests {
             outbound_echo: None,
             last_click: None,
             post_paste: None,
+            post_paste_enabled: false,
         }
     }
     #[test]

@@ -34,7 +34,6 @@ pub struct BusinessRow {
 pub struct BusinessPage {
     pub rows: Vec<BusinessRow>,
     pub total: usize,
-    pub last_sync: Option<i64>,
 }
 pub fn read_data(
     paths: &StorePaths,

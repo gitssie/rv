@@ -1,13 +1,19 @@
-//! Chat controller: host HTTP jobs, local drafts and guarded async view updates.
+//! Chat controller: local projections and immediate async operations; durable sends use outbox.
+mod images;
+mod notifications;
 mod plugins;
+#[cfg(test)]
+pub(super) mod test_support;
+#[cfg(test)]
+mod tests;
 mod view;
-use super::{AddressBookApp, Modal};
+mod window;
+use super::AddressBookApp;
 use gpui::*;
 use gpui_component::input::{InputEvent, TextareaState};
-use rv_business::chat::Action as ChatAction;
 use rv_business::chat::*;
+use rv_business::chat::sync::ChatSync;
 use rv_core::workspace::AppId;
-use std::{collections::HashSet, time::Duration};
 pub(super) struct ChatState {
     pub accounts: Vec<ChatAccount>,
     pub conversations: Vec<Conversation>,
@@ -17,14 +23,21 @@ pub(super) struct ChatState {
     pub thread: Thread,
     pub composer: Entity<TextareaState>,
     pub clear_composer: Option<(String, String)>,
-    pub refresh_on_load: bool,
     pub loading: bool,
-    pub error: Option<String>,
-    pub busy: HashSet<AppId>,
-    pub sequence: u64,
+    pub thread_loading: bool,
+    pub syncs: std::collections::HashMap<(AppId,ChatSync),usize>,
     pub thread_sequence: u64,
+    data_sequences: [u64; 3],
     registry: plugins::Registry,
-    pub scroll: ScrollHandle,
+    pub scroll: ListState,
+    pub remembered: std::collections::HashMap<AppId, String>,
+    pub notifications_open: bool,
+    pub notifications: Vec<rv_business::notifications::Notification>,
+    pub remembered_notifications: std::collections::HashMap<AppId, String>,
+    pub image_preparing: bool,
+    pub window: Option<WindowHandle<gpui_component::Root>>,
+    pub opening: bool,
+    input_subscription: Option<Subscription>,
 }
 impl ChatState {
     pub fn new(window: &mut Window, cx: &mut Context<AddressBookApp>) -> Self {
@@ -42,14 +55,21 @@ impl ChatState {
                     .placeholder("输入消息…")
             }),
             clear_composer: None,
-            refresh_on_load: false,
             loading: false,
-            error: None,
-            busy: HashSet::new(),
-            sequence: 0,
+            thread_loading: false,
+            syncs: Default::default(),
             thread_sequence: 0,
+            data_sequences: [0; 3],
             registry: plugins::Registry::default(),
-            scroll: ScrollHandle::new(),
+            scroll: ListState::new(0, ListAlignment::Bottom, px(400.)),
+            remembered: Default::default(),
+            notifications_open: false,
+            notifications: vec![],
+            remembered_notifications: Default::default(),
+            image_preparing: false,
+            window: None,
+            opening: false,
+            input_subscription: None,
         }
     }
     fn selected(&self) -> Option<&Conversation> {
@@ -66,7 +86,7 @@ impl ChatState {
 }
 impl AddressBookApp {
     pub(super) fn subscribe_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self._subscriptions.push(cx.subscribe_in(
+        self.chat.input_subscription=Some(cx.subscribe_in(
             &self.chat.composer,
             window,
             |this, input, event, window, cx| match event {
@@ -76,7 +96,7 @@ impl AddressBookApp {
                         if let Some(id) = &this.chat.selected {
                             let body = input.read(cx).value().to_string();
                             if let Err(error) = save_draft(this.book.paths(), id, &body) {
-                                this.chat.error = Some(error);
+                                this.chat_error(error, cx);
                             }
                         }
                     }
@@ -85,137 +105,138 @@ impl AddressBookApp {
             },
         ));
         self.reload_chat(cx);
-        // No catch-up or jobs when RV is closed. Refresh only registered, credentialed accounts.
-        cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor()
-                    .timer(Duration::from_secs(60))
-                    .await;
-                if this
-                    .update(cx, |this, cx| {
-                        if this.read_only {
-                            return;
-                        }
-                        let accounts = this
-                            .chat
-                            .accounts
-                            .iter()
-                            .map(|a| a.id.clone())
-                            .collect::<Vec<_>>();
-                        for id in accounts {
-                            this.dispatch_chat(id, ChatAction::Inbox, cx);
-                        }
-                    })
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        })
-        .detach();
     }
-    pub(super) fn open_chat(&mut self, cx: &mut Context<Self>) {
-        self.modal = Modal::Chat;
-        self.chat.refresh_on_load = true;
-        self.reload_chat(cx);
-        cx.notify();
+    pub(super) fn open_chat(&mut self,window:&mut Window,cx:&mut Context<Self>) {
+        self.open_chat_window(None,window,cx);
+    }
+    pub(in crate::app) fn open_chat_for(&mut self,id:AppId,window:&mut Window,cx:&mut Context<Self>) {
+        self.open_chat_window(Some(id),window,cx);
     }
     pub(super) fn reload_chat(&mut self, cx: &mut Context<Self>) {
-        self.chat.sequence += 1;
-        let sequence = self.chat.sequence;
+        self.reload_chat_data([true; 3], true, cx);
+    }
+    /// Local projections have independent generations so concurrent domain events
+    /// cannot discard another projection's in-flight initial load.
+    pub(super) fn reload_chat_data(
+        &mut self,
+        scopes: [bool; 3],
+        thread: bool,
+        cx: &mut Context<Self>,
+    ) {
+        for (index, enabled) in scopes.iter().enumerate() {
+            if *enabled {
+                self.chat.data_sequences[index] += 1;
+            }
+        }
+        let sequences = self.chat.data_sequences;
         let paths = self.book.paths().clone();
-        self.chat.loading = true;
+        if scopes[1] {
+            self.chat.loading = true;
+        }
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    let accounts = accounts(&paths)?;
-                    let mut conversations = conversations(&paths)?;
-                    local_images(&paths, &mut conversations, &mut Thread::default());
-                    Ok::<_, String>((accounts, conversations))
-                })
-                .await;
-            let _ =
-                this.update(cx, |this, cx| {
-                    if this.chat.sequence != sequence {
-                        return;
-                    }
-                    this.chat.loading = false;
-                    match result {
-                        Ok((accounts, conversations)) => {
-                            this.chat.accounts = accounts;
-                            this.chat.conversations = conversations;
-                            if this.chat.selected.as_ref().is_some_and(|id| {
-                                !this.chat.conversations.iter().any(|c| c.id == *id)
-                            }) {
-                                this.chat.selected = None;
-                                this.chat.thread = Thread::default();
-                                this.chat.thread_sequence += 1;
-                            }
-                            this.load_chat_images(sequence, cx);
-                            if this.chat.refresh_on_load {
-                                this.chat.refresh_on_load = false;
-                                let ids = this
-                                    .chat
-                                    .accounts
-                                    .iter()
-                                    .map(|a| a.id.clone())
-                                    .collect::<Vec<_>>();
-                                for id in ids {
-                                    this.dispatch_chat(id, ChatAction::Inbox, cx);
-                                }
-                            }
-                        }
-                        Err(error) => this.chat.error = Some(error),
-                    }
-                    cx.notify();
-                });
-        })
-        .detach();
-    }
-    fn load_chat_images(&mut self, sequence: u64, cx: &mut Context<Self>) {
-        let paths = self.book.paths().clone();
-        let conversations = self.chat.conversations.clone();
-        cx.spawn(async move |this, cx| {
-            let conversations = cx
-                .background_executor()
-                .spawn(async move {
-                    let mut conversations = conversations;
-                    hydrate_images(&paths, &mut conversations, &mut Thread::default(), None);
-                    conversations
+                    let accounts = scopes[0].then(|| accounts(&paths)).transpose()?;
+                    let conversations = if scopes[1] {
+                        let mut rows = conversations(&paths)?;
+                        local_images(&paths, &mut rows, &mut Thread::default());
+                        Some(rows)
+                    } else {
+                        None
+                    };
+                    let notifications = scopes[2]
+                        .then(|| rv_business::notifications::list(&paths))
+                        .transpose()?;
+                    Ok::<_, String>((accounts, conversations, notifications))
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
-                if this.chat.sequence == sequence {
-                    this.chat.conversations = conversations;
-                    cx.notify();
+                if !scopes.iter().enumerate().any(|(index, enabled)| {
+                    *enabled && this.chat.data_sequences[index] == sequences[index]
+                }) {
+                    return;
                 }
+                if scopes[1] && this.chat.data_sequences[1] == sequences[1] {
+                    this.chat.loading = false;
+                }
+                match result {
+                    Ok((accounts, conversations, notifications)) => {
+                        if this.chat.data_sequences[0] == sequences[0] {
+                            if let Some(accounts) = accounts {
+                                this.chat.accounts = accounts;
+                                if this.chat.account.as_ref().is_none_or(|id| {
+                                    !this.chat.accounts.iter().any(|a| a.id == *id)
+                                }) {
+                                    this.chat.account =
+                                        this.chat.accounts.first().map(|a| a.id.clone());
+                                }
+                            }
+                        }
+                        if this.chat.data_sequences[1] == sequences[1] {
+                            if let Some(conversations) = conversations {
+                                this.chat.conversations = conversations;
+                                if this.chat.selected.as_ref().is_some_and(|id| {
+                                    !this.chat.conversations.iter().any(|c| c.id == *id)
+                                }) {
+                                    this.chat.selected = None;
+                                    this.chat.thread = Thread::default();
+                                    this.chat.thread_sequence += 1;
+                                }
+                            }
+                        }
+                        if this.chat.data_sequences[2] == sequences[2] {
+                            if let Some(notifications) = notifications {
+                                this.chat.notifications = notifications;
+                            }
+                        }
+                    }
+                    Err(error) => this.chat_error(error, cx),
+                }
+                if thread && this.chat.selected.is_some() {
+                    this.reload_chat_thread(cx);
+                }
+                cx.notify();
             });
         })
         .detach();
     }
-    fn select_chat(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
-        self.chat.scroll.scroll_to_bottom();
+    pub(in crate::app) fn select_chat(
+        &mut self,
+        id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.chat.scroll.scroll_to_end();
         self.chat.selected = Some(id.clone());
         self.chat.thread = Thread::default();
-        self.chat.error = None;
         let text = draft(self.book.paths(), &id).unwrap_or_default();
         self.chat
             .composer
             .update(cx, |state, cx| state.set_value(text, window, cx));
         self.reload_chat_thread(cx);
         if let Some(c) = self.chat.selected().cloned() {
-            self.dispatch_chat(c.app_id, ChatAction::Thread(c.remote_id), cx);
+            self.chat.remembered.insert(c.app_id.clone(), c.id.clone());
+            if self
+                .chat
+                .accounts
+                .iter()
+                .any(|a| a.id == c.app_id && a.can_send)
+            {
+                if !self.read_only {self.run_chat_sync(c.app_id.clone(),ChatSync::Thread(c.id.clone()),false,cx);}
+            }
         }
         cx.notify();
     }
-    fn reload_chat_thread(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn reload_chat_thread(&mut self, cx: &mut Context<Self>) {
         let Some(id) = self.chat.selected.clone() else {
             return;
         };
         self.chat.thread_sequence += 1;
         let sequence = self.chat.thread_sequence;
         let paths = self.book.paths().clone();
+        self.chat.thread_loading =
+            self.chat.thread.messages.is_empty() && self.chat.thread.pending.is_empty();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
@@ -229,126 +250,64 @@ impl AddressBookApp {
                 if this.chat.thread_sequence != sequence {
                     return;
                 }
+                this.chat.thread_loading = false;
                 match result {
                     Ok(thread) => {
                         if this.chat.thread.messages.is_empty() {
-                            this.chat.scroll.scroll_to_bottom();
+                            this.chat.scroll.scroll_to_end();
+                        }
+                        let follow = this.chat.thread.messages.is_empty()
+                            || this.chat.scroll.is_scrolled_to_end().unwrap_or(true);
+                        this.chat
+                            .scroll
+                            .reset(thread.messages.len() + thread.pending.len());
+                        if follow {
+                            this.chat.scroll.scroll_to_end();
                         }
                         this.chat.thread = thread;
-                        this.load_thread_images(sequence, cx);
                     }
-                    Err(error) => this.chat.error = Some(error),
+                    Err(error) => this.chat_error(error, cx),
                 }
                 cx.notify();
             });
         })
         .detach();
     }
-    fn load_thread_images(&mut self, sequence: u64, cx: &mut Context<Self>) {
-        let paths = self.book.paths().clone();
-        let thread = self.chat.thread.clone();
-        let thread_app = self
-            .chat
-            .selected()
-            .map(|conversation| conversation.app_id.clone());
-        cx.spawn(async move |this, cx| {
-            let thread = cx
-                .background_executor()
-                .spawn(async move {
-                    let mut thread = thread;
-                    hydrate_images(&paths, &mut [], &mut thread, thread_app.as_ref());
-                    thread
-                })
-                .await;
-            let _ = this.update(cx, |this, cx| {
-                if this.chat.thread_sequence == sequence {
-                    this.chat.thread = thread;
-                    cx.notify();
-                }
-            });
-        })
-        .detach();
+    fn chat_error(&mut self,error:String,cx:&mut Context<Self>) {
+        tracing::error!(app_id=?self.chat.account.as_ref().map(|id|id.as_str()),%error,"Chat action failed");
+        self.set_error_status(error,cx);
     }
-    fn dispatch_chat(&mut self, id: AppId, action: ChatAction, cx: &mut Context<Self>) {
-        if self.read_only || self.chat.busy.contains(&id) || self.home.jobs.contains(&id) {
-            return;
-        }
-        // An account without credentials remains a visible empty state, not a polling error.
-        if !rv_core::workspace::WorkspaceStore::open(self.book.paths())
-            .and_then(|s| s.auth(&id))
-            .is_ok_and(|auth| auth.is_some())
-        {
-            if matches!(action, ChatAction::Send { .. }) {
-                self.chat.error = Some("请先读取此账号资料".into());
+    fn chat_syncing(&self,id:&AppId,operation:&ChatSync)->bool {self.chat.syncs.contains_key(&(id.clone(),operation.clone()))}
+    fn run_chat_sync(&mut self,id:AppId,operation:ChatSync,notify:bool,cx:&mut Context<Self>) {
+        if self.read_only{return;}
+        let key=(id.clone(),operation.clone());
+        if !matches!(operation,ChatSync::SendPending(_)) && self.chat.syncs.contains_key(&key){return;}
+        *self.chat.syncs.entry(key.clone()).or_default()+=1;
+        let paths=self.book.paths().clone();cx.notify();
+        cx.spawn(async move |this,cx| {
+            let result=rv_business::chat::sync::synchronize(paths,id,operation.clone()).await;
+            let _=this.update(cx,|this,cx| {
+                if let Some(count)=this.chat.syncs.get_mut(&key){*count-=1;if *count==0{this.chat.syncs.remove(&key);}}
+                match result {
+                    Ok(())=>{if notify{this.set_status(format!("{}完成",operation.label()),cx);}},
+                    Err(error)=>this.chat_error(format!("{}失败：{error}",operation.label()),cx),
+                }
                 cx.notify();
+            });
+        }).detach();
+    }
+    fn refresh_chat(&mut self,cx:&mut Context<Self>) {
+        if let Some(id)=self.chat.account.clone() {
+            self.run_chat_sync(id.clone(),ChatSync::Inbox,true,cx);
+            if let Some(c)=self.chat.selected().cloned().filter(|c|c.app_id==id) {
+                self.run_chat_sync(id,ChatSync::Thread(c.id),false,cx);
             }
-            return;
         }
-        self.chat.busy.insert(id.clone());
-        self.chat.error = None;
-        let paths = self.book.paths().clone();
-        let target = id.clone();
-        let remote = match &action {
-            ChatAction::Thread(id) | ChatAction::MarkRead(id) => Some(id.clone()),
-            ChatAction::Send { conversation, .. } => Some(conversation.clone()),
-            ChatAction::Inbox => None,
-        };
-        let after_send = matches!(action, ChatAction::Send { .. });
-        let send = match &action {
-            ChatAction::Send { conversation, text } => Some((conversation.clone(), text.clone())),
-            _ => None,
-        };
-        cx.spawn(async move |this, cx| {
-            let (result, persisted_send) = cx
-                .background_executor()
-                .spawn(async move {
-                    let result = rv_business::OfflineRunner::new(None)
-                        .and_then(|runner| runner.chat_blocking(&paths, &target, action));
-                    let persisted_send = send.and_then(|(remote, text)| {
-                        let c = conversations(&paths)
-                            .ok()?
-                            .into_iter()
-                            .find(|c| c.app_id == target && c.remote_id == remote)?;
-                        let persisted = result.is_ok()
-                            || thread(&paths, &c.id)
-                                .ok()?
-                                .pending
-                                .iter()
-                                .any(|m| m.body == text);
-                        persisted.then_some((c.id, text))
-                    });
-                    (result, persisted_send)
-                })
-                .await;
-            let _ = this.update(cx, |this, cx| {
-                this.chat.busy.remove(&id);
-                if persisted_send.is_some() {
-                    this.chat.clear_composer = persisted_send;
-                }
-                if let Err(error) = result {
-                    let title = this
-                        .chat
-                        .accounts
-                        .iter()
-                        .find(|a| a.id == id)
-                        .map(|a| a.title.as_str())
-                        .unwrap_or("账号");
-                    this.chat.error = Some(format!("{title}：{error}"));
-                }
-                this.reload_chat(cx);
-                if let Some(selected) = this.chat.selected().cloned().filter(|c| c.app_id == id) {
-                    this.reload_chat_thread(cx);
-                    // Readback is safe; replies are never automatically retried.
-                    if after_send || remote.as_deref() != Some(selected.remote_id.as_str()) {
-                        this.dispatch_chat(id.clone(), ChatAction::Thread(selected.remote_id), cx);
-                    }
-                }
-                cx.notify();
-            });
-        })
-        .detach();
     }
     fn send_chat(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.chat.notifications_open {
+            return;
+        }
         let Some(c) = self.chat.selected().cloned() else {
             return;
         };
@@ -360,39 +319,42 @@ impl AddressBookApp {
             || c.allow_reply != Some(true)
             || !capability.text
             || text.trim().is_empty()
-            || self.chat.busy.contains(&c.app_id)
-            || self.home.jobs.contains(&c.app_id)
-            || self
+            || !self
                 .chat
-                .thread
-                .pending
+                .accounts
                 .iter()
-                .any(|m| ["sending", "unknown", "submitted"].contains(&m.status.as_str()))
+                .any(|a| a.id == c.app_id && a.can_send)
         {
             return;
         }
-        self.dispatch_chat(
-            c.app_id,
-            ChatAction::Send {
-                conversation: c.remote_id,
-                text,
-            },
-            cx,
-        );
+        match queue_message(self.book.paths(), &c.app_id, &c.id, &text) {
+            Ok(_) => {
+                self.chat.clear_composer = Some((c.id.clone(), text));
+                self.reload_chat_thread(cx);
+                self.run_chat_sync(c.app_id.clone(),ChatSync::SendPending(c.id),false,cx);
+            }
+            Err(error) => self.chat_error(error, cx),
+        }
+        cx.notify();
     }
     pub(super) fn apply_chat_input_result(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some((id, text)) = self.chat.clear_composer.take() {
             if self.chat.selected.as_ref() == Some(&id)
                 && self.chat.composer.read(cx).value().as_ref() == text
             {
-                self.chat.scroll.scroll_to_bottom();
+                self.chat.scroll.scroll_to_end();
                 self.chat
                     .composer
                     .update(cx, |state, cx| state.set_value("", window, cx));
             }
         }
     }
-    fn filter_chat_account(&mut self, id: Option<AppId>, cx: &mut Context<Self>) {
+    fn filter_chat_account(
+        &mut self,
+        id: Option<AppId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.chat.account = id;
         if self
             .chat
@@ -402,6 +364,16 @@ impl AddressBookApp {
             self.chat.selected = None;
             self.chat.thread = Thread::default();
             self.chat.thread_sequence += 1;
+        }
+        if let Some(id) = self
+            .chat
+            .account
+            .as_ref()
+            .and_then(|id| self.chat.remembered.get(id))
+            .cloned()
+            .filter(|_| !self.chat.notifications_open)
+        {
+            self.select_chat(id, window, cx);
         }
         cx.notify();
     }

@@ -23,15 +23,35 @@ fn export_function_previews() {
     let output = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs");
     for (name, id, width, height) in [
         ("apple-ui-menu.png", "", 1100., 760.),
-        ("apple-ui-menu-signed-out.png", "menu-signed-out", 640., 620.),
-        ("apple-ui-menu-store-only.png", "menu-store-only", 640., 620.),
+        (
+            "apple-ui-menu-signed-out.png",
+            "menu-signed-out",
+            640.,
+            620.,
+        ),
+        (
+            "apple-ui-menu-store-only.png",
+            "menu-store-only",
+            640.,
+            620.,
+        ),
         ("apple-ui-icloud.png", "cloud-login", 640., 400.),
-        ("apple-ui-authorizations.png", "authorization-result", 1100., 760.),
+        (
+            "apple-ui-authorizations.png",
+            "authorization-result",
+            1100.,
+            760.,
+        ),
         ("apple-ui-devices.png", "devices-result", 640., 400.),
         ("apple-ui-code.png", "login-challenge", 640., 400.),
         ("apple-ui-unknown.png", "unknown-operation", 640., 400.),
         ("apple-ui-email-unknown.png", "email-unknown", 640., 400.),
-        ("apple-ui-confirmation.png", "authorization-confirmation", 640., 400.),
+        (
+            "apple-ui-confirmation.png",
+            "authorization-confirmation",
+            640.,
+            400.,
+        ),
         ("apple-ui-name.png", "name", 1100., 760.),
         ("zxtouch-email-processing.png", "email-loading", 640., 400.),
         (
@@ -234,17 +254,23 @@ fn export_function_previews() {
         }
         if id == "authorization-confirmation" {
             cx.update_window(handle.into(), |_, window, cx| {
-                preview_view.as_ref().unwrap().update(cx, |view, cx| view.preview_function_confirmation(window, cx));
+                preview_view.as_ref().unwrap().update(cx, |view, cx| {
+                    view.preview_function_confirmation(window, cx)
+                });
                 window.draw(cx).clear(cx);
-            }).unwrap();
+            })
+            .unwrap();
             cx.run_until_parked();
-            cx.update_window(handle.into(), |_, window, cx| window.draw(cx).clear(cx)).unwrap();
+            cx.update_window(handle.into(), |_, window, cx| window.draw(cx).clear(cx))
+                .unwrap();
         }
         let destination = if name.starts_with("apple-ui-") {
             let directory = output.parent().unwrap().join("tempdir/apple-ui");
             std::fs::create_dir_all(&directory).unwrap();
             directory.join(name)
-        } else { output.join(name) };
+        } else {
+            output.join(name)
+        };
         cx.capture_screenshot(handle.into())
             .unwrap()
             .save(destination)

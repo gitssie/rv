@@ -14,6 +14,19 @@ fn id(v: &Value) -> Result<String, String> {
         .filter(|s| s.len() <= 128 && !s.chars().any(char::is_control))
         .ok_or("消息或会话 ID 无效".into())
 }
+// The gateway regenerates wrapper UUIDs for bridged replies on each read.
+// The reply entity ID is stable and is also returned by the send endpoint.
+fn message_id(v: &Value) -> Result<String, String> {
+    let stable = match v["message_type"].as_str() {
+        Some("legacy_reply") => v["data"]["entity"].get("id"),
+        Some("reply_plain") => v["data"].get("id"),
+        _ => None,
+    };
+    if let Some(stable) = stable {
+        return id(stable).map(|id| format!("reply:{id}"));
+    }
+    id(&v["id"])
+}
 fn time(v: &Value) -> i64 {
     v.as_i64()
         .or_else(|| {
@@ -32,10 +45,10 @@ fn text(v: &Value) -> String {
         return "消息已隐藏".into();
     }
     match v["message_type"].as_str().unwrap_or("") {
-        "text" | "text_message" | "message" => {
+        "text" | "text_message" | "message" | "reply_plain" => {
             v["data"]["content"].as_str().unwrap_or("").to_owned()
         }
-        "legacy_portal_message" => {
+        "legacy_portal_message" | "legacy_reply" => {
             super::notice::plain_text(v["data"]["entity"]["body"].as_str().unwrap_or(""))
         }
         "legacy_action" => v["data"]["content"]
@@ -50,29 +63,40 @@ fn text(v: &Value) -> String {
     }
 }
 fn image(v: &Value) -> Option<ChatImage> {
-    ChatImage::from_url(
+    ChatImage::from_url(v["url"].as_str().or_else(|| {
         v["thumbnails"]
             .as_array()
             .and_then(|ts| ts.iter().find_map(|t| t["url"].as_str()))
-            .or_else(|| v["url"].as_str()),
-    )
+    }))
 }
 fn participants(v: &Value) -> Vec<Participant> {
     v["opposite_users"]
         .as_array()
         .into_iter()
         .flatten()
-        .filter(|u| u["type"].as_str() == Some("user"))
+        .filter(|u| matches!(u["type"].as_str(), Some("user" | "member")))
         .filter_map(|u| {
             let data = &u["data"];
             let remote_id = string(&data["id"])?;
-            let name = data["login"]
+            let name = data["login_name"]
                 .as_str()
+                .or_else(|| data["login"].as_str())
                 .or_else(|| data["name"].as_str())
                 .unwrap_or("联系人")
                 .to_owned();
             Some(Participant {
                 remote_id,
+                username: string(&data["login_name"]).or_else(|| string(&data["login"])),
+                avatar: image(&data["photo"]),
+                country_code: string(&data["country_code"])
+                    .or_else(|| string(&data["country"]["iso_code"]))
+                    .or_else(|| string(&data["country"]["code"]))
+                    .map(|s| s.to_uppercase())
+                    .filter(|s| s.len() == 2 && s.bytes().all(|b| b.is_ascii_uppercase())),
+                language: string(&data["language_code"]).or_else(|| {
+                    string(&data["locale"])
+                        .map(|s| s.split(['-', '_']).next().unwrap_or("").to_string())
+                }),
                 name,
                 payload: crate::vinted::redact(u, 0),
             })
@@ -93,13 +117,14 @@ fn conversation(app: &AppInstance, v: &Value) -> Result<Conversation, String> {
                 .map(str::to_owned)
         })
         .unwrap_or("会话".into());
-    let items = v["data"]["inventory_items"]
+    let items = v["data"]["items"]
         .as_array()
+        .or_else(|| v["data"]["inventory_items"].as_array())
         .into_iter()
         .flatten()
         .map(|i| {
             Ok(ContextItem {
-                remote_id: id(&i["id"])?,
+                remote_id: id(i.get("inventory_item_id").unwrap_or(&i["id"]))?,
                 title: i["title"].as_str().unwrap_or("商品").into(),
                 price: i["price"]["amount"].as_str().map(|amount| {
                     format!(
@@ -120,7 +145,7 @@ fn conversation(app: &AppInstance, v: &Value) -> Result<Conversation, String> {
         .as_array()
         .into_iter()
         .flatten()
-        .filter(|u| u["type"].as_str() == Some("user"))
+        .filter(|u| matches!(u["type"].as_str(), Some("user" | "member")))
         .find_map(|u| image(&u["data"]["photo"]));
     let last = &v["last_message"];
     let latest = v["messages"]
@@ -129,6 +154,13 @@ fn conversation(app: &AppInstance, v: &Value) -> Result<Conversation, String> {
         .flatten()
         .max_by_key(|m| time(&m["created_at"]))
         .unwrap_or(last);
+    let preview = text(latest);
+    let has_images = [
+        &latest["data"]["photos"],
+        &latest["data"]["entity"]["photos"],
+    ]
+    .iter()
+    .any(|photos| photos.as_array().is_some_and(|photos| !photos.is_empty()));
     Ok(Conversation {
         id: String::new(),
         app_id: app.id.clone(),
@@ -137,7 +169,11 @@ fn conversation(app: &AppInstance, v: &Value) -> Result<Conversation, String> {
         account: app.title.clone(),
         bundle: app.bundle_id.clone(),
         avatar,
-        preview: text(latest),
+        preview: if preview.is_empty() && has_images {
+            "[图片]".into()
+        } else {
+            preview
+        },
         updated_at: time(&latest["created_at"]).max(time(&v["created_at"])),
         unread: v["is_unread_by_current_user"].as_bool() == Some(true),
         allow_reply: match v["allow_reply"].as_bool() {
@@ -191,11 +227,14 @@ fn request(
     })
 }
 impl ChatStrategy for VintedChat {
+    fn requires_proxy(&self) -> bool {
+        true
+    }
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             text: true,
             mark_read: true,
-            upload: false,
+            upload: true,
         }
     }
     fn inbox(&self, cursor: Option<&str>) -> Result<ChatRequest, String> {
@@ -239,7 +278,7 @@ impl ChatStrategy for VintedChat {
             if m["conversation_id"].as_str() != Some(remote) {
                 return Err("消息会话归属不一致".into());
             }
-            let remote_id = id(&m["id"])?;
+            let remote_id = message_id(m)?;
             let sender = string(&m["sender_id"]).unwrap_or_default();
             let mut images = Vec::new();
             if m["data"]["is_message_content_hidden"].as_bool() != Some(true)
@@ -250,6 +289,7 @@ impl ChatStrategy for VintedChat {
                 }
             }
             messages.push(Message {
+                translation: None,
                 id: String::new(),
                 remote_id: Some(remote_id),
                 outgoing: own.as_deref() == Some(sender.as_str()),
@@ -282,14 +322,43 @@ impl ChatStrategy for VintedChat {
         )
     }
     fn sent_message_id(&self, conversation: &str, reply: &Value) -> Option<String> {
-        let message = &reply["message"];
+        let message = reply.get("message").unwrap_or(reply);
         if message["conversation_id"]
             .as_str()
             .is_some_and(|id| id != conversation)
         {
             return None;
         }
-        id(&message["id"]).ok()
+        message_id(message).ok()
+    }
+    fn image_upload(&self) -> Result<ImageUpload, String> {
+        Ok(ImageUpload {
+            url: "https://www.vinted.com/api/v2/photos".into(),
+            fields: vec![("photo[type]".into(), "user_msg".into())],
+            file_field: "photo[file]".into(),
+        })
+    }
+    fn image_reference(&self, reply: &Value) -> Result<String, String> {
+        if reply.get("code").is_some_and(|code| code != 0) {
+            return Err("图片上传未成功".into());
+        }
+        reply["temp_uuid"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| "图片上传回执缺少引用，结果待确认".into())
+    }
+    fn reply_image(&self, id: &str, reference: &str) -> Result<ChatRequest, String> {
+        uuid::Uuid::parse_str(id).map_err(|_| "会话 ID 无效")?;
+        uuid::Uuid::parse_str(reference).map_err(|_| "图片引用无效")?;
+        request(
+            &format!("conversations/{id}/replies"),
+            None,
+            reqwest::Method::POST,
+            Some(
+                json!({"content":"","photo_temp_uuids":[reference],"is_personal_data_sharing_check_skipped":false}),
+            ),
+        )
     }
     fn mark_read(&self, id: &str) -> Result<ChatRequest, String> {
         uuid::Uuid::parse_str(id).map_err(|_| "会话 ID 无效")?;

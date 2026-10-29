@@ -14,10 +14,6 @@ CREATE TABLE IF NOT EXISTS vinted_orders (
 );
 CREATE INDEX IF NOT EXISTS vinted_products_updated ON vinted_products(app_id,fetched_at DESC);
 CREATE INDEX IF NOT EXISTS vinted_orders_updated ON vinted_orders(app_id,direction,fetched_at DESC);
-CREATE TABLE IF NOT EXISTS vinted_sync_state (
- app_id TEXT NOT NULL REFERENCES app_instances(id) ON DELETE CASCADE,
- dataset TEXT NOT NULL,last_sync INTEGER NOT NULL,PRIMARY KEY(app_id,dataset)
-);
 CREATE VIRTUAL TABLE IF NOT EXISTS vinted_product_search USING fts5(app_id UNINDEXED,product_id UNINDEXED,title,brand,payload,tokenize='trigram');
 CREATE TRIGGER IF NOT EXISTS vinted_product_insert AFTER INSERT ON vinted_products BEGIN
  INSERT INTO vinted_product_search(rowid,app_id,product_id,title,brand,payload) VALUES(new.rowid,new.app_id,new.product_id,json_extract(new.payload,'$.title'),json_extract(new.payload,'$.brand'),new.payload);

@@ -490,3 +490,51 @@ fn selector_region_disambiguates_and_matching_modes_are_explicit() {
     selected.case_sensitive = false;
     assert!(selected.matches(&observed.elements[0], frame()));
 }
+
+#[tokio::test(start_paused = true)]
+async fn runtime_value_postcondition_rejects_wrong_keyboard_layout_then_observes_exact_text() {
+    let device = FakeDevice::new(vec![
+        observation(&["wrong-layout"]),
+        observation(&["test@example.invalid"]),
+    ]);
+    let calls = device.calls.clone();
+    let flow = workflow(vec![Action::WaitForInput {
+        input: "email".into(),
+        case_sensitive: true,
+        region: None,
+    }]);
+    let encoded = serde_json::to_string(&flow).unwrap();
+    assert!(!encoded.contains("test@example.invalid"));
+    let result = Runner::new(device)
+        .run(&flow, &values(), &RunControl::default())
+        .await;
+    assert_eq!(result.state, RunState::Succeeded);
+    assert_eq!(*calls.lock().unwrap(), vec![Call::Observe, Call::Observe]);
+}
+
+#[tokio::test]
+async fn frame_bound_target_rejects_changed_orientation_before_dispatch() {
+    let device = FakeDevice::new(vec![Observation {
+        frame: Frame {
+            width: 2000,
+            height: 1000,
+            orientation: 1,
+        },
+        ..observation(&[])
+    }]);
+    let calls = device.calls.clone();
+    let result = Runner::new(device)
+        .run(
+            &workflow(vec![Action::Tap {
+                target: Target::FramePoint {
+                    frame: frame(),
+                    point: Point { x: 200., y: 300. },
+                },
+            }]),
+            &values(),
+            &RunControl::default(),
+        )
+        .await;
+    assert_eq!(result.state, RunState::Failed);
+    assert_eq!(*calls.lock().unwrap(), vec![Call::Observe]);
+}

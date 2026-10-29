@@ -12,53 +12,71 @@ use gpui_component::{
     h_flex, v_flex,
 };
 impl AddressBookApp {
-    fn render_shop_dialog(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_shop_dialog(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let Some(app) = &self.home.editing else {
             return div().into_any_element();
         };
-        let (name, _symbol, _accent, _) =
-            self.home.plugins.for_bundle(&app.bundle_id).identity(app);
+        let renderer = self.home.plugins.for_bundle(&app.bundle_id);
         v_flex()
             .id("shop-panel")
+            .h(px(
+                (f32::from(window.viewport_size().height) - 120.).clamp(160., 320.)
+            ))
+            .min_h_0()
             .text_sm()
             .child(
                 h_flex()
-                    .gap_2()
+                    .gap_3()
                     .items_center()
-                    .child(self.app_avatar(&app.bundle_id))
+                    .flex_shrink_0()
+                    .child(self.virtual_app_avatar(app))
                     .child(
                         v_flex()
                             .flex_1()
                             .min_w_0()
                             .gap_0p5()
                             .child(
-                                div()
-                                    .font_semibold()
-                                    .text_ellipsis()
-                                    .child(app.title.clone()),
+                                h_flex()
+                                    .gap_1()
+                                    .items_center()
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .font_semibold()
+                                            .text_ellipsis()
+                                            .child(renderer.display_title(app)),
+                                    )
+                                    .child(self.render_shop_operations(cx))
+                                    .child(
+                                        Button::new("shop-close")
+                                            .debug_selector(|| "shop-close".into())
+                                            .ghost()
+                                            .icon(gpui_component::IconName::Close)
+                                            .tooltip("关闭店铺详情")
+                                            .accessibility_label("关闭店铺详情")
+                                            .on_click(
+                                                cx.listener(|this, _, _, cx| this.close_modal(cx)),
+                                            ),
+                                    ),
                             )
-                            .child(div().text_xs().text_color(theme::muted(cx)).child(name)),
-                    )
-                    .child(
-                        self.home
-                            .plugins
-                            .for_bundle(&app.bundle_id)
-                            .header_info(app, cx),
-                    )
-                    .child(self.render_shop_operations(cx))
-                    .child(
-                        Button::new("shop-close")
-                            .ghost()
-                            .icon(gpui_component::IconName::Close)
-                            .accessibility_label("关闭店铺详情")
-                            .on_click(cx.listener(|this, _, _, cx| this.close_modal(cx))),
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .items_center()
+                                    .min_w_0()
+                                    .child(self.render_execution_indicator(&app.id, cx))
+                                    .child(renderer.profile_details(app, self.book.paths(), cx))
+                                    .child(div().flex_1())
+                                    .child(self.render_shop_token_expirations(cx)),
+                            ),
                     ),
             )
             .child(
                 div()
                     .id("shop-scroll")
+                    .flex_1()
                     .min_h_0()
-                    .overflow_y_scroll()
                     .child(self.render_business_data(cx)),
             )
             .into_any_element()
@@ -86,9 +104,6 @@ impl AddressBookApp {
                 )
                 .into_any_element();
         }
-        if matches!(self.modal, Modal::Chat) {
-            return div().into_any_element();
-        }
         if matches!(self.modal, Modal::Shop) {
             return div().into_any_element();
         }
@@ -103,25 +118,10 @@ impl AddressBookApp {
         let owner = cx.entity();
         if matches!(self.modal, Modal::Shop) {
             return dialog
-                .width(px(450.))
+                .width(px((f32::from(window.viewport_size().width) - 32.).min(640.)))
                 .max_h(relative(0.9))
                 .close_button(false)
-                .child(self.render_shop_dialog(cx))
-                .on_close(move |_, _, cx| owner.update(cx, |this, cx| this.close_modal(cx)));
-        }
-        if matches!(self.modal, Modal::Chat) {
-            return dialog
-                .width(px((f32::from(window.viewport_size().width) - 32.).min(980.)))
-                .max_h(relative(0.9))
-                .title("聊天")
-                .child(
-                    self.render_chat(
-                        (f32::from(window.viewport_size().height) - 140.)
-                            .min(520.)
-                            .max(100.),
-                        cx,
-                    ),
-                )
+                .child(self.render_shop_dialog(window, cx))
                 .on_close(move |_, _, cx| owner.update(cx, |this, cx| this.close_modal(cx)));
         }
         let (title, subtitle): (&str, Option<String>) = match &self.modal {
@@ -136,7 +136,7 @@ impl AddressBookApp {
                 ("删除连接", Some(format!("确定删除“{name}”吗？")))
             }
             Modal::AppDelete => ("删除卡片", None),
-            Modal::App | Modal::Shop | Modal::Chat => (self.app_editor_title(), None),
+            Modal::App | Modal::Shop => (self.app_editor_title(), None),
             Modal::None | Modal::PhoneControl(_) => return dialog,
         };
 
@@ -179,7 +179,7 @@ impl AddressBookApp {
                     )
                     .into_any_element()
             }
-            Modal::App | Modal::Shop | Modal::Chat => self.render_app_editor(cx),
+            Modal::App | Modal::Shop => self.render_app_editor(cx),
             Modal::None | Modal::PhoneControl(_) => div().into_any_element(),
         };
 
@@ -232,14 +232,15 @@ impl AddressBookApp {
             Modal::App => Some(4),
             Modal::AppDelete => Some(5),
             Modal::Shop => Some(6),
-            Modal::Chat => Some(7),
             _ => None,
         };
         if self.home.component_dialog == kind {
             return;
         }
         if self.home.component_dialog.take().is_some() && window.has_active_dialog(cx) {
-            window.close_dialog(cx);
+            // Nested confirmations/details belong to the current modal owner.
+            // Popping only the top leaves the old owner rendering an empty Dialog.
+            window.close_all_dialogs(cx);
             self.focus.focus(window, cx);
         }
         self.home.component_dialog = kind;

@@ -26,7 +26,7 @@ pub(super) fn setup(
     let (_, cx) = cx.add_window_view(|window, cx| {
         let app = cx.new(|cx| AddressBookApp::with_book(book, false, "Ready".into(), window, cx));
         entity = Some(app.clone());
-        let shell = cx.new(|_| WindowRoot::new(app));
+        let shell = cx.new(|cx| WindowRoot::new(app, cx));
         Root::new(shell, window, cx)
     });
     cx.update(|window, cx| window.draw(cx).clear(cx));
@@ -69,8 +69,12 @@ fn home_actions_share_window_titlebar_without_a_second_toolbar(cx: &mut TestAppC
         }
     }
     click(cx, "chat-open");
-    app.read_with(cx, |app, _| assert!(matches!(app.modal, Modal::Chat)));
-    app.update(cx, |app, cx| app.close_modal(cx));
+    cx.run_until_parked();
+    let chat=app.read_with(cx,|app,_|app.chat.window.expect("chat window"));
+    let main=cx.update(|window,_|window.window_handle().window_id());
+    assert_ne!(chat.window_id(),main);
+    chat.update(cx,|_,window,_|window.remove_window()).unwrap();
+    cx.run_until_parked();
     click(cx, "sidebar-toggle");
     app.read_with(cx, |app, _| assert!(app.collapsed));
     cx.update(|window, cx| window.draw(cx).clear(cx));
@@ -780,7 +784,7 @@ fn saved_password_editor_shows_mask_without_submitting_mask_as_password(cx: &mut
 }
 
 #[gpui::test]
-fn card_delete_defaults_to_phone_and_local_only_keeps_other_idfv(cx: &mut TestAppContext) {
+fn card_delete_is_local_only_and_keeps_other_idfv(cx: &mut TestAppContext) {
     use rv_core::workspace::{AppId, WorkspaceStore};
     let device = Connection::new("phone", "example.test", 5901);
     let (app, cx, _dir) = setup(cx, vec![device.clone()]);
@@ -797,33 +801,11 @@ fn card_delete_defaults_to_phone_and_local_only_keeps_other_idfv(cx: &mut TestAp
                 .sync_backups(device.id, "lt.manodrabuziai.fr", &response)
                 .unwrap();
             app.open_app_delete(id.clone(), cx);
-            assert!(app.home.deletion.as_ref().unwrap().phone);
+            assert!(!app.home.deletion.as_ref().unwrap().phone);
         })
     });
-    click(cx, "confirm-app-delete");
-    app.read_with(cx, |app, _| {
-        let state = app.home.deletion.as_ref().unwrap();
-        assert!(!state.busy && state.error.is_some());
-        assert!(
-            WorkspaceStore::open(app.book.paths())
-                .unwrap()
-                .load(&id)
-                .is_ok()
-        );
-    });
-    // Enter and the footer share this guard after a failed phone deletion.
-    app.update(cx, |app, cx| app.confirm_app_delete(cx));
-    app.read_with(cx, |app, _| {
-        let state = app.home.deletion.as_ref().unwrap();
-        assert!(!state.busy && state.error.is_some());
-        assert!(
-            WorkspaceStore::open(app.book.paths())
-                .unwrap()
-                .load(&id)
-                .is_ok()
-        );
-    });
-    click(cx, "delete-phone-backup");
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("delete-phone-backup").is_none());
     click(cx, "confirm-app-delete");
     app.read_with(cx, |app, _| {
         assert!(matches!(app.modal, Modal::None));
@@ -840,15 +822,15 @@ fn card_delete_defaults_to_phone_and_local_only_keeps_other_idfv(cx: &mut TestAp
 }
 
 #[gpui::test]
-fn shop_skeleton_tags_and_phone_delete_failure_preserve_card(cx: &mut TestAppContext) {
+fn shop_tags_edit_and_local_deletion_do_not_call_phone(cx: &mut TestAppContext) {
     use crate::session_window::{SessionOptions, SessionView};
     use rv_core::workspace::{AppId, WorkspaceStore};
-    use rv_session::{FunctionEvent, SessionEvent, SessionHandle};
+    use rv_session::{SessionEvent, SessionHandle};
     let device = Connection::new("phone", "example.test", 5901);
     let (app, cx, _dir) = setup(cx, vec![device.clone()]);
     let id = AppId::from_idfv("C9EB7804-2062-4519-AC8D-6F68972574F3").unwrap();
-    let (handle, peer) = SessionHandle::test_pair();
-    let view = cx.update(|window, cx| {
+    let (handle, mut peer) = SessionHandle::test_pair();
+    let _view = cx.update(|window, cx| {
         let view = cx.new(|cx| SessionView::with_control_test_handle(
             ConnectRequest::from_connection(&device, None),
             SessionOptions { scale: rv_core::ScaleMode::Fit, pin_toolbar: false,
@@ -874,20 +856,17 @@ fn shop_skeleton_tags_and_phone_delete_failure_preserve_card(cx: &mut TestAppCon
     });
     cx.run_until_parked();
     cx.update(|window, cx| window.draw(cx).clear(cx));
-    let skeleton = cx
-        .debug_bounds("shop-product-skeleton")
-        .expect("empty shop preserves product layout");
-    assert!(skeleton.size.height >= px(72.));
-    let tags = cx
-        .debug_bounds(Box::leak(
-            format!("app-card-tags-{}", id.as_str()).into_boxed_str(),
+    assert!(cx.debug_bounds("shop-product-skeleton").is_none());
+    assert!(
+        cx.debug_bounds(Box::leak(
+            format!("app-card-tags-{}", id.as_str()).into_boxed_str()
         ))
-        .unwrap();
-    assert!(tags.bottom() <= skeleton.top());
-    click(cx, &format!("app-avatar-{}", id.as_str()));
+        .is_some()
+    );
+    cx.update(|window, cx| app.update(cx, |app, cx| app.open_app_detail(id.clone(), window, cx)));
     app.read_with(cx, |app, _| assert!(matches!(app.modal, Modal::Shop)));
     cx.update(|window, cx| window.draw(cx).clear(cx));
-    assert!(cx.debug_bounds("shop-detail-skeleton").unwrap().size.height >= px(320.));
+    assert!(cx.debug_bounds("shop-detail-skeleton").is_none());
     app.update(cx, |app, cx| app.close_modal(cx));
     cx.update(|window, cx| app.update(cx, |app, cx| app.open_app_card(id.clone(), window, cx)));
     cx.run_until_parked();
@@ -904,41 +883,17 @@ fn shop_skeleton_tags_and_phone_delete_failure_preserve_card(cx: &mut TestAppCon
         app.confirm_app_delete(cx);
     });
     app.read_with(cx, |app, _| {
-        assert!(app.home.deletion.as_ref().unwrap().busy)
-    });
-    cx.update(|_, cx| {
-        // The control runtime can reject the request without an operation wrapper.
-        peer.events
-            .send(SessionEvent::Functions(FunctionEvent::Error(
-                "ZXTouch 尚未连接".into(),
-            )))
-            .unwrap();
-        view.update(cx, |view, cx| view.pump_control_test(cx));
-    });
-    app.read_with(cx, |app, _| {
-        let state = app.home.deletion.as_ref().unwrap();
-        assert!(!state.busy && state.error.is_some());
+        assert!(app.home.deletion.is_none());
         assert!(
             WorkspaceStore::open(app.book.paths())
                 .unwrap()
                 .load(&id)
-                .is_ok()
+                .is_err()
         );
+        assert!(matches!(app.modal, Modal::None));
     });
-    // Enter and the footer share this guard after a failed phone deletion.
-    app.update(cx, |app, cx| app.confirm_app_delete(cx));
-    app.read_with(cx, |app, _| {
-        let state = app.home.deletion.as_ref().unwrap();
-        assert!(!state.busy && state.error.is_some());
-        assert!(
-            WorkspaceStore::open(app.book.paths())
-                .unwrap()
-                .load(&id)
-                .is_ok()
-        );
-    });
-    app.update(cx, |app, cx| app.close_modal(cx));
-    app.read_with(cx, |app, _| assert!(matches!(app.modal, Modal::None)));
+    assert!(std::iter::from_fn(|| peer.commands.try_recv().ok()).all(|command| !matches!(command,
+        rv_session::SessionCommand::Function(rv_session::FunctionCommand::Invoke {id,..}) if id=="app-delete")));
 }
 
 #[gpui::test]
@@ -950,6 +905,8 @@ fn proxy_manager_edits_credentials_and_card_editor_keeps_fixed_binding(cx: &mut 
     let paths = rv_core::StorePaths::in_dir(dir.path().into());
     let id = AppId::from_idfv("C9EB7804-2062-4519-AC8D-6F68972574F3").unwrap();
     let proxy = SocksProxy {
+        protocol: Default::default(),
+        front_proxy_id: None,
         id: uuid::Uuid::new_v4().to_string(),
         name: "Shop exit".into(),
         host: "127.0.0.1".into(),
@@ -957,6 +914,7 @@ fn proxy_manager_edits_credentials_and_card_editor_keeps_fixed_binding(cx: &mut 
         username: "user".into(),
         password: "actual-secret".into(),
         mode: ProxyMode::Exclusive,
+        ip: Default::default(),
     };
     let mut store = WorkspaceStore::open(&paths).unwrap();
     store.sync_backups(device_id,"lt.manodrabuziai.fr",&serde_json::json!({"bundle_id":"lt.manodrabuziai.fr","backups":[{"kind":"snapshot","backup_id":"snapshot:1","idfv":id.as_str(),"display_name":"shop"}]})).unwrap();
@@ -1019,7 +977,11 @@ fn full_window_settings_keeps_home_state_and_cross_page_focus(cx: &mut TestAppCo
             app.settings.theme.focus_handle(cx).focus(window, cx);
             app.select_settings_page(SettingsPage::Proxies, window, cx);
             assert!(app.focus.is_focused(window));
-            app.home.proxies.select.focus_handle(cx).focus(window, cx);
+            app.home
+                .proxies
+                .front_select
+                .focus_handle(cx)
+                .focus(window, cx);
             app.select_settings_page(SettingsPage::General, window, cx);
             assert!(app.focus.is_focused(window));
             app.on_focus_search(&FocusSearch, window, cx);
@@ -1072,4 +1034,185 @@ fn settings_component_switches_pages_without_search(cx: &mut TestAppContext) {
     });
     cx.update(|window, cx| app.update(cx, |app, cx| app.on_close_modal(&CloseModal, window, cx)));
     app.read_with(cx, |app, _| assert!(app.settings.page.is_none()));
+}
+
+#[gpui::test]
+fn closing_shop_removes_the_component_dialog_without_an_empty_window(cx: &mut TestAppContext) {
+    use gpui_component::WindowExt;
+    use rv_core::workspace::{AppId, WorkspaceStore};
+    let device = Connection::new("fixture", "127.0.0.1", 9);
+    let (app, cx, _dir) = setup(cx, vec![device.clone()]);
+    let id = AppId::from_idfv("C9EB7804-2062-4519-AC8D-6F68972574F3").unwrap();
+    app.update(cx, |app, cx| {
+        WorkspaceStore::open(app.book.paths())
+            .unwrap()
+            .sync_backups(
+                device.id,
+                "lt.manodrabuziai.fr",
+                &serde_json::json!({"bundle_id":"lt.manodrabuziai.fr", "backups":[{
+                    "backup_id":format!("snapshot:{}", id.as_str()), "kind":"snapshot",
+                    "display_name":"backup title", "idfv":id.as_str()
+                }]}),
+            )
+            .unwrap();
+        app.reload_home(cx);
+    });
+    cx.run_until_parked();
+    for _ in 0..3 {
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_app_detail(id.clone(), window, cx))
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        app.read_with(cx, |app, _| assert!(matches!(app.modal, Modal::Shop)));
+        click(cx, "shop-close");
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+            assert!(
+                !window.has_active_dialog(cx),
+                "closing the shop must leave no empty dialog layer"
+            );
+        });
+        app.read_with(cx, |app, _| assert!(matches!(app.modal, Modal::None)));
+        assert!(
+            cx.debug_bounds("management-dialog-layer").is_none(),
+            "closed dialog must not leave a cached rendered layer"
+        );
+    }
+    // A child dialog shares the shop's stack. Closing the owner must remove both,
+    // rather than leaving the owner's builder to render an empty default Dialog.
+    cx.update(|window, cx| app.update(cx, |app, cx| app.open_app_detail(id.clone(), window, cx)));
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        window.draw(cx).clear(cx);
+        window.open_dialog(cx, |dialog, _, _| dialog.title("child"));
+    });
+    app.update(cx, |app, cx| app.close_modal(cx));
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        window.draw(cx).clear(cx);
+        assert!(
+            !window.has_active_dialog(cx),
+            "closing the shop must also remove its child layers"
+        );
+    });
+    // Match native rendering order: the shell paints overlays before its child
+    // AddressBookApp is rendered. A forced second draw used to hide this bug.
+    cx.update(|window, cx| app.update(cx, |app, cx| app.open_app_detail(id.clone(), window, cx)));
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| app.close_modal(cx));
+        let shell = Root::read(window, cx)
+            .view()
+            .clone()
+            .downcast::<WindowRoot>()
+            .unwrap();
+        shell.update(cx, |_, cx| cx.notify());
+        window.draw(cx).clear(cx);
+    });
+    assert!(
+        cx.debug_bounds("management-dialog-layer").is_none(),
+        "the first closing frame must not paint a default empty Dialog"
+    );
+}
+
+#[gpui::test]
+fn phone_handoff_cancel_keeps_rv_owner_and_shop_open(cx: &mut TestAppContext) {
+    use crate::session_window::{SessionOptions, SessionView};
+    use rv_core::workspace::{AppId, ExecutionMode, WorkspaceStore};
+    use rv_session::{SessionEvent, SessionHandle};
+    let device = Connection::new("fixture", "127.0.0.1", 9);
+    let (app, cx, _dir) = setup(cx, vec![device.clone()]);
+    let id = AppId::from_idfv("C9EB7804-2062-4519-AC8D-6F68972574F3").unwrap();
+    let (handle, peer) = SessionHandle::test_pair();
+    let _view = cx.update(|window,cx| {
+        let view=cx.new(|cx| SessionView::with_control_test_handle(
+            ConnectRequest::from_connection(&device,None),
+            SessionOptions { scale:rv_core::ScaleMode::Fit,pin_toolbar:false,menu_key:"F8".into(),hide_shots:true,thumb_path:None,app_icon_cache:None,address_book:Some(app.downgrade()),transfer_folders:Default::default(),app_shortcuts:vec![],remember_password:false },handle,window,cx));
+        app.update(cx,|app,cx| {
+            app.home.control_loading.remove(&device.id);
+            app.home.controls.insert(device.id,super::home::control::PhoneControl::new(view.clone(),&device));
+            WorkspaceStore::open(app.book.paths()).unwrap().sync_backups(device.id,"lt.manodrabuziai.fr",&serde_json::json!({"bundle_id":"lt.manodrabuziai.fr","backups":[{"backup_id":format!("snapshot:{}",id.as_str()),"kind":"snapshot","display_name":"fixture backup","idfv":id.as_str()}]})).unwrap();
+            app.reload_home(cx);
+        });
+        peer.events.send(SessionEvent::ControlState(true)).unwrap();
+        view.update(cx,|view,cx|view.pump_control_test(cx));
+        view
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| app.update(cx, |app, cx| app.open_app_detail(id.clone(), window, cx)));
+    click(cx, "shop-handoff-phone");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    app.read_with(cx, |app, _| {
+        assert!(
+            matches!(app.modal, Modal::Shop),
+            "cancelling handoff must retain the shop"
+        );
+        let store = WorkspaceStore::open(app.book.paths()).unwrap();
+        assert_eq!(store.execution(&id).unwrap().mode, ExecutionMode::Rv);
+        assert!(app.home.handoff_running.is_empty());
+    });
+}
+
+#[gpui::test]
+fn rv_takeover_confirmation_requires_acknowledgement_and_cancel_has_no_effect(
+    cx: &mut TestAppContext,
+) {
+    use gpui_component::{WindowExt, dialog::Confirm};
+    use std::{cell::Cell, rc::Rc};
+    let (_app, cx, _dir) = setup(cx, vec![]);
+    let confirmations = Rc::new(Cell::new(0));
+    let receiver = confirmations.clone();
+    cx.update(|window, cx| {
+        crate::ui::confirm_execution_handoff(
+            crate::ui::ExecutionHandoffPrompt {
+                title: "交给 RV",
+                icon: crate::assets::FunctionIcon::Monitor,
+                device: "iPhone7Plus".into(),
+                backup: "fixture backup".into(),
+                acknowledgement: Some("已保存最新备份并停止手机 App"),
+            },
+            window,
+            cx,
+            move |_, _| receiver.set(receiver.get() + 1),
+        )
+    });
+    click(cx, "handoff-confirm");
+    assert_eq!(
+        confirmations.get(),
+        0,
+        "unchecked confirmation button must be disabled"
+    );
+    cx.dispatch_action(Confirm { secondary: false });
+    assert_eq!(
+        confirmations.get(),
+        0,
+        "Enter must not bypass acknowledgement"
+    );
+    click(cx, "handoff-acknowledgement");
+    click(cx, "handoff-confirm");
+    assert_eq!(confirmations.get(), 1);
+    cx.update(|window, cx| assert!(!window.has_active_dialog(cx)));
+    let receiver = confirmations.clone();
+    cx.update(|window, cx| {
+        crate::ui::confirm_execution_handoff(
+            crate::ui::ExecutionHandoffPrompt {
+                title: "交给 RV",
+                icon: crate::assets::FunctionIcon::Monitor,
+                device: "iPhone7Plus".into(),
+                backup: "fixture backup".into(),
+                acknowledgement: Some("已保存最新备份并停止手机 App"),
+            },
+            window,
+            cx,
+            move |_, _| receiver.set(receiver.get() + 1),
+        )
+    });
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_eq!(confirmations.get(), 1, "cancel cannot dispatch takeover");
+    cx.update(|window, cx| assert!(!window.has_active_dialog(cx)));
 }

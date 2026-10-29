@@ -7,12 +7,15 @@ pub struct ChatImage {
     pub url: String,
     #[serde(skip)]
     pub path: Option<PathBuf>,
+    #[serde(skip)]
+    pub bytes: Option<Vec<u8>>,
 }
 impl ChatImage {
     pub fn from_url(url: Option<&str>) -> Option<Self> {
         url.filter(|s| !s.is_empty()).map(|s| Self {
             url: s.into(),
             path: None,
+            bytes: None,
         })
     }
 }
@@ -52,12 +55,18 @@ pub struct Message {
     pub body: String,
     pub status: String,
     pub images: Vec<ChatImage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub translation: Option<super::translation::Translation>,
     pub payload: Value,
 }
 #[derive(Clone, Debug)]
 pub struct Participant {
     pub remote_id: String,
     pub name: String,
+    pub username: Option<String>,
+    pub avatar: Option<ChatImage>,
+    pub country_code: Option<String>,
+    pub language: Option<String>,
     pub payload: Value,
 }
 #[derive(Clone, Debug)]
@@ -66,6 +75,10 @@ pub struct ChatAccount {
     pub title: String,
     pub bundle: String,
     pub has_auth: bool,
+    pub avatar: Option<ChatImage>,
+    pub unread: Option<usize>,
+    pub notification_unread: Option<usize>,
+    pub can_send: bool,
     pub session_status: String,
     pub market: String,
 }
@@ -73,6 +86,7 @@ pub struct ChatAccount {
 pub struct Thread {
     pub messages: Vec<Message>,
     pub pending: Vec<Message>,
+    pub customer: Option<Customer>,
 }
 pub fn local_images(
     paths: &rv_core::StorePaths,
@@ -80,30 +94,10 @@ pub fn local_images(
     thread: &mut Thread,
 ) {
     images(conversations, thread, |image| {
-        image.path = crate::assets::cached(paths, &image.url)
+        if image.bytes.is_none() {
+            image.path = crate::assets::cached(paths, &image.url)
+        }
     });
-}
-pub fn hydrate_images(
-    paths: &rv_core::StorePaths,
-    conversations: &mut [Conversation],
-    thread: &mut Thread,
-    thread_app: Option<&AppId>,
-) {
-    for conversation in conversations {
-        let id = conversation.app_id.clone();
-        images(
-            std::slice::from_mut(conversation),
-            &mut Thread::default(),
-            |image| {
-                image.path = crate::assets::fetch_for_app(paths, &id, &image.url).ok();
-            },
-        );
-    }
-    if let Some(id) = thread_app {
-        images(&mut [], thread, |image| {
-            image.path = crate::assets::fetch_for_app(paths, id, &image.url).ok();
-        });
-    }
 }
 
 fn images(
@@ -126,4 +120,15 @@ fn images(
             f(image);
         }
     }
+}
+
+#[derive(Clone, Debug)]
+pub struct Customer {
+    pub id: String,
+    pub name: String,
+    pub country_code: Option<String>,
+    pub language: Option<String>,
+    pub language_source: Option<String>,
+    pub tags: Vec<String>,
+    pub note: String,
 }

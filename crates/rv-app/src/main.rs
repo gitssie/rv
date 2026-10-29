@@ -54,6 +54,10 @@ fn main() {
         #[cfg(target_os = "macos")]
         macos_dock_icon::set();
 
+        cx.on_app_quit(|_| async {
+            rv_business::proxy::engine::shutdown();
+        })
+        .detach();
         gpui_component::init(cx);
         bind_keys(cx);
 
@@ -77,7 +81,7 @@ fn main() {
                     move |window, cx| {
                         let book = cx.new(|cx| AddressBookApp::new(window, cx));
                         *slot.borrow_mut() = Some(book.clone());
-                        let shell = cx.new(|_| WindowRoot::new(book));
+                        let shell = cx.new(|cx| WindowRoot::new(book, cx));
                         cx.new(|cx| Root::new(shell, window, cx))
                     }
                 })
@@ -121,6 +125,7 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("delete", DeleteSelected, Some("AddressBook")),
         KeyBinding::new("cmd-backspace", DeleteSelected, Some("AddressBook")),
         KeyBinding::new("cmd-q", QuitApp, None),
+        KeyBinding::new("cmd-w", ChatClose, Some("ChatWindow")),
         KeyBinding::new("cmd-shift-f", SessionFullscreen, Some("Session")),
         KeyBinding::new("cmd-shift-f", FileTransferFullscreen, Some("FileTransfer")),
         KeyBinding::new("cmd-a", FileTransferSelectAll, Some("FileTransfer")),

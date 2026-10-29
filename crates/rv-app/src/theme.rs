@@ -34,9 +34,6 @@ pub fn hover(cx: &App) -> Hsla {
 pub fn accent(cx: &App) -> Hsla {
     cx.theme().primary
 }
-pub fn accent_fg(cx: &App) -> Hsla {
-    cx.theme().primary_foreground
-}
 pub fn success(cx: &App) -> Hsla {
     cx.theme().success
 }
@@ -66,11 +63,6 @@ pub fn row_background(selected: bool, index: usize, cx: &App) -> Hsla {
     } else {
         cx.theme().colors.list
     }
-}
-
-// Brand identity is data, distinct from application interaction/status colors.
-pub fn brand_color(value: u32) -> Hsla {
-    rgb(value).into()
 }
 
 // The remote framebuffer alone keeps a neutral dark surround in either theme.

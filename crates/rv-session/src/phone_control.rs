@@ -7,10 +7,19 @@ use std::{
 };
 use tokio::sync::mpsc::UnboundedReceiver;
 
+#[cfg(test)]
 pub(crate) async fn run(
+    request: ConnectRequest,
+    commands: UnboundedReceiver<SessionCommand>,
+    events: mpsc::Sender<SessionEvent>,
+) {
+    run_with_store(request, commands, events, None).await;
+}
+pub(crate) async fn run_with_store(
     request: ConnectRequest,
     mut commands: UnboundedReceiver<SessionCommand>,
     events: mpsc::Sender<SessionEvent>,
+    token_paths: Option<rv_core::StorePaths>,
 ) {
     let send = |event| {
         let _ = events.send(event);
@@ -30,6 +39,7 @@ pub(crate) async fn run(
         !request.view_only,
     );
     functions.enable_apple_account_storage(&request);
+    let mut token_sync: Option<tokio::task::JoinHandle<()>> = None;
     let mut configured = false;
     let mut healthy = false;
     let mut online = false;
@@ -42,12 +52,17 @@ pub(crate) async fn run(
             command = commands.recv() => match command {
                 None | Some(SessionCommand::Close) => break,
                 Some(SessionCommand::App(command)) => {
-                    if online { apps.command(command, &app_send); }
+                    if functions.registration_active() { app_send(crate::AppEvent::Failed { command, message: "注册正在执行，请先停止注册".into() }); }
+                    else if online { apps.command(command, &app_send); }
                     else { app_send(crate::AppEvent::Failed { command, message: "ZXTouch 尚未连接，请稍后重试".into() }); }
                 },
                 Some(SessionCommand::Function(command)) => {
-                    if online { functions.command(command, &function_send); }
-                    else { function_send(crate::FunctionEvent::Error("ZXTouch 尚未连接，请稍后重试".into())); }
+                    if matches!(command, crate::FunctionCommand::Register { .. }) && apps.mutations_pending() {
+                        function_send(crate::FunctionEvent::Registration(crate::functions::registration::Status { running: false, message: "手机操作尚未结束，请稍后执行" }));
+                    } else if online || matches!(command, crate::FunctionCommand::StopRegistration) { functions.command(command, &function_send); }
+                    else if matches!(command, crate::FunctionCommand::Register { .. }) {
+                        function_send(crate::FunctionEvent::Registration(crate::functions::registration::Status { running: false, message: "ZXTouch 尚未连接，请稍后重试" }));
+                    } else { function_send(crate::FunctionEvent::Error("ZXTouch 尚未连接，请稍后重试".into())); }
                 }
                 // Desktop input and file transfers never belong to this controller.
                 _ => {}
@@ -107,6 +122,12 @@ pub(crate) async fn run(
         let ready = healthy && apps.http_ready();
         if ready != online {
             online = ready;
+            if !online {
+                functions.cancel_registration();
+                if let Some(sync) = token_sync.take() { sync.abort(); }
+            } else if let (Some(paths), Some(device)) = (&token_paths, request.connection_id) {
+                token_sync = Some(tokio::spawn(crate::phone_tokens::run(paths.clone(), device, client.clone())));
+            }
             send(SessionEvent::ControlState(online));
             if online {
                 for command in [AppCommand::DeviceInfo, AppCommand::Foreground] {
@@ -115,6 +136,8 @@ pub(crate) async fn run(
             }
         }
     }
+    functions.cancel_registration();
+    if let Some(sync) = token_sync { sync.abort(); }
     if let Some(task) = probe {
         task.abort();
     }

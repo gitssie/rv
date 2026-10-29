@@ -1201,107 +1201,323 @@ async fn cloud_login_resolves_fresh_store_account_before_invoking() {
     actor.abort();
 }
 
-
 #[tokio::test]
-async fn managed_first_login_persists_candidate_before_ios_change_and_reuses_new_password(){
- let dir=tempfile::tempdir().unwrap();let paths=rv_core::StorePaths::in_dir(dir.path().into());
- let ctx=apple_accounts::Context::at(paths.clone(),Some("device-a".into()));
- let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();
- let client=crate::phone_http::PhoneHttpClient::new("127.0.0.1",listener.local_addr().unwrap().port(),"test".into()).unwrap();
- let (commands,rx)=mpsc::channel(8);let (events,mut states)=mpsc::channel(32);
- let actor=tokio::spawn(apple_accounts::run(client,rx,events,ctx));
- assert!(matches!(next(&mut states).await,FunctionEvent::Available(true)));
- commands.send(FunctionCommand::InvokeForAccount{apple_id:"first@test".into(),id:"store-login".into(),text:"First@Test----Original123----https://code.example.test/current".into()}).await.unwrap();
- let (socket,_)=listener.accept().await.unwrap();let mut socket=TestStream::new(socket);
- assert_eq!(packet(&mut socket).await.0,33);reply(&mut socket,json!({"ok":true,"apple_password_change":1})).await;
- let (_,login)=packet(&mut socket).await;assert_eq!(login["method"],"signInAppStore");assert_eq!(login["params"]["password"],"Original123");
- reply(&mut socket,json!({"operation_id":"login-1","method":"signInAppStore","status":"completed","result":{"outcome":"succeeded","authenticated":true}})).await;
- assert_eq!(packet(&mut socket).await.0,33);reply(&mut socket,json!({"ok":true,"apple_password_change":1})).await;
- let (_,change)=packet(&mut socket).await;assert_eq!(change["method"],"changePassword");assert_eq!(change["params"]["password"],"Original123");
- let password=change["params"]["new_password"].as_str().unwrap().to_owned();assert_eq!(password.len(),8);
- // This read is before the simulated iOS mutation responds: durability precedes dispatch.
- let store=rv_core::workspace::WorkspaceStore::open(&paths).unwrap();let pending=store.apple_account("first@test").unwrap().unwrap();
- assert_eq!(pending.pending_password.as_deref(),Some(password.as_str()));assert_eq!(pending.password,"Original123");assert_eq!(pending.original_password,"Original123");
- reply(&mut socket,json!({"operation_id":"password-1","method":"changePassword","status":"completed","result":{"outcome":"succeeded","password_changed":true}})).await;
- assert_eq!(packet(&mut socket).await.0,33);reply(&mut socket,json!({"ok":true,"apple_password_change":1})).await;
- let (_,confirm)=packet(&mut socket).await;assert_eq!(confirm["method"],"signInAppStore");assert_eq!(confirm["params"]["password"],password);
- reply(&mut socket,json!({"operation_id":"login-2","method":"signInAppStore","status":"completed","result":{"outcome":"succeeded","authenticated":true}})).await;
- loop{if let FunctionEvent::State{record,..}=next(&mut states).await {if record["status"]=="completed"{assert_eq!(record["method"],"signInAppStore");assert_eq!(record["result"]["outcome"],"succeeded");break;}}}
- let saved=store.apple_account("first@test").unwrap().unwrap();assert_eq!(saved.password,password);assert_eq!(saved.original_password,"Original123");assert!(saved.pending_password.is_none());assert_eq!(saved.init_status,rv_core::workspace::AppleInitStatus::Ready);
- assert_eq!(saved.device_id.as_deref(),Some("device-a"));assert!(saved.first_login_at.is_some()&&saved.password_changed_at.is_some());
- // Reusing the same pasted original must not overwrite the confirmed password or rotate again.
- commands.send(FunctionCommand::Invoke{id:"store-login".into(),text:"FIRST@test----Original123".into()}).await.unwrap();
- assert_eq!(packet(&mut socket).await.0,33);reply(&mut socket,json!({"ok":true,"apple_password_change":1})).await;
- let (_,again)=packet(&mut socket).await;assert_eq!(again["params"]["password"],password);assert_eq!(again["method"],"signInAppStore");
- reply(&mut socket,json!({"operation_id":"login-3","method":"signInAppStore","status":"completed","result":{"outcome":"succeeded","authenticated":true}})).await;
- loop{if let FunctionEvent::State{record,..}=next(&mut states).await{if record["status"]=="completed"{break;}}}
- assert_eq!(store.apple_account("first@test").unwrap().unwrap().original_password,"Original123");
- drop(commands);actor.await.unwrap();
+async fn managed_first_login_persists_candidate_before_ios_change_and_reuses_new_password() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = rv_core::StorePaths::in_dir(dir.path().into());
+    let ctx = apple_accounts::Context::at(paths.clone(), Some("device-a".into()));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client = crate::phone_http::PhoneHttpClient::new(
+        "127.0.0.1",
+        listener.local_addr().unwrap().port(),
+        "test".into(),
+    )
+    .unwrap();
+    let (commands, rx) = mpsc::channel(8);
+    let (events, mut states) = mpsc::channel(32);
+    let actor = tokio::spawn(apple_accounts::run(client, rx, events, ctx));
+    assert!(matches!(
+        next(&mut states).await,
+        FunctionEvent::Available(true)
+    ));
+    commands
+        .send(FunctionCommand::InvokeForAccount {
+            apple_id: "first@test".into(),
+            id: "store-login".into(),
+            text: "First@Test----Original123----https://code.example.test/current".into(),
+        })
+        .await
+        .unwrap();
+    let (socket, _) = listener.accept().await.unwrap();
+    let mut socket = TestStream::new(socket);
+    assert_eq!(packet(&mut socket).await.0, 33);
+    reply(&mut socket, json!({"ok":true,"apple_password_change":1})).await;
+    let (_, login) = packet(&mut socket).await;
+    assert_eq!(login["method"], "signInAppStore");
+    assert_eq!(login["params"]["password"], "Original123");
+    reply(&mut socket,json!({"operation_id":"login-1","method":"signInAppStore","status":"completed","result":{"outcome":"succeeded","authenticated":true}})).await;
+    assert_eq!(packet(&mut socket).await.0, 33);
+    reply(&mut socket, json!({"ok":true,"apple_password_change":1})).await;
+    let (_, change) = packet(&mut socket).await;
+    assert_eq!(change["method"], "changePassword");
+    assert_eq!(change["params"]["password"], "Original123");
+    let password = change["params"]["new_password"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(password.len(), 8);
+    // This read is before the simulated iOS mutation responds: durability precedes dispatch.
+    let store = rv_core::workspace::WorkspaceStore::open(&paths).unwrap();
+    let pending = store.apple_account("first@test").unwrap().unwrap();
+    assert_eq!(pending.pending_password.as_deref(), Some(password.as_str()));
+    assert_eq!(pending.password, "Original123");
+    assert_eq!(pending.original_password, "Original123");
+    reply(&mut socket,json!({"operation_id":"password-1","method":"changePassword","status":"completed","result":{"outcome":"succeeded","password_changed":true}})).await;
+    assert_eq!(packet(&mut socket).await.0, 33);
+    reply(&mut socket, json!({"ok":true,"apple_password_change":1})).await;
+    let (_, confirm) = packet(&mut socket).await;
+    assert_eq!(confirm["method"], "signInAppStore");
+    assert_eq!(confirm["params"]["password"], password);
+    reply(&mut socket,json!({"operation_id":"login-2","method":"signInAppStore","status":"completed","result":{"outcome":"succeeded","authenticated":true}})).await;
+    loop {
+        if let FunctionEvent::State { record, .. } = next(&mut states).await {
+            if record["status"] == "completed" {
+                assert_eq!(record["method"], "signInAppStore");
+                assert_eq!(record["result"]["outcome"], "succeeded");
+                break;
+            }
+        }
+    }
+    let saved = store.apple_account("first@test").unwrap().unwrap();
+    assert_eq!(saved.password, password);
+    assert_eq!(saved.original_password, "Original123");
+    assert!(saved.pending_password.is_none());
+    assert_eq!(
+        saved.init_status,
+        rv_core::workspace::AppleInitStatus::Ready
+    );
+    assert_eq!(saved.device_id.as_deref(), Some("device-a"));
+    assert!(saved.first_login_at.is_some() && saved.password_changed_at.is_some());
+    // Reusing the same pasted original must not overwrite the confirmed password or rotate again.
+    commands
+        .send(FunctionCommand::Invoke {
+            id: "store-login".into(),
+            text: "FIRST@test----Original123".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(packet(&mut socket).await.0, 33);
+    reply(&mut socket, json!({"ok":true,"apple_password_change":1})).await;
+    let (_, again) = packet(&mut socket).await;
+    assert_eq!(again["params"]["password"], password);
+    assert_eq!(again["method"], "signInAppStore");
+    reply(&mut socket,json!({"operation_id":"login-3","method":"signInAppStore","status":"completed","result":{"outcome":"succeeded","authenticated":true}})).await;
+    loop {
+        if let FunctionEvent::State { record, .. } = next(&mut states).await {
+            if record["status"] == "completed" {
+                break;
+            }
+        }
+    }
+    assert_eq!(
+        store
+            .apple_account("first@test")
+            .unwrap()
+            .unwrap()
+            .original_password,
+        "Original123"
+    );
+    drop(commands);
+    actor.await.unwrap();
 }
 
 #[tokio::test]
-async fn managed_unknown_password_change_preserves_both_passwords_and_does_not_retry(){
- let dir=tempfile::tempdir().unwrap();let paths=rv_core::StorePaths::in_dir(dir.path().into());let ctx=apple_accounts::Context::at(paths.clone(),None);
- let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();let client=crate::phone_http::PhoneHttpClient::new("127.0.0.1",listener.local_addr().unwrap().port(),"test".into()).unwrap();
- let (commands,rx)=mpsc::channel(8);let (events,mut states)=mpsc::channel(32);let actor=tokio::spawn(apple_accounts::run(client,rx,events,ctx));
- let _=next(&mut states).await;commands.send(FunctionCommand::Invoke{id:"store-login".into(),text:"unknown@test----Original123".into()}).await.unwrap();
- let (socket,_)=listener.accept().await.unwrap();let mut socket=TestStream::new(socket);
- let _=packet(&mut socket).await;reply(&mut socket,json!({"ok":true,"apple_password_change":1})).await;
- let _=packet(&mut socket).await;reply(&mut socket,json!({"operation_id":"initial","method":"signInAppStore","status":"completed","result":{"outcome":"succeeded","authenticated":true}})).await;
- let _=packet(&mut socket).await;reply(&mut socket,json!({"ok":true,"apple_password_change":1})).await;
- let (_,change)=packet(&mut socket).await;let candidate=change["params"]["new_password"].as_str().unwrap().to_owned();
- reply(&mut socket,json!({"operation_id":"password-unknown","method":"changePassword","status":"completed","error":{"domain":"org.trollvnc.apple","code":6},"result":{"outcome":"unknown"}})).await;
- loop{if let FunctionEvent::State{record,..}=next(&mut states).await{if record["status"]=="completed"{break;}}}
- let store=rv_core::workspace::WorkspaceStore::open(&paths).unwrap();let account=store.apple_account("unknown@test").unwrap().unwrap();
- assert_eq!(account.password,"Original123");assert_eq!(account.pending_password.as_deref(),Some(candidate.as_str()));assert_eq!(account.init_status,rv_core::workspace::AppleInitStatus::Unknown);assert_eq!(account.password_change_operation_id.as_deref(),Some("password-unknown"));
- commands.send(FunctionCommand::Invoke{id:"store-login".into(),text:"unknown@test----Original123".into()}).await.unwrap();
- loop{if matches!(next(&mut states).await,FunctionEvent::Error(_)){break;}}
- let mut no_request=String::new();socket.read_line(&mut no_request).await.unwrap();
- // Recover the original operation; never issue another password mutation.
- commands.send(FunctionCommand::Resume{task:31,operation_id:"password-unknown".into()}).await.unwrap();
- let _=packet(&mut socket).await;reply(&mut socket,json!({"ok":true,"apple_password_change":1})).await;
- let (_,query)=packet(&mut socket).await;assert_eq!(query["action"],"result");assert_eq!(query["operation_id"],"password-unknown");
- reply(&mut socket,json!({"operation_id":"password-unknown","method":"changePassword","status":"completed","error":{"domain":"org.trollvnc.apple","code":11,"reason":"account_locked"},"result":{"outcome":"failed","password_changed":true}})).await;
- loop{if let FunctionEvent::State{record,..}=next(&mut states).await{if record["status"]=="completed"{break;}}}
- let recovered=store.apple_account("unknown@test").unwrap().unwrap();assert_eq!(recovered.password,candidate);assert_eq!(recovered.original_password,"Original123");assert!(recovered.pending_password.is_none());assert_eq!(recovered.account_status,rv_core::workspace::AppleAccountStatus::Locked);
- drop(commands);actor.await.unwrap();
+async fn managed_unknown_password_change_preserves_both_passwords_and_does_not_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = rv_core::StorePaths::in_dir(dir.path().into());
+    let ctx = apple_accounts::Context::at(paths.clone(), None);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client = crate::phone_http::PhoneHttpClient::new(
+        "127.0.0.1",
+        listener.local_addr().unwrap().port(),
+        "test".into(),
+    )
+    .unwrap();
+    let (commands, rx) = mpsc::channel(8);
+    let (events, mut states) = mpsc::channel(32);
+    let actor = tokio::spawn(apple_accounts::run(client, rx, events, ctx));
+    let _ = next(&mut states).await;
+    commands
+        .send(FunctionCommand::Invoke {
+            id: "store-login".into(),
+            text: "unknown@test----Original123".into(),
+        })
+        .await
+        .unwrap();
+    let (socket, _) = listener.accept().await.unwrap();
+    let mut socket = TestStream::new(socket);
+    let _ = packet(&mut socket).await;
+    reply(&mut socket, json!({"ok":true,"apple_password_change":1})).await;
+    let _ = packet(&mut socket).await;
+    reply(&mut socket,json!({"operation_id":"initial","method":"signInAppStore","status":"completed","result":{"outcome":"succeeded","authenticated":true}})).await;
+    let _ = packet(&mut socket).await;
+    reply(&mut socket, json!({"ok":true,"apple_password_change":1})).await;
+    let (_, change) = packet(&mut socket).await;
+    let candidate = change["params"]["new_password"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    reply(&mut socket,json!({"operation_id":"password-unknown","method":"changePassword","status":"completed","error":{"domain":"org.trollvnc.apple","code":6},"result":{"outcome":"unknown"}})).await;
+    loop {
+        if let FunctionEvent::State { record, .. } = next(&mut states).await {
+            if record["status"] == "completed" {
+                break;
+            }
+        }
+    }
+    let store = rv_core::workspace::WorkspaceStore::open(&paths).unwrap();
+    let account = store.apple_account("unknown@test").unwrap().unwrap();
+    assert_eq!(account.password, "Original123");
+    assert_eq!(
+        account.pending_password.as_deref(),
+        Some(candidate.as_str())
+    );
+    assert_eq!(
+        account.init_status,
+        rv_core::workspace::AppleInitStatus::Unknown
+    );
+    assert_eq!(
+        account.password_change_operation_id.as_deref(),
+        Some("password-unknown")
+    );
+    commands
+        .send(FunctionCommand::Invoke {
+            id: "store-login".into(),
+            text: "unknown@test----Original123".into(),
+        })
+        .await
+        .unwrap();
+    loop {
+        if matches!(next(&mut states).await, FunctionEvent::Error(_)) {
+            break;
+        }
+    }
+    let mut no_request = String::new();
+    socket.read_line(&mut no_request).await.unwrap();
+    // Recover the original operation; never issue another password mutation.
+    commands
+        .send(FunctionCommand::Resume {
+            task: 31,
+            operation_id: "password-unknown".into(),
+        })
+        .await
+        .unwrap();
+    let _ = packet(&mut socket).await;
+    reply(&mut socket, json!({"ok":true,"apple_password_change":1})).await;
+    let (_, query) = packet(&mut socket).await;
+    assert_eq!(query["action"], "result");
+    assert_eq!(query["operation_id"], "password-unknown");
+    reply(&mut socket,json!({"operation_id":"password-unknown","method":"changePassword","status":"completed","error":{"domain":"org.trollvnc.apple","code":11,"reason":"account_locked"},"result":{"outcome":"failed","password_changed":true}})).await;
+    loop {
+        if let FunctionEvent::State { record, .. } = next(&mut states).await {
+            if record["status"] == "completed" {
+                break;
+            }
+        }
+    }
+    let recovered = store.apple_account("unknown@test").unwrap().unwrap();
+    assert_eq!(recovered.password, candidate);
+    assert_eq!(recovered.original_password, "Original123");
+    assert!(recovered.pending_password.is_none());
+    assert_eq!(
+        recovered.account_status,
+        rv_core::workspace::AppleAccountStatus::Locked
+    );
+    drop(commands);
+    actor.await.unwrap();
 }
 
 #[tokio::test]
 async fn managed_manual_change_preserves_ready_and_does_not_switch_other_media_account() {
-    let dir=tempfile::tempdir().unwrap();let paths=rv_core::StorePaths::in_dir(dir.path().into());
-    let mut store=rv_core::workspace::WorkspaceStore::open(&paths).unwrap();
-    let a=store.prepare_apple_login("identity@test","Original123",None,None,&json!({})).unwrap().account;
-    let a=store.apple_login_succeeded(&a).unwrap();let a=store.begin_apple_password_change(&a).unwrap();let ready=store.apple_password_change_succeeded(&a).unwrap();
-    let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();let client=crate::phone_http::PhoneHttpClient::new("127.0.0.1",listener.local_addr().unwrap().port(),"test".into()).unwrap();
-    let (commands,rx)=mpsc::channel(8);let (events,mut states)=mpsc::channel(32);
-    let actor=tokio::spawn(apple_accounts::run(client,rx,events,apple_accounts::Context::at(paths.clone(),None)));
-    let _=next(&mut states).await;
-    let mut connection=None;
-    for succeed in [false,true] {
-        commands.send(FunctionCommand::InvokeForAccount{id:"apple-password-change".into(),text:String::new(),apple_id:"identity@test".into()}).await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let paths = rv_core::StorePaths::in_dir(dir.path().into());
+    let mut store = rv_core::workspace::WorkspaceStore::open(&paths).unwrap();
+    let a = store
+        .prepare_apple_login("identity@test", "Original123", None, None, &json!({}))
+        .unwrap()
+        .account;
+    let a = store.apple_login_succeeded(&a).unwrap();
+    let a = store.begin_apple_password_change(&a).unwrap();
+    let ready = store.apple_password_change_succeeded(&a).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client = crate::phone_http::PhoneHttpClient::new(
+        "127.0.0.1",
+        listener.local_addr().unwrap().port(),
+        "test".into(),
+    )
+    .unwrap();
+    let (commands, rx) = mpsc::channel(8);
+    let (events, mut states) = mpsc::channel(32);
+    let actor = tokio::spawn(apple_accounts::run(
+        client,
+        rx,
+        events,
+        apple_accounts::Context::at(paths.clone(), None),
+    ));
+    let _ = next(&mut states).await;
+    let mut connection = None;
+    for succeed in [false, true] {
+        commands
+            .send(FunctionCommand::InvokeForAccount {
+                id: "apple-password-change".into(),
+                text: String::new(),
+                apple_id: "identity@test".into(),
+            })
+            .await
+            .unwrap();
         // The first request uses the shared HTTP/2 transport for the read-only preflight.
-        if connection.is_none(){let (stream,_)=listener.accept().await.unwrap();connection=Some(TestStream::new(stream));}
-        let socket=connection.as_mut().unwrap();
-        assert_eq!(packet(socket).await.0,33);reply(socket,json!({"ok":true,"apple_password_change":1})).await;
-        let (_,query)=packet(socket).await;assert_eq!(query["method"],"queryAccountState");
+        if connection.is_none() {
+            let (stream, _) = listener.accept().await.unwrap();
+            connection = Some(TestStream::new(stream));
+        }
+        let socket = connection.as_mut().unwrap();
+        assert_eq!(packet(socket).await.0, 33);
+        reply(socket, json!({"ok":true,"apple_password_change":1})).await;
+        let (_, query) = packet(socket).await;
+        assert_eq!(query["method"], "queryAccountState");
         reply(socket,json!({"operation_id":"state","method":"queryAccountState","status":"completed","result":{
             "icloud":{"status":"not_signed_in","account":null},
             "identity":{"status":"signed_in","account":{"apple_id":"identity@test"}},
             "app_store":{"status":"signed_in","account":{"apple_id":"other-media@test","authenticated":true}}
         }})).await;
-        assert_eq!(packet(socket).await.0,33);reply(socket,json!({"ok":true,"apple_password_change":1})).await;
-        let (_,change)=packet(socket).await;
-        assert_eq!(change["method"],"changePassword");assert_eq!(change["params"]["apple_id"],"identity@test");assert_eq!(change["params"]["password"],ready.password);
-        let candidate=change["params"]["new_password"].as_str().unwrap().to_owned();
-        let saved=store.apple_account("identity@test").unwrap().unwrap();assert_eq!(saved.pending_password.as_deref(),Some(candidate.as_str()));
-        let result=if succeed {json!({"operation_id":"manual","method":"changePassword","status":"completed","result":{"outcome":"succeeded","password_changed":true}})} else {json!({"operation_id":"manual","method":"changePassword","status":"completed","error":{"domain":"org.trollvnc.apple","code":3},"result":{"outcome":"failed"}})};
-        reply(socket,result).await;
-        loop {if let FunctionEvent::State{record,..}=next(&mut states).await {if record["status"]=="completed"{assert_eq!(record["method"],"changePassword");break;}}}
-        let saved=store.apple_account("identity@test").unwrap().unwrap();assert_eq!(saved.init_status,rv_core::workspace::AppleInitStatus::Ready);assert!(saved.pending_password.is_none());assert_eq!(saved.original_password,"Original123");
-        assert_eq!(saved.password,if succeed {candidate} else {ready.password.clone()});
+        assert_eq!(packet(socket).await.0, 33);
+        reply(socket, json!({"ok":true,"apple_password_change":1})).await;
+        let (_, change) = packet(socket).await;
+        assert_eq!(change["method"], "changePassword");
+        assert_eq!(change["params"]["apple_id"], "identity@test");
+        assert_eq!(change["params"]["password"], ready.password);
+        let candidate = change["params"]["new_password"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let saved = store.apple_account("identity@test").unwrap().unwrap();
+        assert_eq!(saved.pending_password.as_deref(), Some(candidate.as_str()));
+        let result = if succeed {
+            json!({"operation_id":"manual","method":"changePassword","status":"completed","result":{"outcome":"succeeded","password_changed":true}})
+        } else {
+            json!({"operation_id":"manual","method":"changePassword","status":"completed","error":{"domain":"org.trollvnc.apple","code":3},"result":{"outcome":"failed"}})
+        };
+        reply(socket, result).await;
+        loop {
+            if let FunctionEvent::State { record, .. } = next(&mut states).await {
+                if record["status"] == "completed" {
+                    assert_eq!(record["method"], "changePassword");
+                    break;
+                }
+            }
+        }
+        let saved = store.apple_account("identity@test").unwrap().unwrap();
+        assert_eq!(
+            saved.init_status,
+            rv_core::workspace::AppleInitStatus::Ready
+        );
+        assert!(saved.pending_password.is_none());
+        assert_eq!(saved.original_password, "Original123");
+        assert_eq!(
+            saved.password,
+            if succeed {
+                candidate
+            } else {
+                ready.password.clone()
+            }
+        );
         // No Store login is requested before or after changing the identity password.
-        assert!(tokio::time::timeout(Duration::from_millis(75),packet(socket)).await.is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(75), packet(socket))
+                .await
+                .is_err()
+        );
     }
-    drop(commands);actor.await.unwrap();
+    drop(commands);
+    actor.await.unwrap();
 }

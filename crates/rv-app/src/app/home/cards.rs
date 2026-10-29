@@ -7,6 +7,7 @@ use gpui_component::{
     h_flex,
     input::Input,
     menu::{DropdownMenu, PopupMenuItem},
+    tooltip::Tooltip,
     v_flex,
 };
 
@@ -73,9 +74,7 @@ impl AddressBookApp {
                     .items_center()
                     .justify_center()
                     .child(if self.home.loading {
-                        Icon::new(IconName::LoaderCircle)
-                            .text_color(theme::muted(cx))
-                            .into_any_element()
+                        gpui_component::spinner::Spinner::new().into_any_element()
                     } else {
                         Icon::new(IconName::Inbox)
                             .text_color(theme::muted(cx))
@@ -193,14 +192,27 @@ impl AddressBookApp {
                         AppSort::Title => "名称",
                         AppSort::LastUsed => "最近使用",
                     })
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.home.sort = match this.home.sort {
-                            AppSort::Updated => AppSort::Title,
-                            AppSort::Title => AppSort::LastUsed,
-                            AppSort::LastUsed => AppSort::Updated,
-                        };
-                        this.reload_home(cx);
-                    })),
+                    .dropdown_menu({
+                        let owner = cx.entity();
+                        move |mut menu, _, _| {
+                            for (label, sort) in [
+                                ("最近更新", AppSort::Updated),
+                                ("名称", AppSort::Title),
+                                ("最近使用", AppSort::LastUsed),
+                            ] {
+                                let owner = owner.clone();
+                                menu = menu.item(PopupMenuItem::new(label).on_click(
+                                    move |_, _, cx| {
+                                        owner.update(cx, |this, cx| {
+                                            this.home.sort = sort;
+                                            this.reload_home(cx);
+                                        });
+                                    },
+                                ));
+                            }
+                            menu
+                        }
+                    }),
             )
             .into_any_element()
     }
@@ -221,48 +233,60 @@ impl AddressBookApp {
         let edit = app.id.clone();
         let favorite = app.id.clone();
         let menu_id = app.id.clone();
-        let avatar = app.id.clone();
-        let devices = links
-            .iter()
-            .filter_map(|b| self.book.get(b.device_id).map(|d| d.name.clone()))
-            .collect::<std::collections::BTreeSet<_>>();
+        let detail_id = app.id.clone();
+        let context = self.home.card_context.get(&app.id);
+        let expiry = context.map(|context| context.expiry).unwrap_or_default();
+        let proxy_name = context.and_then(|context| context.proxy_name.clone());
+        let sources = self.backup_source_labels(links);
+        let backup_details = app.id.clone();
+        let pinned = app.pinned;
+        let archived = app.archived;
         let menu = Button::new(SharedString::from(format!("app-menu-{}", app.id.as_str())))
             .ghost()
             .icon(IconName::Ellipsis)
-            .accessibility_label("App 更多操作")
+            .accessibility_label("账号更多操作")
+            .disabled(self.read_only)
             .dropdown_menu({
                 let book = cx.entity();
                 let pin = menu_id.clone();
                 let archive = menu_id.clone();
                 move |menu, _, _| {
                     let editor = book.clone();
-                    let pinned = book.clone();
-                    let archived = book.clone();
+                    let pin_owner = book.clone();
+                    let archive_owner = book.clone();
                     let deleted = book.clone();
                     let delete_id = menu_id.clone();
-                    menu.item(PopupMenuItem::new("编辑备注与标签…").on_click({
+                    menu.item(PopupMenuItem::new("编辑账号配置…").on_click({
                         let edit = edit.clone();
                         move |_, window, cx| {
                             editor
                                 .update(cx, |this, cx| this.open_app_card(edit.clone(), window, cx))
                         }
                     }))
-                    .item(PopupMenuItem::new("切换置顶").on_click({
-                        let pin = pin.clone();
-                        move |_, _, cx| {
-                            pinned.update(cx, |this, cx| {
-                                this.change_app(pin.clone(), |a| a.pinned = !a.pinned, cx)
-                            })
-                        }
-                    }))
-                    .item(PopupMenuItem::new("切换归档").on_click({
-                        let archive = archive.clone();
-                        move |_, _, cx| {
-                            archived.update(cx, |this, cx| {
-                                this.change_app(archive.clone(), |a| a.archived = !a.archived, cx)
-                            })
-                        }
-                    }))
+                    .item(
+                        PopupMenuItem::new(if pinned { "取消置顶" } else { "置顶" }).on_click({
+                            let pin = pin.clone();
+                            move |_, _, cx| {
+                                pin_owner.update(cx, |this, cx| {
+                                    this.change_app(pin.clone(), |a| a.pinned = !a.pinned, cx)
+                                })
+                            }
+                        }),
+                    )
+                    .item(
+                        PopupMenuItem::new(if archived { "取消归档" } else { "归档" }).on_click({
+                            let archive = archive.clone();
+                            move |_, _, cx| {
+                                archive_owner.update(cx, |this, cx| {
+                                    this.change_app(
+                                        archive.clone(),
+                                        |a| a.archived = !a.archived,
+                                        cx,
+                                    )
+                                })
+                            }
+                        }),
+                    )
                     .item(PopupMenuItem::new("删除…").on_click(move |_, _, cx| {
                         deleted.update(cx, |this, cx| this.open_app_delete(delete_id.clone(), cx));
                     }))
@@ -271,20 +295,7 @@ impl AddressBookApp {
         let header = h_flex()
             .gap_3()
             .items_center()
-            .child(
-                div()
-                    .id(ElementId::from(format!("app-avatar-{}", app.id.as_str())))
-                    .debug_selector({
-                        let id = app.id.clone();
-                        move || format!("app-avatar-{}", id.as_str())
-                    })
-                    .cursor_pointer()
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        cx.stop_propagation();
-                        this.open_app_detail(avatar.clone(), window, cx);
-                    }))
-                    .child(self.app_avatar(&app.bundle_id)),
-            )
+            .child(self.virtual_app_avatar(app))
             .child(
                 v_flex()
                     .flex_1()
@@ -294,7 +305,7 @@ impl AddressBookApp {
                         div()
                             .font_semibold()
                             .text_ellipsis()
-                            .child(app.title.clone()),
+                            .child(renderer.display_title(app)),
                     )
                     .child(
                         div()
@@ -310,8 +321,16 @@ impl AddressBookApp {
                     .icon(IconName::Star)
                     .selected(app.favorite)
                     .disabled(self.read_only)
-                    .tooltip("收藏")
-                    .accessibility_label("收藏")
+                    .tooltip(if app.favorite {
+                        "取消收藏"
+                    } else {
+                        "收藏"
+                    })
+                    .accessibility_label(if app.favorite {
+                        "取消收藏"
+                    } else {
+                        "收藏"
+                    })
                     .on_click(cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
                         this.change_app(favorite.clone(), |a| a.favorite = !a.favorite, cx)
@@ -328,6 +347,14 @@ impl AddressBookApp {
             );
         let body =
             v_flex()
+                .id(SharedString::from(format!(
+                    "app-card-body-{}",
+                    app.id.as_str()
+                )))
+                .cursor_pointer()
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.open_app_detail(detail_id.clone(), window, cx);
+                }))
                 .flex_1()
                 .p_3()
                 .gap_2()
@@ -350,7 +377,43 @@ impl AddressBookApp {
                     )
                 })
                 .child(renderer.card_preview(self.home.previews.get(&app.id), cx))
-                .child(renderer.details(app, links.len(), cx))
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .min_w_0()
+                        .when(rv_business::strategy(&app.bundle_id).is_some(), |row| {
+                            row.child(self.render_execution_indicator(&app.id, cx))
+                        })
+                        .child(renderer.details(app, links.len(), expiry, cx))
+                        .child(div().flex_1())
+                        .when(rv_business::strategy(&app.bundle_id).is_some(), |row| {
+                            let tooltip = proxy_name
+                                .as_ref()
+                                .map(|name| format!("关联代理：{name}；在账号配置中修改"))
+                                .unwrap_or_else(|| "未关联代理；请在账号配置中选择".into());
+                            row.child(
+                                h_flex()
+                                    .id(SharedString::from(format!(
+                                        "card-proxy-{}",
+                                        app.id.as_str()
+                                    )))
+                                    .gap_1()
+                                    .min_w_0()
+                                    .text_xs()
+                                    .text_color(theme::muted(cx))
+                                    .tooltip(move |window, cx| {
+                                        Tooltip::new(tooltip.clone()).build(window, cx)
+                                    })
+                                    .child(Icon::new(IconName::Network))
+                                    .child(
+                                        div()
+                                            .text_ellipsis()
+                                            .child(proxy_name.unwrap_or_else(|| "—".into())),
+                                    ),
+                            )
+                        }),
+                )
                 .when(!app.note.is_empty(), |body| {
                     body.child(
                         div()
@@ -374,12 +437,32 @@ impl AddressBookApp {
                     .text_xs()
                     .text_color(theme::muted(cx))
                     .text_ellipsis()
-                    .child(if devices.is_empty() {
-                        String::new()
-                    } else {
-                        devices.into_iter().collect::<Vec<_>>().join(" · ")
-                    }),
-            );
+                    .id(SharedString::from(format!(
+                        "app-backup-source-{}",
+                        app.id.as_str()
+                    )))
+                    .tooltip({
+                        let detail = sources.join("\n");
+                        move |window, cx| Tooltip::new(detail.clone()).build(window, cx)
+                    })
+                    .child(sources.first().cloned().unwrap_or_default()),
+            )
+            .when(!links.is_empty(), |footer| {
+                footer.child(
+                    Button::new(SharedString::from(format!(
+                        "app-backup-info-{}",
+                        app.id.as_str()
+                    )))
+                    .ghost()
+                    .icon(IconName::Info)
+                    .tooltip("手机备份详情")
+                    .accessibility_label("手机备份详情")
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.show_backup_info(backup_details.clone(), window, cx);
+                    })),
+                )
+            });
         v_flex()
             .id(ElementId::from(format!("app-card-{}", app.id.as_str())))
             .w(width)

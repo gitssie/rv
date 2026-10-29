@@ -101,6 +101,19 @@ impl AddressBookApp {
     fn render_device(&self, device: &Connection, cx: &mut Context<Self>) -> AnyElement {
         let id = device.id;
         let online = self.phone_online(id, cx);
+        let lock = if let Some(control) = self.home.controls.get(&id) {
+            control.view.update(cx, |view, cx| {
+                view.render_home_lock_button(self.read_only, cx)
+            })
+        } else {
+            Button::new(SharedString::from(format!("device-lock-unavailable-{id}")))
+                .ghost()
+                .icon(crate::assets::AppActionIcon::Lock)
+                .tooltip("设备未连接，锁屏状态未知")
+                .accessibility_label("锁屏状态未知")
+                .disabled(true)
+                .into_any_element()
+        };
         let selected = self.selected == Some(id);
         let current = device.current_bundle_id.as_deref().map(|bundle| {
             let name = self
@@ -178,6 +191,12 @@ impl AddressBookApp {
                                     } else {
                                         theme::muted(cx)
                                     }),
+                            )
+                            .child(
+                                div()
+                                    .id(ElementId::from(format!("device-lock-{id}")))
+                                    .debug_selector(move || format!("device-lock-{id}"))
+                                    .child(lock),
                             ),
                     )
                     .child(

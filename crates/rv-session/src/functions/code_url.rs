@@ -19,7 +19,8 @@ pub fn validate_code_url(text: &str) -> Result<(), String> {
 /// Match an explicitly labelled code, never an arbitrary number in IDs or dates.
 fn text_codes(body: &str) -> Vec<String> {
     static CODE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r"(?ix)
+        regex::Regex::new(
+            r"(?ix)
             (?:
                 \b(?:your\s+)?apple\s+(?:account|id)\s+(?:verification\s+)?code
                 | \b(?:verification|security|one[-\s]time|otp)\s+code
@@ -27,16 +28,24 @@ fn text_codes(body: &str) -> Vec<String> {
             )
             \s*(?:is|为|為|是)?\s*[:：]?\s*
             ([0-9]{6})
-        ").expect("valid verification-code pattern")
+        ",
+        )
+        .expect("valid verification-code pattern")
     });
-    CODE.captures_iter(body).filter_map(|capture| {
-        let code = capture.get(1)?;
-        // Check the boundary without consuming the next SMS label.
-        if body.as_bytes().get(code.end()).is_some_and(u8::is_ascii_digit) {
-            return None;
-        }
-        Some(code.as_str().to_owned())
-    }).collect()
+    CODE.captures_iter(body)
+        .filter_map(|capture| {
+            let code = capture.get(1)?;
+            // Check the boundary without consuming the next SMS label.
+            if body
+                .as_bytes()
+                .get(code.end())
+                .is_some_and(u8::is_ascii_digit)
+            {
+                return None;
+            }
+            Some(code.as_str().to_owned())
+        })
+        .collect()
 }
 
 /// Accept complete codes, explicit JSON fields and labelled SMS text.
@@ -50,8 +59,11 @@ pub fn extract_verification_code(body: &str) -> Result<String, String> {
     if let Ok(value) = serde_json::from_str::<Value>(body) {
         for candidate in [&value, &value["data"], &value["result"]] {
             if let Some(text) = candidate.as_str() {
-                if valid_code(text) { codes.push(text.to_owned()); }
-                else { codes.extend(text_codes(text)); }
+                if valid_code(text) {
+                    codes.push(text.to_owned());
+                } else {
+                    codes.extend(text_codes(text));
+                }
             }
             for key in ["code", "verification_code", "verificationCode", "otp"] {
                 if let Some(code) = candidate.get(key).and_then(Value::as_str)
@@ -107,21 +119,40 @@ mod tests {
 
     #[test]
     fn extracts_apple_sms_with_timestamp_and_preserves_leading_zero() {
-        assert_eq!(extract_verification_code(
-            "Your Apple Account code is: 053322. Do not share it with anyone.|2026-11-29"
-        ).unwrap(), "053322");
+        assert_eq!(
+            extract_verification_code(
+                "Your Apple Account code is: 053322. Do not share it with anyone.|2026-11-29"
+            )
+            .unwrap(),
+            "053322"
+        );
     }
 
     #[test]
     fn labeled_codes_exclude_long_numbers_dates_and_ambiguous_codes() {
-        assert_eq!(extract_verification_code("Apple ID verification code: 001234.").unwrap(), "001234");
-        assert_eq!(extract_verification_code("您的 Apple 验证码是：053322，请勿分享。").unwrap(), "053322");
+        assert_eq!(
+            extract_verification_code("Apple ID verification code: 001234.").unwrap(),
+            "001234"
+        );
+        assert_eq!(
+            extract_verification_code("您的 Apple 验证码是：053322，请勿分享。").unwrap(),
+            "053322"
+        );
         assert!(extract_verification_code("Your Apple Account code is: 10533220.").is_err());
         assert!(extract_verification_code("Your Apple Account code is: 0533220.").is_err());
         assert!(extract_verification_code("2026-11-29 / id=053322").is_err());
-        assert!(extract_verification_code("Apple Account code: 053322. Apple ID code: 001234.").is_err());
+        assert!(
+            extract_verification_code("Apple Account code: 053322. Apple ID code: 001234.")
+                .is_err()
+        );
         assert!(extract_verification_code("验证码：053322验证码：001234").is_err());
         assert!(extract_verification_code(r#"{"id":"053322","date":"2026-11-29"}"#).is_err());
-        assert_eq!(extract_verification_code(r#"{"data":{"message":"Your Apple Account code is: 053322.|2026-11-29"}}"#).unwrap(), "053322");
+        assert_eq!(
+            extract_verification_code(
+                r#"{"data":{"message":"Your Apple Account code is: 053322.|2026-11-29"}}"#
+            )
+            .unwrap(),
+            "053322"
+        );
     }
 }

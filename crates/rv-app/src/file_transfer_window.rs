@@ -24,7 +24,7 @@ use gpui_component::{
 use rv_core::{ConnectionId, TransferFolders};
 use rv_session::{
     FileCommand, FileTransferClient, FileTransferSnapshot, PHOTO_PAGE_SIZE, PhotoAlbum,
-    PhotoDeleteStatus, PhotoEntry, TransferDirection, TransferStatus,
+    PhotoDeleteStatus, PhotoEntry, SafariFolder, TransferDirection, TransferStatus,
 };
 use smallvec::SmallVec;
 
@@ -201,7 +201,7 @@ pub fn open(
             cx.new(|cx| FileTransferView::new(host, client, allow_upload, memory, window, cx));
         cx.new(|cx| {
             gpui_component::Root::new(
-                cx.new(|_| crate::file_transfer_window::dialogs::TransferShell(view)),
+                cx.new(|cx| crate::file_transfer_window::dialogs::TransferShell::new(view, cx)),
                 window,
                 cx,
             )
@@ -240,6 +240,12 @@ pub struct FileTransferView {
     remote_sort: FileSort,
     active_side: FileSide,
     photo_mode: bool,
+    safari_mode: bool,
+    safari_requested: bool,
+    safari_selected: Option<String>,
+    files_remote: Option<String>,
+    pending_remote: Option<String>,
+    remote_target: Option<String>,
     photo_selected: Option<String>,
     photo_selected_ids: Vec<String>,
     photo_anchor: Option<(usize, usize)>,
@@ -356,6 +362,12 @@ impl FileTransferView {
             remote_sort: FileSort::default(),
             active_side: FileSide::Remote,
             photo_mode,
+            safari_mode: false,
+            safari_requested: false,
+            safari_selected: None,
+            files_remote: None,
+            pending_remote: None,
+            remote_target: None,
             photo_selected: None,
             photo_selected_ids: Vec::new(),
             photo_anchor: None,
@@ -408,7 +420,13 @@ impl FileTransferView {
                     .then(|| self.remote.photo_error.clone())
                     .flatten()
             })
-            .or_else(|| self.remote.error.clone());
+            .or_else(|| {
+                if self.safari_mode && self.remote.safari_path.is_none() {
+                    None
+                } else {
+                    self.remote.error.clone()
+                }
+            });
         let (message, icon, color, running) = if let Some(error) = error {
             (error, IconName::CircleX, theme::danger(cx), false)
         } else if let Some(status) = self
@@ -536,6 +554,47 @@ impl FileTransferView {
         let photo_page_changed = self.remote.photo_offset != snapshot.photo_offset
             || self.remote.photo_album != snapshot.photo_album;
         self.remote = snapshot;
+        if self.safari_mode {
+            if self.remote.safari_busy {
+                self.safari_requested = true;
+            }
+            if let Some(selected) = self.safari_selected.as_ref().filter(|path| {
+                self.remote
+                    .safari_folders
+                    .iter()
+                    .any(|folder| &folder.path == *path)
+            }) {
+                self.remote.safari_path = Some(selected.clone());
+            }
+        }
+        if let Some(target) = &self.remote_target {
+            if self.remote.remote_path != *target {
+                self.remote.remote_path = target.clone();
+                self.remote.entries.clear();
+                self.remote.listed_path = None;
+                self.remote.listing = true;
+                self.remote.error = None;
+            } else if !self.remote.listing {
+                self.remote_target = None;
+            }
+        }
+        if self.safari_mode && self.safari_requested && !self.remote.safari_busy {
+            self.safari_requested = false;
+            if let Some(path) = self.remote.safari_path.clone() {
+                self.safari_selected = Some(path.clone());
+                self.pending_remote = Some(path);
+                self.remote.entries.clear();
+                self.remote.listed_path = None;
+                self.remote.listing = true;
+            } else {
+                self.remote.entries.clear();
+                self.remote.listed_path = None;
+                self.remote_selected = None;
+                self.remote_selected_names.clear();
+                self.remote_anchor = None;
+                self.status_error = self.remote.safari_error.clone();
+            }
+        }
         self.sync_photo_mode(cx);
         self.sort_remote_entries();
         if photos_changed {
@@ -618,8 +677,25 @@ impl FileTransferView {
         }
     }
 
-    fn refresh_remote(&self) {
-        self.request_remote_list(self.remote.remote_path.clone());
+    fn refresh_remote(&mut self) {
+        if self.safari_mode {
+            if self
+                .client
+                .as_ref()
+                .is_some_and(|client| client.send(FileCommand::SafariDownloads))
+            {
+                self.safari_requested = true;
+                self.remote.safari_busy = true;
+                self.remote.entries.clear();
+                self.remote.listed_path = None;
+                self.remote_selected = None;
+                self.remote_selected_names.clear();
+                self.remote_anchor = None;
+                self.status_error = None;
+            }
+        } else {
+            self.request_remote_list(self.remote.remote_path.clone());
+        }
     }
 
     fn request_remote_list(&self, path: String) {
@@ -702,6 +778,15 @@ impl FileTransferView {
             cx.notify();
             return;
         }
+        if self.safari_mode
+            && self
+                .remote
+                .safari_path
+                .as_ref()
+                .is_some_and(|root| root != &path)
+        {
+            return;
+        }
         let path = if path.len() > 1 {
             path.trim_end_matches('/').to_owned()
         } else {
@@ -723,6 +808,11 @@ impl FileTransferView {
             self.persist_folders(cx);
         }
         self.preferred_remote = Some(path.clone());
+        self.remote_target = Some(path.clone());
+        self.remote.remote_path = path.clone();
+        self.remote.listed_path = None;
+        self.remote.entries.clear();
+        self.remote.listing = true;
         self.status_error = None;
         self.remote_selected = None;
         self.remote_selected_names.clear();
@@ -736,6 +826,9 @@ impl FileTransferView {
     }
 
     fn go_remote(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.safari_mode {
+            return;
+        }
         let path = self.remote_path_input.read(cx).value().trim().to_owned();
         self.navigate_remote(path, true, window, cx);
     }
@@ -938,6 +1031,9 @@ impl FileTransferView {
 
     fn show_photos(&mut self, cx: &mut Context<Self>) {
         if self.remote.can_photos && !self.photo_mode {
+            self.safari_mode = false;
+            self.safari_requested = false;
+            self.pending_remote = None;
             self.photo_mode = true;
             self.memory.folders.borrow_mut().photo_mode = true;
             self.persist_folders(cx);
@@ -946,7 +1042,172 @@ impl FileTransferView {
         }
     }
 
+    fn remote_directory_ready(&self) -> bool {
+        !self.safari_requested
+            && self.pending_remote.is_none()
+            && self.remote_target.is_none()
+            && !(self.safari_mode && self.remote.safari_path.is_none())
+            && !self.remote.listing
+            && !self.remote.management_busy
+            && self.remote.error.is_none()
+            && self.remote.listed_path.as_deref() == Some(self.remote.remote_path.as_str())
+    }
+
+    fn select_safari_folder(&mut self, path: String, cx: &mut Context<Self>) {
+        if !self.safari_mode
+            || self.safari_requested
+            || self.remote.listing
+            || self.current_job.is_some()
+            || self
+                .queue
+                .iter()
+                .any(|job| matches!(job.state, QueueState::Queued))
+            || !self
+                .remote
+                .safari_folders
+                .iter()
+                .any(|folder| folder.path == path)
+            || self.safari_selected.as_ref() == Some(&path)
+        {
+            return;
+        }
+        self.safari_selected = Some(path.clone());
+        self.remote.safari_path = Some(path.clone());
+        self.pending_remote = Some(path);
+        self.remote.entries.clear();
+        self.remote.listed_path = None;
+        self.remote_selected = None;
+        self.remote_selected_names.clear();
+        self.remote_anchor = None;
+        self.status_error = None;
+        cx.notify();
+    }
+
+    fn render_safari_sources(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let selected = self
+            .remote
+            .safari_folders
+            .iter()
+            .enumerate()
+            .find(|(_, folder)| Some(&folder.path) == self.safari_selected.as_ref())
+            .map(|(index, folder)| safari_folder_label(index, folder))
+            .unwrap_or_else(|| "Safari files".into());
+        h_flex()
+            .px_2()
+            .py_1()
+            .gap_2()
+            .items_center()
+            .border_b_1()
+            .border_color(theme::line(cx))
+            .child(
+                Button::new("safari-source")
+                    .ghost()
+                    .small()
+                    .label(selected)
+                    .icon(IconName::ChevronDown)
+                    .loading(self.remote.safari_busy)
+                    .disabled(
+                        self.remote.safari_folders.is_empty()
+                            || self.safari_requested
+                            || self.remote.listing
+                            || self.current_job.is_some(),
+                    )
+                    .dropdown_menu(safari_folder_menu(
+                        cx.entity(),
+                        self.remote.safari_folders.clone(),
+                    )),
+            )
+    }
+
+    fn show_safari(&mut self, cx: &mut Context<Self>) {
+        if self.current_job.is_some()
+            || self
+                .queue
+                .iter()
+                .any(|job| matches!(job.state, QueueState::Queued))
+            || self.remote.listing
+            || self.remote.management_busy
+            || self.remote.safari_busy
+            || !self.remote.caps.is_some_and(|caps| caps.list)
+        {
+            return;
+        }
+        if !self
+            .client
+            .as_ref()
+            .is_some_and(|client| client.send(FileCommand::SafariDownloads))
+        {
+            self.status_error = Some("Safari directory lookup could not be started".into());
+            cx.notify();
+            return;
+        }
+        if !self.safari_mode && self.files_remote.is_none() {
+            self.files_remote = Some(self.remote.remote_path.clone());
+        }
+        self.photo_mode = false;
+        self.memory.folders.borrow_mut().photo_mode = false;
+        self.persist_folders(cx);
+        self.safari_mode = true;
+        self.safari_requested = true;
+        self.safari_selected = None;
+        self.pending_remote = None;
+        self.remote.safari_busy = true;
+        self.remote.safari_path = None;
+        self.remote.safari_error = None;
+        self.remote.entries.clear();
+        self.remote.listed_path = None;
+        self.remote_selected = None;
+        self.remote_selected_names.clear();
+        self.remote_anchor = None;
+        self.status_error = None;
+        cx.notify();
+    }
+
+    fn render_remote_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        use gpui_component::tab::{Tab, TabBar};
+        let locked = self.current_job.is_some()
+            || self
+                .queue
+                .iter()
+                .any(|job| matches!(job.state, QueueState::Queued));
+        TabBar::new("remote-browser-tabs")
+            .underline()
+            .selected_index(if self.photo_mode {
+                1
+            } else if self.safari_mode {
+                2
+            } else {
+                0
+            })
+            .children([
+                Tab::new().label("Files").disabled(locked),
+                Tab::new()
+                    .label("Photos")
+                    .disabled(locked || !self.remote.can_photos),
+                Tab::new().label("Safari").disabled(
+                    locked
+                        || !self.remote.caps.is_some_and(|caps| caps.list)
+                        || self.remote.safari_busy
+                        || self.remote.listing,
+                ),
+            ])
+            .on_click(cx.listener(|this, index: &usize, _, cx| match index {
+                0 => this.show_files(cx),
+                1 => this.show_photos(cx),
+                _ => this.show_safari(cx),
+            }))
+    }
+
     fn show_files(&mut self, cx: &mut Context<Self>) {
+        if self.safari_mode || self.files_remote.is_some() {
+            self.safari_mode = false;
+            self.safari_requested = false;
+            self.pending_remote = self.files_remote.take();
+            self.remote.entries.clear();
+            self.remote.listed_path = None;
+            self.status_error = None;
+            cx.notify();
+        }
         if self.photo_mode {
             self.photo_mode = false;
             self.memory.folders.borrow_mut().photo_mode = false;
@@ -1104,6 +1365,19 @@ impl FileTransferView {
     }
 
     fn prepare_queue(&mut self, jobs: Vec<QueueJob>, cx: &mut Context<Self>) {
+        if jobs.iter().any(|job| {
+            matches!(
+                job.action,
+                QueueAction::Upload { .. }
+                    | QueueAction::Download { .. }
+                    | QueueAction::DeleteRemote(_)
+            )
+        }) && !self.remote_directory_ready()
+        {
+            self.status_error = Some("Wait for the remote folder to finish loading".into());
+            cx.notify();
+            return;
+        }
         if jobs.is_empty() {
             return;
         }
@@ -1656,6 +1930,9 @@ impl FileTransferView {
             FileSide::Remote => {
                 if self.allow_upload
                     && self.remote.can_delete
+                    && self.remote_directory_ready()
+                    && remote_parent(&details.path).as_deref()
+                        == Some(self.remote.remote_path.as_str())
                     && !self.remote.management_busy
                     && let Some(client) = &self.client
                 {
@@ -1670,6 +1947,9 @@ impl FileTransferView {
         let Some(side) = self.pending_batch_delete.take() else {
             return;
         };
+        if side == FileSide::Remote && !self.remote_directory_ready() {
+            return;
+        }
         let jobs = match side {
             FileSide::Local => self
                 .local_selected_paths
@@ -1807,6 +2087,9 @@ impl FileTransferView {
                 }
             }
             FileSide::Remote => {
+                if !self.remote_directory_ready() {
+                    return;
+                }
                 if let Some(client) = &self.client {
                     client.send(FileCommand::CreateFolder(join_remote(
                         &self.remote.remote_path,
@@ -1819,7 +2102,7 @@ impl FileTransferView {
     }
 
     fn rename_item(&mut self, cx: &mut Context<Self>) {
-        let Some(details) = self.pending_rename.take() else {
+        let Some(details) = self.pending_rename.clone() else {
             return;
         };
         self.status_error = None;
@@ -1834,6 +2117,7 @@ impl FileTransferView {
             cx.notify();
             return;
         }
+        self.pending_rename = None;
         match details.side {
             FileSide::Local => {
                 let from = PathBuf::from(details.path);
@@ -1848,6 +2132,9 @@ impl FileTransferView {
             FileSide::Remote => {
                 if self.allow_upload
                     && self.remote.can_rename
+                    && self.remote_directory_ready()
+                    && remote_parent(&details.path).as_deref()
+                        == Some(self.remote.remote_path.as_str())
                     && !self.remote.management_busy
                     && let Some(client) = &self.client
                 {
@@ -2524,20 +2811,7 @@ impl FileTransferView {
                     .child(Icon::new(crate::assets::FunctionIcon::Smartphone))
                     .child("Remote")
                     .child(div().flex_1())
-                    .child(
-                        Button::new("photos-files")
-                            .ghost()
-                            .text_color(theme::muted(cx))
-                            .icon(IconName::Folder)
-                            .label("Files")
-                            .on_click(cx.listener(|this, _, _, cx| this.show_files(cx))),
-                    )
-                    .child(
-                        Button::new("photos-photos")
-                            .ghost()
-                            .icon(IconName::GalleryVerticalEnd)
-                            .label("Photos"),
-                    ),
+                    .child(self.render_remote_tabs(cx)),
             )
             .child(
                 h_flex()
@@ -2656,10 +2930,27 @@ impl FileTransferView {
     }
 
     fn render_remote_pane(&self, cx: &mut Context<Self>) -> AnyElement {
+        let safari_empty = self.safari_mode
+            && !self.safari_requested
+            && !self.remote.safari_busy
+            && self.remote.safari_error.is_none()
+            && (self.remote.safari_path.is_none()
+                || (!self.remote.listing
+                    && self.remote.error.is_none()
+                    && self.remote.entries.is_empty()));
         let parent = remote_parent(&self.remote.remote_path);
         let back = self.remote_back.last().cloned();
-        let available = self.remote.caps.is_some_and(|caps| caps.list);
-        let message = if let Some(error) = &self.remote.error {
+        let available = self.remote.caps.is_some_and(|caps| caps.list)
+            && !self.safari_requested
+            && !(self.safari_mode && self.remote.safari_path.is_none());
+        let message = if self.safari_mode && self.safari_requested {
+            "Locating Safari Downloads…".into()
+        } else if self.safari_mode && self.remote.safari_path.is_none() {
+            self.remote
+                .safari_error
+                .clone()
+                .unwrap_or_else(|| "Safari Downloads is unavailable".into())
+        } else if let Some(error) = &self.remote.error {
             error.clone()
         } else if self.remote.listing {
             "Loading remote files…".into()
@@ -2687,105 +2978,99 @@ impl FileTransferView {
                     .child(Icon::new(crate::assets::FunctionIcon::Smartphone))
                     .child("Remote")
                     .child(div().flex_1())
-                    .child(
-                        Button::new("files-files")
-                            .ghost()
-                            .icon(IconName::Folder)
-                            .label("Files"),
-                    )
-                    .child(
-                        Button::new("files-photos")
-                            .ghost()
-                            .text_color(theme::muted(cx))
-                            .icon(IconName::GalleryVerticalEnd)
-                            .label("Photos")
-                            .disabled(!self.remote.can_photos)
-                            .on_click(cx.listener(|this, _, _, cx| this.show_photos(cx))),
-                    ),
+                    .child(self.render_remote_tabs(cx)),
             )
-            .child(
-                h_flex()
-                    .py_1()
-                    .px_2()
-                    .gap_2()
-                    .items_center()
-                    .border_b_1()
-                    .border_color(theme::line(cx))
-                    .child(
-                        Button::new("remote-back")
-                            .ghost()
-                            .icon(IconName::ChevronLeft)
-                            .tooltip("Previous remote folder")
-                            .disabled(back.is_none() || !available)
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                if let Some(path) = this.remote_back.pop() {
-                                    this.navigate_remote(path, false, window, cx);
-                                }
-                            })),
-                    )
-                    .child(
-                        Button::new("remote-parent")
-                            .ghost()
-                            .icon(IconName::ArrowUp)
-                            .tooltip("Parent folder")
-                            .disabled(parent.is_none() || !available)
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                if let Some(parent) = parent.clone() {
-                                    this.navigate_remote(parent, true, window, cx);
-                                }
-                            })),
-                    )
-                    .child(
-                        Input::new(&self.remote_path_input)
-                            .appearance(false)
-                            .aria_label("Remote folder path")
-                            .flex_1()
-                            .min_w_0(),
-                    )
-                    .child(
-                        Button::new("remote-new-folder")
-                            .ghost()
-                            .icon(IconName::Plus)
-                            .tooltip("New folder")
-                            .accessibility_label("New folder")
-                            .disabled(
-                                !self.allow_upload
-                                    || !self.remote.can_mkdir
-                                    || self.remote.management_busy
-                                    || self.remote.listed_path.as_deref()
-                                        != Some(self.remote.remote_path.as_str()),
-                            )
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.new_folder_side = Some(FileSide::Remote);
-                                this.new_folder_input.update(cx, |input, cx| {
-                                    input.set_value("", window, cx);
-                                });
-                                cx.notify();
-                            })),
-                    ),
-            )
+            .when(self.safari_mode, |pane| {
+                pane.child(self.render_safari_sources(cx))
+            })
+            .when(!self.safari_mode, |pane| {
+                pane.child(
+                    h_flex()
+                        .py_1()
+                        .px_2()
+                        .gap_2()
+                        .items_center()
+                        .border_b_1()
+                        .border_color(theme::line(cx))
+                        .child(
+                            Button::new("remote-back")
+                                .ghost()
+                                .icon(IconName::ChevronLeft)
+                                .tooltip("Previous remote folder")
+                                .disabled(back.is_none() || !available)
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    if let Some(path) = this.remote_back.pop() {
+                                        this.navigate_remote(path, false, window, cx);
+                                    }
+                                })),
+                        )
+                        .child(
+                            Button::new("remote-parent")
+                                .ghost()
+                                .icon(IconName::ArrowUp)
+                                .tooltip("Parent folder")
+                                .disabled(parent.is_none() || !available)
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    if let Some(parent) = parent.clone() {
+                                        this.navigate_remote(parent, true, window, cx);
+                                    }
+                                })),
+                        )
+                        .child(
+                            Input::new(&self.remote_path_input)
+                                .appearance(false)
+                                .aria_label("Remote folder path")
+                                .flex_1()
+                                .min_w_0(),
+                        )
+                        .child(
+                            Button::new("remote-new-folder")
+                                .ghost()
+                                .icon(IconName::Plus)
+                                .tooltip("New folder")
+                                .accessibility_label("New folder")
+                                .disabled(
+                                    !self.allow_upload
+                                        || !self.remote_directory_ready()
+                                        || !self.remote.can_mkdir
+                                        || self.remote.management_busy
+                                        || self.remote.listed_path.as_deref()
+                                            != Some(self.remote.remote_path.as_str()),
+                                )
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.new_folder_side = Some(FileSide::Remote);
+                                    this.new_folder_input.update(cx, |input, cx| {
+                                        input.set_value("", window, cx);
+                                    });
+                                    cx.notify();
+                                })),
+                        ),
+                )
+            })
             .child(self.table_header(FileSide::Remote, cx))
-            .child(
-                if self.remote.entries.is_empty()
-                    || self.remote.listing
-                    || self.remote.error.is_some()
-                {
-                    crate::ui::empty_state(message, cx).into_any_element()
-                } else {
-                    uniform_list(
-                        "remote-files",
-                        self.remote.entries.len(),
-                        cx.processor(|this, range: Range<usize>, _, cx| {
-                            range
-                                .map(|index| this.render_remote_row(index, cx))
-                                .collect::<Vec<_>>()
-                        }),
-                    )
-                    .flex_1()
-                    .min_h_0()
-                    .into_any_element()
-                },
-            )
+            .child(if safari_empty {
+                crate::ui::empty_icon(cx).into_any_element()
+            } else if self.remote.entries.is_empty()
+                || (self.safari_mode
+                    && (self.safari_requested || self.remote.safari_path.is_none()))
+                || self.remote.listing
+                || self.remote.error.is_some()
+            {
+                crate::ui::empty_state(message, cx).into_any_element()
+            } else {
+                uniform_list(
+                    "remote-files",
+                    self.remote.entries.len(),
+                    cx.processor(|this, range: Range<usize>, _, cx| {
+                        range
+                            .map(|index| this.render_remote_row(index, cx))
+                            .collect::<Vec<_>>()
+                    }),
+                )
+                .flex_1()
+                .min_h_0()
+                .into_any_element()
+            })
             .into_any_element()
     }
 }
@@ -2957,10 +3242,12 @@ impl FileTransferView {
     fn render_transfer_actions(&self, cx: &mut Context<Self>) -> AnyElement {
         let caps = self.remote.caps.unwrap_or_default();
         let upload_enabled = self.allow_upload
+            && self.remote_directory_ready()
             && caps.upload
             && self.remote.listed_path.as_deref() == Some(self.remote.remote_path.as_str())
             && self.local_selected_paths.iter().any(|path| path.is_file());
         let download_enabled = caps.download
+            && self.remote_directory_ready()
             && !self.remote.download_blocked
             && self.remote_selected_names.iter().any(|name| {
                 self.remote
@@ -3298,7 +3585,9 @@ impl FileTransferView {
 
 impl Render for FileTransferView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.sync_component_dialog(window, cx);
+        if let Some(path) = self.pending_remote.take() {
+            self.navigate_remote(path, true, window, cx);
+        }
         let fullscreen = window.is_fullscreen();
         v_flex()
             .id("file-transfer-drop-target")
@@ -3347,6 +3636,38 @@ impl Render for FileTransferView {
                 this.child(self.render_fullscreen_toolbar(cx))
             })
             .into_any_element()
+    }
+}
+
+fn safari_folder_label(index: usize, folder: &SafariFolder) -> String {
+    if folder.downloads {
+        return "Downloads".into();
+    }
+    let time = DateTime::from_timestamp(folder.modified, 0)
+        .map(|time| time.with_timezone(&Local).format("%m-%d %H:%M").to_string())
+        .unwrap_or_default();
+    format!("{time} · {}", index + 1)
+}
+
+fn safari_folder_menu(
+    view: Entity<FileTransferView>,
+    folders: Vec<SafariFolder>,
+) -> impl Fn(
+    gpui_component::menu::PopupMenu,
+    &mut Window,
+    &mut Context<gpui_component::menu::PopupMenu>,
+) -> gpui_component::menu::PopupMenu {
+    move |mut menu, _, _| {
+        for (index, folder) in folders.iter().enumerate() {
+            let owner = view.clone();
+            let path = folder.path.clone();
+            menu = menu.item(
+                PopupMenuItem::new(safari_folder_label(index, folder)).on_click(move |_, _, cx| {
+                    owner.update(cx, |this, cx| this.select_safari_folder(path.clone(), cx));
+                }),
+            );
+        }
+        menu
     }
 }
 
@@ -3869,7 +4190,7 @@ mod tests {
             });
             view = Some(entity.clone());
             gpui_component::Root::new(
-                cx.new(|_| crate::file_transfer_window::dialogs::TransferShell(entity)),
+                cx.new(|cx| crate::file_transfer_window::dialogs::TransferShell::new(entity, cx)),
                 window,
                 cx,
             )
@@ -3898,6 +4219,253 @@ mod tests {
         });
     }
     #[gpui::test]
+    fn rename_submit_closes_dialog_before_the_next_render(cx: &mut TestAppContext) {
+        use gpui_component::WindowExt;
+        let directory = tempfile::tempdir().unwrap();
+        let memory = test_memory();
+        memory.folders.borrow_mut().local = Some(directory.path().into());
+        let (session, _peer) = SessionHandle::test_pair();
+        cx.update(gpui_component::init);
+        let mut view = None;
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let entity = cx.new(|cx| {
+                FileTransferView::new(
+                    "test".into(),
+                    session.file_client(),
+                    true,
+                    memory,
+                    window,
+                    cx,
+                )
+            });
+            view = Some(entity.clone());
+            gpui_component::Root::new(
+                cx.new(|cx| crate::file_transfer_window::dialogs::TransferShell::new(entity, cx)),
+                window,
+                cx,
+            )
+        });
+        let view = view.unwrap();
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.focus.focus(window, cx);
+                let path = directory.path().join("before.txt");
+                std::fs::write(&path, b"unchanged").unwrap();
+                view.pending_rename = Some(super::FileDetails {
+                    side: FileSide::Local,
+                    name: "before.txt".into(),
+                    path: path.to_string_lossy().into(),
+                    is_dir: false,
+                    size: Some(9),
+                    modified: None,
+                });
+                view.new_folder_input
+                    .update(cx, |input, cx| input.set_value("after.txt", window, cx));
+                cx.notify();
+            })
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.update(|window, cx| {
+            view.read_with(cx, |view, cx| {
+                assert!(view.new_folder_input.focus_handle(cx).is_focused(window));
+            })
+        });
+        assert!(cx.debug_bounds("transfer-dialog-layer").is_some());
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.new_folder_input
+                    .update(cx, |input, cx| input.set_value("../invalid", window, cx));
+                view.rename_item(cx);
+                assert!(view.pending_rename.is_some());
+                assert!(view.status_error.is_some());
+            })
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(cx.debug_bounds("transfer-dialog-layer").is_some());
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.new_folder_input
+                    .update(cx, |input, cx| input.set_value("after.txt", window, cx))
+            })
+        });
+        view.update(cx, |view, cx| view.rename_item(cx));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(cx.debug_bounds("transfer-dialog-layer").is_none());
+        cx.update(|window, cx| {
+            view.read_with(cx, |view, cx| {
+                assert!(view.component_dialog.is_none());
+                assert!(view.focus.is_focused(window));
+                assert!(!directory.path().join("before.txt").exists());
+                assert_eq!(
+                    std::fs::read(directory.path().join("after.txt")).unwrap(),
+                    b"unchanged"
+                );
+            });
+            assert!(!window.has_active_dialog(cx));
+        });
+    }
+    #[gpui::test]
+    fn safari_is_fixed_and_switching_directories_blocks_old_folder_actions(
+        cx: &mut TestAppContext,
+    ) {
+        let memory = test_memory();
+        let (session, mut peer) = SessionHandle::test_pair();
+        cx.update(gpui_component::init);
+        let mut entity = None;
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let view = cx.new(|cx| {
+                FileTransferView::new(
+                    "fixture".into(),
+                    session.file_client(),
+                    true,
+                    memory.clone(),
+                    window,
+                    cx,
+                )
+            });
+            entity = Some(view.clone());
+            gpui_component::Root::new(
+                cx.new(|cx| super::dialogs::TransferShell::new(view, cx)),
+                window,
+                cx,
+            )
+        });
+        let view = entity.unwrap();
+        while peer.commands.try_recv().is_ok() {}
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.remote.caps = Some(TightFileCaps {
+                    list: true,
+                    upload: true,
+                    download: true,
+                });
+                view.remote.remote_path = "/Library".into();
+                view.remote.listed_path = Some("/Library".into());
+                view.remote.can_mkdir = true;
+                view.show_safari(cx);
+                assert!(!view.remote_directory_ready());
+                view.new_folder_side = Some(super::FileSide::Remote);
+                view.new_folder_input.update(cx, |input, cx| {
+                    input.set_value("should-not-exist", window, cx)
+                });
+                view.create_folder(cx);
+            })
+        });
+        let commands: Vec<_> = std::iter::from_fn(|| peer.commands.try_recv().ok()).collect();
+        assert!(commands.iter().any(|command| matches!(
+            command,
+            rv_session::SessionCommand::File(rv_session::FileCommand::SafariDownloads)
+        )));
+        assert!(!commands.iter().any(|command| matches!(
+            command,
+            rv_session::SessionCommand::File(rv_session::FileCommand::CreateFolder(_))
+        )));
+        cx.update(|window, cx| {
+            view.update(cx, |view, _| {
+                view.local_loading = false;
+            });
+            window.draw(cx).clear(cx);
+        });
+        assert!(cx.debug_bounds("remote-back").is_none());
+        assert!(cx.debug_bounds("remote-parent").is_none());
+        assert!(cx.debug_bounds("remote-new-folder").is_none());
+        cx.update(|window, cx| view.update(cx, |view, cx| {
+            view.remote.safari_path = Some("/Containers/Shared/AppGroup/12345678-1234-1234-1234-123456789abc/File Provider Storage/Downloads".into());
+            view.safari_requested = false;
+            view.remote.safari_busy = false;
+            view.remote.remote_path = view.remote.safari_path.clone().unwrap();
+            view.remote.listed_path = Some(view.remote.remote_path.clone());
+            view.show_files(cx);
+            assert!(!view.remote_directory_ready());
+            let path = view.pending_remote.take().unwrap();
+            view.navigate_remote(path, true, window, cx);
+            assert_eq!(view.remote.remote_path, "/Library");
+            assert!(!view.remote_directory_ready(), "List acknowledgement is required before transfers resume");
+            view.remote.listing = false;
+            view.remote.listed_path = Some("/Library".into());
+            assert!(!view.remote_directory_ready(), "the pending target must also be reconciled");
+            view.remote_target = None;
+            assert!(view.remote_directory_ready());
+        }));
+    }
+
+    #[gpui::test]
+    fn safari_refresh_reconciles_a_finished_lookup_without_observing_busy(cx: &mut TestAppContext) {
+        let (session, mut peer) = SessionHandle::test_pair();
+        let old = "/Containers/Data/Application/12345678-1234-1234-1234-123456789abc/tmp/QuickLookContent-old".to_owned();
+        let new = "/Containers/Data/Application/12345678-1234-1234-1234-123456789abc/tmp/QuickLookContent-new".to_owned();
+        {
+            let mut state = peer.file_state.lock().unwrap();
+            state.caps = Some(TightFileCaps {
+                list: true,
+                upload: true,
+                download: true,
+            });
+            state.remote_path = old.clone();
+            state.listed_path = Some(old.clone());
+            state.safari_path = Some(old.clone());
+            state.safari_folders = vec![rv_session::SafariFolder {
+                path: old.clone(),
+                modified: 1,
+                downloads: false,
+            }];
+            state.revision += 1;
+        }
+        cx.update(gpui_component::init);
+        let mut entity = None;
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let view = cx.new(|cx| {
+                FileTransferView::new(
+                    "fixture".into(),
+                    session.file_client(),
+                    true,
+                    test_memory(),
+                    window,
+                    cx,
+                )
+            });
+            entity = Some(view.clone());
+            gpui_component::Root::new(
+                cx.new(|cx| super::dialogs::TransferShell::new(view, cx)),
+                window,
+                cx,
+            )
+        });
+        let view = entity.unwrap();
+        while peer.commands.try_recv().is_ok() {}
+        view.update(cx, |view, _| {
+            view.safari_mode = true;
+            view.safari_selected = Some(old.clone());
+            view.refresh_remote();
+            assert!(view.safari_requested);
+            assert!(!view.remote_directory_ready());
+        });
+        // Deliver only the final snapshot: the old directory disappeared.
+        {
+            let mut state = peer.file_state.lock().unwrap();
+            state.safari_busy = false;
+            state.safari_path = Some(new.clone());
+            state.safari_folders = vec![rv_session::SafariFolder {
+                path: new.clone(),
+                modified: 2,
+                downloads: false,
+            }];
+            state.revision += 1;
+        }
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.poll_remote(cx);
+                assert_eq!(view.safari_selected.as_ref(), Some(&new));
+                assert_eq!(view.pending_remote.as_ref(), Some(&new));
+                assert!(!view.remote_directory_ready());
+                let path = view.pending_remote.take().unwrap();
+                view.navigate_remote(path, true, window, cx);
+            })
+        });
+        assert!(std::iter::from_fn(|| peer.commands.try_recv().ok()).any(|command| matches!(command, rv_session::SessionCommand::File(rv_session::FileCommand::List(path)) if path == new)));
+    }
+
+    #[gpui::test]
     fn reopening_transfer_view_restores_folders_and_photos_mode(cx: &mut TestAppContext) {
         let directory = tempfile::tempdir().unwrap();
         let nested = directory.path().join("last-visited");
@@ -3920,7 +4488,7 @@ mod tests {
             });
             first = Some(view.clone());
             gpui_component::Root::new(
-                cx.new(|_| crate::file_transfer_window::dialogs::TransferShell(view)),
+                cx.new(|cx| crate::file_transfer_window::dialogs::TransferShell::new(view, cx)),
                 window,
                 cx,
             )
@@ -4056,6 +4624,12 @@ mod tests {
                 remote_sort: FileSort::default(),
                 active_side: FileSide::Remote,
                 photo_mode: false,
+                safari_mode: false,
+                safari_requested: false,
+                safari_selected: None,
+                files_remote: None,
+                pending_remote: None,
+                remote_target: None,
                 photo_selected: None,
                 photo_selected_ids: Vec::new(),
                 photo_anchor: None,
@@ -4074,7 +4648,7 @@ mod tests {
             });
             view_entity = Some(view.clone());
             gpui_component::Root::new(
-                cx.new(|_| crate::file_transfer_window::dialogs::TransferShell(view)),
+                cx.new(|cx| crate::file_transfer_window::dialogs::TransferShell::new(view, cx)),
                 window,
                 cx,
             )
@@ -4215,6 +4789,12 @@ mod tests {
                 remote_sort: FileSort::default(),
                 active_side: FileSide::Remote,
                 photo_mode: false,
+                safari_mode: false,
+                safari_requested: false,
+                safari_selected: None,
+                files_remote: None,
+                pending_remote: None,
+                remote_target: None,
                 photo_selected: Some("photo-0".into()),
                 photo_selected_ids: vec!["photo-0".into(), "photo-1".into()],
                 photo_anchor: None,
@@ -4233,7 +4813,7 @@ mod tests {
             });
             view_entity = Some(view.clone());
             gpui_component::Root::new(
-                cx.new(|_| crate::file_transfer_window::dialogs::TransferShell(view)),
+                cx.new(|cx| crate::file_transfer_window::dialogs::TransferShell::new(view, cx)),
                 window,
                 cx,
             )
@@ -4438,6 +5018,12 @@ mod tests {
                 remote_sort: FileSort::default(),
                 active_side: FileSide::Remote,
                 photo_mode: true,
+                safari_mode: false,
+                safari_requested: false,
+                safari_selected: None,
+                files_remote: None,
+                pending_remote: None,
+                remote_target: None,
                 photo_selected: Some("photo-0".into()),
                 photo_selected_ids: vec!["photo-0".into(), "photo-1".into()],
                 photo_anchor: None,
@@ -4456,7 +5042,7 @@ mod tests {
             });
             view_entity = Some(view.clone());
             gpui_component::Root::new(
-                cx.new(|_| crate::file_transfer_window::dialogs::TransferShell(view)),
+                cx.new(|cx| crate::file_transfer_window::dialogs::TransferShell::new(view, cx)),
                 window,
                 cx,
             )

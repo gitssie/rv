@@ -41,7 +41,8 @@ impl RunControl {
             true
         });
     }
-    async fn cancelled(&self) {
+    /// Wait for cancellation when coordinating business steps outside the runner.
+    pub async fn cancelled(&self) {
         let mut receiver = self.0.subscribe();
         loop {
             if *receiver.borrow_and_update() == Request::Cancelled {
@@ -216,7 +217,7 @@ impl<D: Device> Runner<D> {
         }
         // Validate all input references before the first possible mutation.
         for step in &workflow.steps {
-            if let Action::InputText { input } = &step.action {
+            if let Action::InputText { input } | Action::WaitForInput { input, .. } = &step.action {
                 let value = inputs
                     .get(input)
                     .ok_or(Failure::known(FailureReason::MissingInput))?;
@@ -255,6 +256,41 @@ impl<D: Device> Runner<D> {
                     )
                     .await?;
                 },
+                Action::WaitForInput {
+                    input,
+                    case_sensitive,
+                    region,
+                } => {
+                    let expected = inputs
+                        .get(input)
+                        .ok_or(Failure::known(FailureReason::MissingInput))?;
+                    let selector = crate::TextSelector {
+                        text: String::new(),
+                        mode: crate::TextMatch::Exact,
+                        case_sensitive: *case_sensitive,
+                        region: *region,
+                    };
+                    loop {
+                        let observed =
+                            bounded(self.device.observe(), control, deadline, false).await?;
+                        check_observation(&observed, &workflow.bundle_id)?;
+                        if observed.elements.iter().any(|element| {
+                            selector.matches_value(expected, element, observed.frame)
+                        }) {
+                            break;
+                        }
+                        bounded(
+                            async {
+                                tokio::time::sleep(self.options.poll_interval).await;
+                                Ok(())
+                            },
+                            control,
+                            deadline,
+                            false,
+                        )
+                        .await?;
+                    }
+                }
                 Action::Tap { target } => {
                     let observed = bounded(self.device.observe(), control, deadline, false).await?;
                     check_observation(&observed, &workflow.bundle_id)?;
@@ -309,6 +345,15 @@ fn check_observation(observation: &Observation, expected_bundle: &str) -> Result
 fn locate(target: &Target, observation: &Observation) -> Result<Point, Failure> {
     let frame = observation.frame;
     let point = match target {
+        Target::FramePoint {
+            frame: expected,
+            point,
+        } => {
+            if *expected != frame {
+                return Err(Failure::known(FailureReason::TargetNotFound));
+            }
+            *point
+        }
         Target::Screen { point } => Point {
             x: point.x * f64::from(frame.width),
             y: point.y * f64::from(frame.height),

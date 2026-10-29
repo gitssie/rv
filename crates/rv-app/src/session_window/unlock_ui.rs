@@ -499,6 +499,35 @@ impl SessionView {
             _ => {}
         }
     }
+    /// Main device-list action, backed by the same observed state and commands.
+    pub(crate) fn render_home_lock_button(
+        &self,
+        read_only: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        if read_only || self.phase != Phase::Connected || self.unlock.screen_locked.is_none() {
+            return Button::new("device-lock-unknown")
+                .ghost()
+                .icon(
+                    if self.phase == Phase::Connected && self.unlock.screen_locked == Some(false) {
+                        crate::assets::AppActionIcon::Unlock
+                    } else {
+                        crate::assets::AppActionIcon::Lock
+                    },
+                )
+                .tooltip(if read_only {
+                    "只读模式，无法操作锁屏"
+                } else if self.phase == Phase::Connected {
+                    "锁屏状态未知"
+                } else {
+                    "设备未连接"
+                })
+                .accessibility_label("锁屏状态未知")
+                .disabled(true)
+                .into_any_element();
+        }
+        self.render_unlock_button(cx).into_any_element()
+    }
     pub(super) fn render_unlock_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let view = cx.entity();
         let state = self.unlock.visual_state();
@@ -529,6 +558,7 @@ impl SessionView {
             .loading(state == UnlockVisualState::Unlocking)
             .text_color(color)
             .accessibility_label(label)
+            .tooltip(label)
             .debug_selector(|| "unlock-screen".into())
             .disabled(
                 !(if self.unlock.step == Step::Locking {
@@ -540,7 +570,10 @@ impl SessionView {
                 }) || self.unlock.editing
                     || self.unlock.busy,
             )
-            .on_click(cx.listener(|this, _, _, cx| this.click_unlock(cx)))
+            .on_click(cx.listener(|this, _, _, cx| {
+                cx.stop_propagation();
+                this.click_unlock(cx);
+            }))
             .context_menu(move |menu, _, _| {
                 let edit = view.clone();
                 let clear = view.clone();
@@ -556,7 +589,7 @@ impl SessionView {
                 )
             })
     }
-    pub(super) fn sync_unlock_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn sync_unlock_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         use gpui_component::{WindowExt, dialog::DialogFooter};
         if self.unlock_dialog_open == self.unlock.editing() {
             return;
@@ -570,23 +603,26 @@ impl SessionView {
             return;
         }
         let owner = cx.entity();
-        window.open_dialog(cx, move |dialog, _, cx| {
+        window.open_dialog(cx, move |dialog, window, cx| {
             owner.update(cx, |this, cx| {
                 let submit = cx.entity();
                 let cancel = submit.clone();
                 let close = submit.clone();
-                dialog
+                crate::ui::compact_dialog(dialog, window, 160.)
                     .title("设置锁屏密码")
                     .max_h(relative(0.9))
                     .keyboard(!this.unlock.busy)
                     .close_button(!this.unlock.busy)
                     .overlay_closable(!this.unlock.busy)
                     .child(
-                        v_flex()
+                        crate::ui::tool_section()
                             .id("unlock-setting")
                             .debug_selector(|| "unlock-setting".into())
-                            .gap_3()
-                            .child(Input::new(&this.unlock.input).disabled(this.unlock.busy))
+                            .child(
+                                Input::new(&this.unlock.input)
+                                    .aria_label("6 位锁屏密码")
+                                    .disabled(this.unlock.busy),
+                            )
                             .children(
                                 this.unlock
                                     .validation

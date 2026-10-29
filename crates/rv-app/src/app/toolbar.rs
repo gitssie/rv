@@ -11,6 +11,23 @@ use gpui_component::{
 
 impl AddressBookApp {
     pub(super) fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let unread_accounts = self
+            .chat
+            .accounts
+            .iter()
+            .filter_map(|account| {
+                account
+                    .unread
+                    .filter(|count| *count > 0)
+                    .map(|count| format!("{}：{count}", account.title))
+            })
+            .collect::<Vec<_>>();
+        let has_unread = !unread_accounts.is_empty();
+        let message_tooltip = if has_unread {
+            format!("未读消息\n{}", unread_accounts.join("\n"))
+        } else {
+            "消息：会话与通知".to_string()
+        };
         h_flex()
             .id("management-toolbar")
             .debug_selector(|| "management-toolbar".into())
@@ -48,19 +65,17 @@ impl AddressBookApp {
                     .on_click(cx.listener(|this, _, _, cx| this.reload_home(cx))),
             )
             .child(
-                Badge::new()
-                    .count(self.chat.conversations.iter().filter(|c| c.unread).count())
-                    .child(
-                        Button::new("chat-open")
-                            .occlude()
-                            .debug_selector(|| "chat-open".into())
-                            .ghost()
-                            .icon(FunctionIcon::Chat)
-                            .accessibility_label("聊天")
-                            .tooltip("统一聊天，数字为未读会话数")
-                            .selected(matches!(self.modal, super::Modal::Chat))
-                            .on_click(cx.listener(|this, _, _, cx| this.open_chat(cx))),
-                    ),
+                Badge::new().dot().count(usize::from(has_unread)).child(
+                    Button::new("chat-open")
+                        .occlude()
+                        .debug_selector(|| "chat-open".into())
+                        .ghost()
+                        .icon(FunctionIcon::Chat)
+                        .accessibility_label("消息")
+                        .tooltip(message_tooltip)
+                        .selected(self.chat.window.is_some())
+                        .on_click(cx.listener(|this, _, window, cx| this.open_chat(window,cx))),
+                ),
             )
             .child(div().flex_1())
             .child(

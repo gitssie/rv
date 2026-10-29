@@ -110,7 +110,10 @@ impl StorePaths {
     }
     pub fn load_unlock_code(&self, req: &ConnectRequest) -> Result<Option<UnlockCode>, StoreError> {
         match read(&crate::database::open(&self.database)?, credential_id(req))?.unlock {
-            Some(saved) if saved.host == req.host && saved.port == req.port => {
+            Some(saved)
+                if req.connection_id.is_some()
+                    || (saved.host == req.host && saved.port == req.port) =>
+            {
                 UnlockCode::new(saved.code).map(Some)
             }
             _ => Ok(None),

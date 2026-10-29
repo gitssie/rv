@@ -10,6 +10,7 @@ description = "Host-only offline App business strategies and HTTP tasks"
 workspace = true
 
 [dependencies]
+tracing.workspace = true
 rv-core.workspace = true
 serde_json.workspace = true
 serde.workspace = true
@@ -22,7 +23,7 @@ fs2 = "0.4"
 image = { workspace = true, features = ["webp", "gif"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 tokio.workspace = true
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "stream", "json", "socks"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "stream", "json", "socks", "multipart"] }
 
 [dev-dependencies]
 tempfile = "3"

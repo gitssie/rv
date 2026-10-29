@@ -2,12 +2,13 @@ use super::*;
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::{
     Disableable,
+    form::{Field, Form},
     input::{Input, Textarea},
     v_flex,
 };
 impl AddressBookApp {
     pub(in crate::app) fn app_editor_title(&self) -> &'static str {
-        "编辑 App 信息"
+        "编辑账号配置"
     }
     pub(in crate::app) fn render_app_editor(&self, cx: &mut Context<Self>) -> AnyElement {
         if self.home.editing.is_none() {
@@ -18,22 +19,17 @@ impl AddressBookApp {
             .debug_selector(|| "app-edit-form".into())
             .gap_3()
             .child(
-                v_flex()
-                    .gap_1()
-                    .child(crate::typography::label("名称", cx))
-                    .child(Input::new(&self.home.title)),
-            )
-            .child(
-                v_flex()
-                    .gap_1()
-                    .child(crate::typography::label("标签", cx))
-                    .child(Input::new(&self.home.tags)),
-            )
-            .child(
-                v_flex()
-                    .gap_1()
-                    .child(crate::typography::label("备注", cx))
-                    .child(Textarea::new(&self.home.note)),
+                Form::vertical()
+                    .child(
+                        Field::new()
+                            .label("标签")
+                            .child(Input::new(&self.home.tags)),
+                    )
+                    .child(
+                        Field::new()
+                            .label("备注")
+                            .child(Textarea::new(&self.home.note)),
+                    ),
             )
             .child(self.render_proxy_binding(cx))
             .into_any_element()

@@ -3,6 +3,7 @@ mod account;
 mod apple_accounts;
 mod code_url;
 mod diagnostics;
+pub mod registration;
 use crate::mailbox;
 mod operation_stream;
 mod spec;
@@ -20,6 +21,12 @@ use tokio::sync::mpsc;
 #[derive(Clone)]
 pub enum FunctionCommand {
     RefreshAccountState,
+    Register {
+        text: String,
+        marketing: bool,
+        accept_terms: bool,
+    },
+    StopRegistration,
     Scoped {
         id: String,
         command: Box<FunctionCommand>,
@@ -62,6 +69,7 @@ impl std::fmt::Debug for FunctionCommand {
 }
 #[derive(Clone)]
 pub enum FunctionEvent {
+    Registration(registration::Status),
     AccountStateLoading,
     AccountState(Result<Value, String>),
     ForOperation {
@@ -87,6 +95,7 @@ pub enum FunctionEvent {
 impl std::fmt::Debug for FunctionEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Registration(status) => f.debug_tuple("Registration").field(status).finish(),
             Self::AccountStateLoading => f.write_str("AccountStateLoading"),
             Self::AccountState(_) => f.write_str("AccountState([redacted])"),
             Self::ForOperation { id, .. } => f.debug_tuple("ForOperation").field(id).finish(),
@@ -125,6 +134,7 @@ pub(crate) struct FunctionRuntime {
     tasks: Vec<tokio::task::JoinHandle<()>>,
     last_family: String,
     announce: bool,
+    registration: registration::Runtime,
     account_refresh_pending: bool,
     account_refresh_again: bool,
     apple_accounts: Option<apple_accounts::Context>,
@@ -159,13 +169,14 @@ impl FunctionRuntime {
             tasks: vec![],
             last_family: String::new(),
             announce: false,
+            registration: registration::Runtime::default(),
             account_refresh_pending: false,
             account_refresh_again: false,
             apple_accounts: None,
         }
     }
-    pub(crate) fn enable_apple_account_storage(&mut self,request:&rv_core::ConnectRequest){
-        self.apple_accounts=Some(apple_accounts::Context::system(request));
+    pub(crate) fn enable_apple_account_storage(&mut self, request: &rv_core::ConnectRequest) {
+        self.apple_accounts = Some(apple_accounts::Context::system(request));
     }
     pub(crate) fn set_http_client(&mut self, client: Option<crate::phone_http::PhoneHttpClient>) {
         self.http_client = client;
@@ -232,10 +243,50 @@ impl FunctionRuntime {
             FunctionCommand::Scoped { id, command } => (Some(id), *command),
             c => (None, c),
         };
+        if matches!(command, FunctionCommand::StopRegistration) {
+            self.registration.cancel();
+            return;
+        }
+        if (!self.allowed || self.endpoint.is_none())
+            && matches!(command, FunctionCommand::Register { .. })
+        {
+            send(FunctionEvent::Registration(registration::Status {
+                running: false,
+                message: "功能连接不可用，请重新连接",
+            }));
+            return;
+        }
         if !self.allowed || self.endpoint.is_none() {
             send(FunctionEvent::Error(
                 "功能连接不可用，请检查 ZXTouch 端口并重新连接".into(),
             ));
+            return;
+        }
+        if let FunctionCommand::Register {
+            text,
+            marketing,
+            accept_terms,
+        } = command
+        {
+            if let Some(client) = self.http_client.clone() {
+                self.registration.start(
+                    client,
+                    text,
+                    marketing,
+                    accept_terms,
+                    self.events.clone(),
+                    send,
+                );
+            } else {
+                send(FunctionEvent::Registration(registration::Status {
+                    running: false,
+                    message: "ZXTouch 控制客户端不可用",
+                }));
+            }
+            return;
+        }
+        if self.registration.active() {
+            send(FunctionEvent::Error("注册正在执行，请先停止注册".into()));
             return;
         }
         if matches!(command, FunctionCommand::RefreshAccountState) {
@@ -274,7 +325,7 @@ impl FunctionRuntime {
             let (events, mut rx) = mpsc::channel(32);
             let shared = self.events.clone();
             let key = family.clone();
-            let account_context=self.apple_accounts.clone();
+            let account_context = self.apple_accounts.clone();
             self.tasks.push(tokio::spawn(async move {
                 let forward = async move {
                     let mut diagnostics = diagnostics::OperationLog::default();
@@ -292,9 +343,12 @@ impl FunctionRuntime {
                         }
                     }
                 };
-                let work=async move {
-                    if let Some(ctx)=account_context {apple_accounts::run(client,commands,events,ctx).await;}
-                    else {worker(client,commands,events).await;}
+                let work = async move {
+                    if let Some(ctx) = account_context {
+                        apple_accounts::run(client, commands, events, ctx).await;
+                    } else {
+                        worker(client, commands, events).await;
+                    }
                 };
                 tokio::join!(work, forward);
             }));
@@ -307,6 +361,12 @@ impl FunctionRuntime {
                 event: Box::new(FunctionEvent::Error("此功能请求繁忙，请稍后重试".into())),
             });
         }
+    }
+    pub(crate) fn registration_active(&self) -> bool {
+        self.registration.active()
+    }
+    pub(crate) fn cancel_registration(&self) {
+        self.registration.cancel();
     }
     pub fn advance(&mut self, send: &impl Fn(FunctionEvent)) {
         if self.announce {
@@ -499,13 +559,15 @@ async fn worker_with_provider(
     commands: mpsc::Receiver<FunctionCommand>,
     events: mpsc::Sender<FunctionEvent>,
     mailbox_provider: &dyn mailbox::MailboxProvider,
-) { worker_with_context(client,commands,events,mailbox_provider,None).await; }
+) {
+    worker_with_context(client, commands, events, mailbox_provider, None).await;
+}
 async fn worker_with_context(
     client: crate::phone_http::PhoneHttpClient,
     mut commands: mpsc::Receiver<FunctionCommand>,
     events: mpsc::Sender<FunctionEvent>,
     mailbox_provider: &dyn mailbox::MailboxProvider,
-    account_context:Option<apple_accounts::Context>,
+    account_context: Option<apple_accounts::Context>,
 ) {
     // Every invoke/query/code submission reuses the session HTTP/2 pool.
     let _ = events.send(FunctionEvent::Available(true)).await;
@@ -544,7 +606,9 @@ async fn worker_with_context(
         };
         let request = match command {
             Some(
-                FunctionCommand::Scoped { .. }
+                FunctionCommand::Register { .. }
+                | FunctionCommand::StopRegistration
+                | FunctionCommand::Scoped { .. }
                 | FunctionCommand::RefreshAccountState
                 | FunctionCommand::InvokeForAccount { .. },
             ) => continue,
@@ -650,18 +714,36 @@ async fn worker_with_context(
                     }
                     parsed.params["apple_id"] = json!(target);
                 }
-                if matches!(spec.method,"enableICloud"|"disableFindMy") {
-                    if let Some(ctx)=&account_context {
-                        if let Some(id)=parsed.params["apple_id"].as_str() {
+                if matches!(spec.method, "enableICloud" | "disableFindMy") {
+                    if let Some(ctx) = &account_context {
+                        if let Some(id) = parsed.params["apple_id"].as_str() {
                             match ctx.load(id).await {
-                                Ok(Some(account))=>{parsed.params["password"]=json!(account.password);if parsed.code_url.is_none(){parsed.code_url=account.verification_code_url;}},
-                                Ok(None)=>(),Err(e)=>{let _=events.send(FunctionEvent::Error(e)).await;continue;}
+                                Ok(Some(account)) => {
+                                    parsed.params["password"] = json!(account.password);
+                                    if parsed.code_url.is_none() {
+                                        parsed.code_url = account.verification_code_url;
+                                    }
+                                }
+                                Ok(None) => (),
+                                Err(e) => {
+                                    let _ = events.send(FunctionEvent::Error(e)).await;
+                                    continue;
+                                }
                             }
                         }
                     }
                 }
-                if matches!(spec.method,"signInAppStore"|"enableICloud"|"disableFindMy"|"changePassword") && parsed.params["password"].as_str().is_none_or(str::is_empty) {
-                    let _=events.send(FunctionEvent::Error("首次使用此 Apple ID，请提供登录密码".into())).await;continue;
+                if matches!(
+                    spec.method,
+                    "signInAppStore" | "enableICloud" | "disableFindMy" | "changePassword"
+                ) && parsed.params["password"].as_str().is_none_or(str::is_empty)
+                {
+                    let _ = events
+                        .send(FunctionEvent::Error(
+                            "首次使用此 Apple ID，请提供登录密码".into(),
+                        ))
+                        .await;
+                    continue;
                 }
                 if let Some(credentials) = parsed.mailbox.take() {
                     let _ = events
@@ -870,8 +952,14 @@ async fn worker_with_context(
                     continue;
                 }
             };
-            if invocation && body["method"]=="changePassword" && !wire.apple_password_change {
-                let _=events.send(FunctionEvent::Error("手机版暂不支持 Apple ID 改密，请更新 TrollVNC 后再试；原密码保持不变".into())).await;continue;
+            if invocation && body["method"] == "changePassword" && !wire.apple_password_change {
+                let _ = events
+                    .send(FunctionEvent::Error(
+                        "手机版暂不支持 Apple ID 改密，请更新 TrollVNC 后再试；原密码保持不变"
+                            .into(),
+                    ))
+                    .await;
+                continue;
             }
             let action = body["action"].as_str().unwrap_or("").to_owned();
             let streaming = task == 32 && wire.app_state_stream;

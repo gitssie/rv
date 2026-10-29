@@ -11,6 +11,44 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[tokio::test]
+async fn offline_register_is_terminal_and_controller_can_close() {
+    let port = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut connection = Connection::new("offline", "127.0.0.1", 5900);
+    connection.zxtouch_port = Some(port.local_addr().unwrap().port());
+    let (commands, rx) = tokio::sync::mpsc::unbounded_channel();
+    let (events, received) = std::sync::mpsc::channel();
+    commands
+        .send(crate::SessionCommand::Function(
+            crate::FunctionCommand::Register {
+                text: "a@example.test user secret".into(),
+                marketing: false,
+                accept_terms: true,
+            },
+        ))
+        .unwrap();
+    let task = tokio::spawn(super::run(
+        ConnectRequest::from_connection(&connection, None),
+        rx,
+        events,
+    ));
+    let event =
+        tokio::task::spawn_blocking(move || received.recv_timeout(Duration::from_secs(2)).unwrap())
+            .await
+            .unwrap();
+    assert!(matches!(
+        event,
+        SessionEvent::Functions(crate::FunctionEvent::Registration(
+            crate::functions::registration::Status { running: false, .. }
+        ))
+    ));
+    commands.send(crate::SessionCommand::Close).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
 #[test]
 fn independent_control_recovers_login_and_token_without_connecting_vnc() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();

@@ -1,9 +1,9 @@
-//! Explicit card deletion; phone deletion must finish before local data is removed.
+//! Local card deletion. Shadow owns phone backup management.
 use super::*;
+use gpui::prelude::FluentBuilder;
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::{
     Disableable,
-    checkbox::Checkbox,
     dialog::{AlertDialog, DialogFooter},
 };
 
@@ -18,7 +18,10 @@ pub(in crate::app) struct AppDeletion {
 }
 impl AddressBookApp {
     pub(in crate::app) fn open_app_delete(&mut self, id: AppId, cx: &mut Context<Self>) {
-        if self.read_only || self.home.jobs.contains(&id) {
+        if self.read_only
+            || self.home.jobs.contains(&id)
+            || self.home.backup_syncing.contains_key(&id)
+        {
             return;
         }
         let Ok(app) = WorkspaceStore::open(self.book.paths()).and_then(|store| store.load(&id))
@@ -27,8 +30,12 @@ impl AddressBookApp {
         };
         self.home.deletion = Some(AppDeletion {
             id,
-            title: app.title,
-            phone: true,
+            title: self
+                .home
+                .plugins
+                .for_bundle(&app.bundle_id)
+                .display_title(&app),
+            phone: false,
             busy: false,
             error: None,
             started: false,
@@ -50,7 +57,10 @@ impl AddressBookApp {
         let cancel = owner.clone();
         alert
             .title("删除卡片")
-            .description(format!("确定删除“{}”？", state.title))
+            .description(format!(
+                "确定删除“{}”的本地账号、state 和任务？手机备份保留。",
+                state.title
+            ))
             .keyboard(!state.busy)
             .close_button(!state.busy)
             .on_ok(move |_, _, cx| {
@@ -67,28 +77,12 @@ impl AddressBookApp {
                 })
             })
             .on_close(move |_, _, cx| owner.update(cx, |this, cx| this.close_modal(cx)))
-            .child(
-                Checkbox::new("delete-phone-backup")
-                    .debug_selector(|| "delete-phone-backup".into())
-                    .checked(state.phone)
-                    .disabled(state.busy)
-                    .label("同时删除手机备份")
-                    .on_click(cx.listener(|this, checked: &bool, _, cx| {
-                        if let Some(state) = &mut this.home.deletion {
-                            state.phone = *checked;
-                            state.error = None;
-                            state.started = false;
-                            state.remaining.clear();
-                        }
-                        cx.notify();
-                    })),
-            )
-            .children(state.error.as_ref().map(|error| {
-                div()
-                    .text_xs()
-                    .text_color(crate::theme::danger(cx))
-                    .child(error.clone())
-            }))
+            .when_some(state.error.as_ref(), |alert, message| {
+                alert.child(
+                    crate::typography::caption(message.clone(), cx)
+                        .text_color(crate::theme::danger(cx)),
+                )
+            })
             .footer(
                 DialogFooter::new()
                     .child(
@@ -112,11 +106,15 @@ impl AddressBookApp {
         let Some(state) = &self.home.deletion else {
             return;
         };
-        if state.busy || self.read_only || self.home.jobs.contains(&state.id) {
+        if state.busy
+            || self.read_only
+            || self.home.jobs.contains(&state.id)
+            || self.home.backup_syncing.contains_key(&state.id)
+        {
             return;
         }
         let id = state.id.clone();
-        let phone = state.phone;
+        let phone = false;
         let links = if state.started {
             // Completed deletions have already been popped. An explicit retry
             // continues from the failed archive instead of repeating the batch.

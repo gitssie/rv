@@ -398,41 +398,62 @@ fn offscreen_keyboard_forwards_pairs_and_consumes_menu_shortcuts(cx: &mut TestAp
 }
 
 #[gpui::test]
-fn offscreen_random_touch_is_explicit_single_flight_and_hover_does_not_cancel(cx: &mut TestAppContext) {
+fn offscreen_random_touch_is_explicit_single_flight_and_hover_does_not_cancel(
+    cx: &mut TestAppContext,
+) {
     let (view, cx, mut peer) = setup(cx, false);
     let caps = serde_json::from_value(serde_json::json!({
         "control":true,"zx_control":{"version":3,"port":6000,"token":"fixture"}
-    })).unwrap();
-    view.update(cx, |view, cx| view.apply_app_event(rv_session::AppEvent::Capabilities(caps), cx));
+    }))
+    .unwrap();
+    view.update(cx, |view, cx| {
+        view.apply_app_event(rv_session::AppEvent::Capabilities(caps), cx)
+    });
     commands(&mut peer);
     cx.update(|window, cx| window.draw(cx).clear(cx));
     let button = cx.debug_bounds("random-touch").unwrap();
     cx.simulate_click(button.center(), Modifiers::default());
     let sent = commands(&mut peer);
-    let ids: Vec<_> = sent.iter().filter_map(|command| match command {
-        SessionCommand::App(rv_session::AppCommand::RandomTouch(id)) => Some(*id),
-        _ => None,
-    }).collect();
+    let ids: Vec<_> = sent
+        .iter()
+        .filter_map(|command| match command {
+            SessionCommand::App(rv_session::AppCommand::RandomTouch(id)) => Some(*id),
+            _ => None,
+        })
+        .collect();
     assert_eq!(ids.len(), 1);
     view.update(cx, |view, _| view.send_pointer(10, 20));
     assert!(commands(&mut peer).is_empty());
     cx.simulate_click(button.center(), Modifiers::default());
     assert!(matches!(commands(&mut peer).as_slice(),
         [SessionCommand::App(rv_session::AppCommand::CancelTouch(id))] if *id == ids[0]));
-    view.update(cx, |view, cx| view.apply_app_event(rv_session::AppEvent::Finished(
-        rv_session::AppCommand::RandomTouch(ids[0].wrapping_add(1))), cx));
+    view.update(cx, |view, cx| {
+        view.apply_app_event(
+            rv_session::AppEvent::Finished(rv_session::AppCommand::RandomTouch(
+                ids[0].wrapping_add(1),
+            )),
+            cx,
+        )
+    });
     view.read_with(cx, |view, _| assert!(view.touch_gesture.busy()));
-    view.update(cx, |view, cx| view.apply_app_event(rv_session::AppEvent::Finished(
-        rv_session::AppCommand::RandomTouch(ids[0])), cx));
+    view.update(cx, |view, cx| {
+        view.apply_app_event(
+            rv_session::AppEvent::Finished(rv_session::AppCommand::RandomTouch(ids[0])),
+            cx,
+        )
+    });
     view.read_with(cx, |view, _| assert!(!view.touch_gesture.busy()));
     // Modifier callbacks construct events by updating Keyboard before send_keys.
     // Cancelling playback must discard that unsent state as well as the events.
     cx.simulate_click(button.center(), Modifiers::default());
     let sent = commands(&mut peer);
-    let id = sent.iter().find_map(|command| match command {
-        SessionCommand::App(rv_session::AppCommand::RandomTouch(id)) => Some(*id),
-        _ => None,
-    }).unwrap();
+    let id = sent
+        .iter()
+        .find_map(|command| match command {
+            SessionCommand::App(rv_session::AppCommand::RandomTouch(id)) => Some(*id),
+            _ => None,
+        })
+        .unwrap();
     view.update(cx, |view, _| {
         let events = view.keys.set_modifiers(true, false, false);
         view.send_keys(events);
@@ -440,46 +461,95 @@ fn offscreen_random_touch_is_explicit_single_flight_and_hover_does_not_cancel(cx
     assert!(matches!(commands(&mut peer).as_slice(),
         [SessionCommand::App(rv_session::AppCommand::CancelTouch(cancelled))] if *cancelled == id));
     view.update(cx, |view, cx| {
-        view.apply_app_event(rv_session::AppEvent::Finished(rv_session::AppCommand::RandomTouch(id)), cx);
+        view.apply_app_event(
+            rv_session::AppEvent::Finished(rv_session::AppCommand::RandomTouch(id)),
+            cx,
+        );
         assert!(!view.keys.set_modifiers(true, false, false).is_empty());
     });
 }
 
 #[gpui::test]
 fn offscreen_trollvnc_paste_waits_for_ack_and_does_not_repeat(cx: &mut TestAppContext) {
+    check_keyboard_paste_touch(cx, false);
+}
+#[gpui::test]
+fn offscreen_keyboard_paste_touches_only_when_enabled(cx: &mut TestAppContext) {
+    check_keyboard_paste_touch(cx, true);
+}
+fn check_keyboard_paste_touch(cx: &mut TestAppContext, enabled: bool) {
     let (view, cx, mut peer) = setup(cx, false);
-    view.update(cx, |view, _| view.clipboard_transfer.last_click = Some((100, 100)));
-    peer.events.send(SessionEvent::Apps(rv_session::AppEvent::Capabilities(
-        rv_session::AppCapabilities { control: true, clipboard_write: true, ..Default::default() }
-    ))).unwrap();
+    view.update(cx, |view, _| {
+        assert!(!view.clipboard_transfer.post_paste_enabled);
+        if enabled { view.clipboard_transfer.post_paste_enabled = true; }
+        view.clipboard_transfer.last_click = Some((100, 100));
+    });
+    peer.events
+        .send(SessionEvent::Apps(rv_session::AppEvent::Capabilities(
+            rv_session::AppCapabilities {
+                control: true,
+                clipboard_write: true,
+                ..Default::default()
+            },
+        )))
+        .unwrap();
     view.update(cx, |view, cx| view.pump(cx));
     commands(&mut peer);
     cx.write_to_clipboard(ClipboardItem::new_string("中文输入".into()));
     for is_held in [false, false, true] {
         cx.simulate_event(gpui::KeyDownEvent {
-            keystroke: gpui::Keystroke::parse("cmd-v").unwrap(), is_held, prefer_character_input: false,
+            keystroke: gpui::Keystroke::parse("cmd-v").unwrap(),
+            is_held,
+            prefer_character_input: false,
         });
     }
-    cx.simulate_event(gpui::KeyUpEvent { keystroke: gpui::Keystroke::parse("v").unwrap() });
+    cx.simulate_event(gpui::KeyUpEvent {
+        keystroke: gpui::Keystroke::parse("v").unwrap(),
+    });
     let sent = commands(&mut peer);
-    let writes: Vec<_> = sent.iter().filter_map(|command| match command {
-        SessionCommand::App(command @ rv_session::AppCommand::WriteClipboard { .. }) => Some(command.clone()),
-        _ => None,
-    }).collect();
+    let writes: Vec<_> = sent
+        .iter()
+        .filter_map(|command| match command {
+            SessionCommand::App(command @ rv_session::AppCommand::WriteClipboard { .. }) => {
+                Some(command.clone())
+            }
+            _ => None,
+        })
+        .collect();
     assert_eq!(writes.len(), 1);
-    assert!(!sent.iter().any(|command| matches!(command,
-        SessionCommand::Input(vnc::X11Event::KeyEvent(event)) if event.keycode == u32::from(b'v'))));
-    view.update(cx, |view, cx| view.apply_app_event(rv_session::AppEvent::Finished(writes[0].clone()), cx));
-    cx.update(|window, cx| { view.update(cx, |view, cx| view.finish_keyboard_paste(window, cx)); });
-    view.read_with(cx, |view, _| assert!(view.clipboard_transfer.post_paste.is_some()));
+    assert!(
+        !sent.iter().any(|command| matches!(command,
+        SessionCommand::Input(vnc::X11Event::KeyEvent(event)) if event.keycode == u32::from(b'v')))
+    );
+    view.update(cx, |view, cx| {
+        view.apply_app_event(rv_session::AppEvent::Finished(writes[0].clone()), cx)
+    });
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| view.finish_keyboard_paste(window, cx));
+    });
+    view.read_with(cx, |view, _| {
+        assert_eq!(view.clipboard_transfer.post_paste.is_some(), enabled)
+    });
     let sent = commands(&mut peer);
-    assert_eq!(sent.iter().filter(|command| matches!(command,
-        SessionCommand::Input(vnc::X11Event::KeyEvent(event)) if event.keycode == u32::from(b'v'))).count(), 2);
-    assert!(cx.read_from_clipboard().is_none_or(|item| item.text().is_none_or(|text| text.is_empty())));
+    assert_eq!(
+        sent.iter()
+            .filter(|command| matches!(command,
+        SessionCommand::Input(vnc::X11Event::KeyEvent(event)) if event.keycode == u32::from(b'v')))
+            .count(),
+        2
+    );
+    assert!(
+        cx.read_from_clipboard()
+            .is_none_or(|item| item.text().is_none_or(|text| text.is_empty()))
+    );
     cx.simulate_keystrokes("cmd-v");
-    assert!(!commands(&mut peer).iter().any(|command| matches!(command,
-        SessionCommand::App(rv_session::AppCommand::WriteClipboard { .. })) || matches!(command,
-        SessionCommand::Input(vnc::X11Event::KeyEvent(event)) if event.keycode == u32::from(b'v'))));
+    assert!(
+        !commands(&mut peer).iter().any(|command| matches!(
+            command,
+            SessionCommand::App(rv_session::AppCommand::WriteClipboard { .. })
+        ) || matches!(command,
+        SessionCommand::Input(vnc::X11Event::KeyEvent(event)) if event.keycode == u32::from(b'v')))
+    );
 }
 
 #[gpui::test]
@@ -488,23 +558,27 @@ fn offscreen_post_paste_touch_survives_hover_before_and_during_press(cx: &mut Te
     commands(&mut peer);
     let now = std::time::Instant::now();
     view.update(cx, |view, _| {
-        view.clipboard_transfer.post_paste = super::paste_touch::PasteTouch::new(
-            (100, 100), (view.fb_w, view.fb_h), [42; 32], now,
-        );
+        view.clipboard_transfer.post_paste_enabled = true;
+        view.clipboard_transfer.post_paste =
+            super::paste_touch::PasteTouch::new((100, 100), (view.fb_w, view.fb_h), [42; 32], now);
         view.send_pointer(200, 200);
         assert!(view.clipboard_transfer.post_paste.is_some());
     });
     assert!(commands(&mut peer).is_empty());
     let start = now + Duration::from_secs(10);
     for (offset, down) in [(0, true), (2, false), (4, true), (6, false)] {
-        cx.update(|window, cx| view.update(cx, |view, cx| {
-            view.send_pointer(200, 200);
-            view.advance_post_paste_touch(window, cx, start + Duration::from_secs(offset));
-        }));
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.send_pointer(200, 200);
+                view.advance_post_paste_touch(window, cx, start + Duration::from_secs(offset));
+            })
+        });
         let sent = commands(&mut peer);
         assert_eq!(sent.len(), 1);
-        assert!(matches!(&sent[0], SessionCommand::Input(vnc::X11Event::PointerEvent(ev))
-            if ev.bottons == u8::from(down) && ev.position_x.abs_diff(100) <= 2));
+        assert!(
+            matches!(&sent[0], SessionCommand::Input(vnc::X11Event::PointerEvent(ev))
+            if ev.bottons == u8::from(down) && ev.position_x.abs_diff(100) <= 2)
+        );
     }
     view.update(cx, |view, _| {
         assert!(view.clipboard_transfer.post_paste.is_none());
@@ -512,8 +586,10 @@ fn offscreen_post_paste_touch_survives_hover_before_and_during_press(cx: &mut Te
     });
     let sent = commands(&mut peer);
     assert_eq!(sent.len(), 1);
-    assert!(matches!(&sent[0], SessionCommand::Input(vnc::X11Event::PointerEvent(ev))
-        if ev.bottons == 0 && ev.position_x == 200));
+    assert!(
+        matches!(&sent[0], SessionCommand::Input(vnc::X11Event::PointerEvent(ev))
+        if ev.bottons == 0 && ev.position_x == 200)
+    );
 }
 
 #[gpui::test]
@@ -522,23 +598,37 @@ fn offscreen_post_paste_touch_is_paired_and_manual_input_cancels(cx: &mut TestAp
     commands(&mut peer);
     let now = std::time::Instant::now();
     view.update(cx, |view, _| {
-        view.clipboard_transfer.post_paste = super::paste_touch::PasteTouch::new(
-            (100, 100), (view.fb_w, view.fb_h), [42; 32], now,
-        );
+        view.clipboard_transfer.post_paste_enabled = true;
+        view.clipboard_transfer.post_paste =
+            super::paste_touch::PasteTouch::new((100, 100), (view.fb_w, view.fb_h), [42; 32], now);
     });
     let later = now + Duration::from_secs(10);
-    cx.update(|window, cx| view.update(cx, |view, cx| view.advance_post_paste_touch(window, cx, later)));
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.advance_post_paste_touch(window, cx, later)
+        })
+    });
     let sent = commands(&mut peer);
     assert_eq!(sent.len(), 1);
-    assert!(matches!(&sent[0], SessionCommand::Input(vnc::X11Event::PointerEvent(ev)) if ev.bottons == 1));
+    assert!(
+        matches!(&sent[0], SessionCommand::Input(vnc::X11Event::PointerEvent(ev)) if ev.bottons == 1)
+    );
     // A real button press releases the scripted finger before forwarding itself.
     let center = picture(&view, cx).center();
     view.update(cx, |view, _| view.button(super::BTN_LEFT, true, center));
     let sent = commands(&mut peer);
     assert_eq!(sent.len(), 2);
-    assert!(matches!(&sent[0], SessionCommand::Input(vnc::X11Event::PointerEvent(ev)) if ev.bottons == 0 && ev.position_x.abs_diff(100) <= 2));
-    assert!(matches!(&sent[1], SessionCommand::Input(vnc::X11Event::PointerEvent(ev)) if ev.bottons == 1 && ev.position_x == 400));
-    cx.update(|window, cx| view.update(cx, |view, cx| view.advance_post_paste_touch(window, cx, later + Duration::from_secs(10))));
+    assert!(
+        matches!(&sent[0], SessionCommand::Input(vnc::X11Event::PointerEvent(ev)) if ev.bottons == 0 && ev.position_x.abs_diff(100) <= 2)
+    );
+    assert!(
+        matches!(&sent[1], SessionCommand::Input(vnc::X11Event::PointerEvent(ev)) if ev.bottons == 1 && ev.position_x == 400)
+    );
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.advance_post_paste_touch(window, cx, later + Duration::from_secs(10))
+        })
+    });
     assert!(commands(&mut peer).is_empty());
 }
 
@@ -548,32 +638,50 @@ fn offscreen_post_paste_touch_stops_when_remote_focus_is_lost(cx: &mut TestAppCo
     commands(&mut peer);
     let now = std::time::Instant::now();
     view.update(cx, |view, _| {
-        view.clipboard_transfer.post_paste = super::paste_touch::PasteTouch::new(
-            (100, 100), (view.fb_w, view.fb_h), [42; 32], now,
-        );
+        view.clipboard_transfer.post_paste_enabled = true;
+        view.clipboard_transfer.post_paste =
+            super::paste_touch::PasteTouch::new((100, 100), (view.fb_w, view.fb_h), [42; 32], now);
     });
     let later = now + Duration::from_secs(10);
-    cx.update(|window, cx| view.update(cx, |view, cx| view.advance_post_paste_touch(window, cx, later)));
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.advance_post_paste_touch(window, cx, later)
+        })
+    });
     commands(&mut peer);
     view.update(cx, |view, _| view.show_menu = true);
-    cx.update(|window, cx| view.update(cx, |view, cx| view.advance_post_paste_touch(window, cx, later)));
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.advance_post_paste_touch(window, cx, later)
+        })
+    });
     let sent = commands(&mut peer);
     assert_eq!(sent.len(), 1);
-    assert!(matches!(&sent[0], SessionCommand::Input(vnc::X11Event::PointerEvent(ev)) if ev.bottons == 0));
-    view.read_with(cx, |view, _| assert!(view.clipboard_transfer.post_paste.is_none()));
+    assert!(
+        matches!(&sent[0], SessionCommand::Input(vnc::X11Event::PointerEvent(ev)) if ev.bottons == 0)
+    );
+    view.read_with(cx, |view, _| {
+        assert!(view.clipboard_transfer.post_paste.is_none())
+    });
 }
 
 #[gpui::test]
-fn offscreen_trollvnc_paste_without_capability_does_not_paste_old_phone_text(cx: &mut TestAppContext) {
+fn offscreen_trollvnc_paste_without_capability_does_not_paste_old_phone_text(
+    cx: &mut TestAppContext,
+) {
     let (view, cx, mut peer) = setup(cx, false);
-    peer.events.send(SessionEvent::Apps(rv_session::AppEvent::Capabilities(
-        rv_session::AppCapabilities::default()
-    ))).unwrap();
+    peer.events
+        .send(SessionEvent::Apps(rv_session::AppEvent::Capabilities(
+            rv_session::AppCapabilities::default(),
+        )))
+        .unwrap();
     view.update(cx, |view, cx| view.pump(cx));
     commands(&mut peer);
     for key in ["ctrl-v", "cmd-v"] {
         cx.simulate_keystrokes(key);
-        cx.simulate_event(gpui::KeyUpEvent { keystroke: gpui::Keystroke::parse("v").unwrap() });
+        cx.simulate_event(gpui::KeyUpEvent {
+            keystroke: gpui::Keystroke::parse("v").unwrap(),
+        });
         assert!(!commands(&mut peer).iter().any(|command| matches!(command,
             SessionCommand::App(rv_session::AppCommand::WriteClipboard { .. })) || matches!(command,
             SessionCommand::Input(vnc::X11Event::KeyEvent(event)) if event.keycode == u32::from(b'v'))));
@@ -803,7 +911,10 @@ fn control_toolbar_keeps_primary_actions_reachable_at_640px(cx: &mut TestAppCont
     let toolbar = cx.debug_bounds("session-toolbar").unwrap();
     assert_eq!(toolbar.top(), crate::theme::toolbar_height());
     assert_eq!(toolbar.size.height, crate::theme::toolbar_height());
-    assert_eq!(cx.debug_bounds("session-stage").unwrap().top(), crate::theme::toolbar_height() * 2.);
+    assert_eq!(
+        cx.debug_bounds("session-stage").unwrap().top(),
+        crate::theme::toolbar_height() * 2.
+    );
     let settings = cx.debug_bounds("session-settings").unwrap();
     assert!(settings.bottom() <= toolbar.top());
     let notifications = cx.debug_bounds("phone-notifications").unwrap();
@@ -824,7 +935,10 @@ fn control_toolbar_keeps_primary_actions_reachable_at_640px(cx: &mut TestAppCont
     assert!(keyboard.right() <= files.left());
     for selector in ["function-menu-toggle", "clip"] {
         let bounds = cx.debug_bounds(selector).unwrap();
-        assert!(bounds.left() >= toolbar.left() && bounds.right() <= toolbar.right(), "{selector}: {bounds:?}");
+        assert!(
+            bounds.left() >= toolbar.left() && bounds.right() <= toolbar.right(),
+            "{selector}: {bounds:?}"
+        );
     }
     while peer.commands.try_recv().is_ok() {}
     let more = cx.debug_bounds("session-settings").unwrap();

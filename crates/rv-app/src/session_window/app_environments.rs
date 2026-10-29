@@ -18,8 +18,6 @@ pub(super) struct Backup {
     note: String,
     date: String,
     snapshot: bool,
-    version: String,
-    build: String,
 }
 #[derive(Clone, Copy, PartialEq)]
 enum EnvironmentRunStatus {
@@ -97,34 +95,81 @@ impl EnvironmentUi {
     }
 }
 impl SessionView {
+    pub(crate) fn can_handoff_backup(&self) -> bool {
+        self.phase == Phase::Connected && !self.view_only() && !self.functions.app_state_unsettled()
+    }
+    pub(crate) fn handoff_backup(&mut self, command: AppCommand, cx: &mut Context<Self>) -> bool {
+        if !self.can_handoff_backup() {
+            return false;
+        }
+        self.handle.app(command);
+        self.functions.message = "正在回写账号备份，RV 任务已停止…".into();
+        cx.notify();
+        true
+    }
+    pub(crate) fn takeover_backup(&mut self, command: AppCommand, cx: &mut Context<Self>) -> bool {
+        if !self.can_handoff_backup() {
+            return false;
+        }
+        self.handle.app(command);
+        self.functions.message = "正在读取手机备份并交给 RV…".into();
+        cx.notify();
+        true
+    }
     pub(crate) fn read_home_profile(
         &mut self,
         id: rv_core::workspace::AppId,
         bundle: String,
         backup: String,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
         if self.phase != Phase::Connected
             || self.view_only()
             || self.functions.app_state_unsettled()
         {
             self.functions.message = "请先连接手机并完成当前备份操作".into();
             cx.notify();
-            return;
+            return false;
         }
         self.handle.app(AppCommand::ReadProfile {
             app_id: id,
             bundle,
             backup,
         });
+        self.functions.message = "正在从手机读取账号备份…".into();
+        cx.notify();
+        true
+    }
+    pub(in crate::session_window) fn phone_handoff_result(
+        &mut self,
+        saved: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.functions.message = if saved {
+            "手机备份已回写校验，RV 任务保持停止"
+        } else {
+            "交接未完成，RV 任务保持停止，请查看日志并重试"
+        }
+        .into();
+        cx.notify();
+    }
+    pub(in crate::session_window) fn backup_profile_result(
+        &mut self,
+        saved: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.functions.message = if saved {
+            "账号备份已保存到 RV"
+        } else {
+            "账号备份保存失败，请查看日志"
+        }
+        .into();
+        cx.notify();
     }
     pub(crate) fn home_connected(&self) -> bool {
         self.phase == Phase::Connected
     }
     pub(crate) fn notify_home(&self, cx: &mut Context<Self>) {
-        if !self.control_only {
-            return;
-        }
         if let Some(id) = self.req.connection_id
             && let Some(book) = self.address_book.as_ref().and_then(WeakEntity::upgrade)
         {
@@ -133,7 +178,15 @@ impl SessionView {
             } else {
                 None
             };
-            book.update(cx, |book, cx| book.phone_changed(id, foreground, cx));
+            let cx_entity = cx.entity().entity_id();
+            book.update(cx, |book, cx| {
+                if self.phase != Phase::Connected {
+                    book.backup_sync_disconnected(cx_entity, cx);
+                }
+                if self.control_only {
+                    book.phone_changed(id, foreground, cx);
+                }
+            });
         }
     }
     pub(in crate::session_window) fn close_function_panel(
@@ -507,8 +560,6 @@ impl SessionView {
                     Some(Backup {
                         app: app_id.clone(),
                         snapshot: row["kind"] == "snapshot",
-                        version: row["version"].as_str().unwrap_or("").into(),
-                        build: row["build"].as_str().unwrap_or("").into(),
                         name: row["display_name"]
                             .as_str()
                             .filter(|name| !name.is_empty())
@@ -530,9 +581,13 @@ impl SessionView {
             if let Some(device) = self.req.connection_id
                 && let Some(book) = self.address_book.as_ref().and_then(WeakEntity::upgrade)
             {
-                book.update(cx, |book, cx| {
-                    book.sync_phone_backups(device, &app_id, result, cx)
+                let profiles = book.update(cx, |book, cx| {
+                    book.sync_phone_backups(device, &app_id, result, cx);
+                    book.missing_backup_profiles(&app_id, result)
                 });
+                for command in profiles {
+                    self.handle.app(command);
+                }
             }
             self.functions.environment.loaded = true;
             self.functions.selected = None;
@@ -1237,108 +1292,12 @@ impl SessionView {
                         }))
                     })
             })
-            .when_some(target.as_ref(), |panel, (id, _)| {
-                let launch = id.clone();
-                let stop = id.clone();
+            .when_some(target.as_ref(), |panel, (_id, _)| {
                 panel
                     .child(
                         crate::ui::tool_actions()
                             .debug_selector(|| "environment-actions".into())
-                            .child(
-                                Button::new("environment-launch")
-                                    .ghost()
-                                    .icon(IconName::Play)
-                                    .debug_selector(|| "environment-launch".into())
-                                    .tooltip("打开 App")
-                                    .accessibility_label("打开 App")
-                                    .disabled(!self.app_allowed(id, 2) || locked)
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.dispatch_app(AppCommand::Launch(launch.clone()), cx)
-                                    })),
-                            )
-                            .child(
-                                Button::new("environment-stop")
-                                    .ghost()
-                                    .icon(crate::assets::AppActionIcon::Terminate)
-                                    .debug_selector(|| "environment-stop".into())
-                                    .tooltip("停止 App")
-                                    .accessibility_label("停止 App")
-                                    .disabled(!self.app_allowed(id, 3) || locked)
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.dispatch_app(AppCommand::Terminate(stop.clone()), cx)
-                                    })),
-                            )
-                            .child({
-                                let state = &self.functions.environment;
-                                let (icon, color, label) = if state.status_failed {
-                                    (
-                                        Icon::new(FunctionIcon::Monitor),
-                                        theme::danger(cx),
-                                        "状态读取失败",
-                                    )
-                                } else {
-                                    match state.running {
-                                        Some(true) => (
-                                            Icon::new(FunctionIcon::Monitor),
-                                            theme::success(cx),
-                                            "运行中",
-                                        ),
-                                        Some(false) => (
-                                            Icon::new(FunctionIcon::Monitor),
-                                            theme::muted(cx),
-                                            "已停止",
-                                        ),
-                                        None => (
-                                            Icon::new(FunctionIcon::Monitor),
-                                            theme::muted(cx),
-                                            "读取运行状态",
-                                        ),
-                                    }
-                                };
-                                Button::new("app-status")
-                                    .ghost()
-                                    .icon(icon)
-                                    .text_color(color)
-                                    .debug_selector(|| "environment-status".into())
-                                    .tooltip(label)
-                                    .accessibility_label(label)
-                                    .disabled(disabled)
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.environment_action("app-status", None, window, cx)
-                                    }))
-                            })
                             .child(div().flex_1())
-                            .children(
-                                [
-                                    ("app-baseline", "创建空白基线", IconName::Plus),
-                                    ("app-describe", "环境详情", IconName::Info),
-                                ]
-                                .map(|(action, label, icon)| {
-                                    Button::new(action)
-                                        .ghost()
-                                        .icon(icon)
-                                        .tooltip(label)
-                                        .accessibility_label(label)
-                                        .disabled(disabled)
-                                        .on_click(cx.listener(move |this, _, window, cx| {
-                                            this.environment_action(action, None, window, cx)
-                                        }))
-                                }),
-                            )
-                            .child(
-                                Button::new("environment-save")
-                                    .debug_selector(|| "environment-save".into())
-                                    .ghost()
-                                    .icon(FunctionIcon::Archive)
-                                    .tooltip("保存当前环境")
-                                    .accessibility_label("保存当前环境")
-                                    .disabled(
-                                        disabled || self.functions.environment.restore_pending,
-                                    )
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.environment_action("app-save", None, window, cx)
-                                    })),
-                            )
                             .child(
                                 Button::new("environment-refresh")
                                     .ghost()
@@ -1358,11 +1317,6 @@ impl SessionView {
                             .gap_1()
                             .max_h(px(270.))
                             .overflow_y_scroll()
-                            .children(
-                                self.functions.environment.baselines.iter().map(|baseline| {
-                                    self.render_baseline_row(baseline, disabled, cx)
-                                }),
-                            )
                             .children(
                                 self.functions
                                     .environment
@@ -1413,88 +1367,144 @@ impl SessionView {
                 },
             )
     }
-    fn render_baseline_row(
-        &self,
-        baseline: &Backup,
-        disabled: bool,
+    fn confirm_rv_takeover(&mut self, backup: Backup, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_handoff_backup() {
+            return;
+        }
+        let Some(device) = self.req.connection_id else {
+            return;
+        };
+        let Some(book) = self.address_book.as_ref().and_then(WeakEntity::upgrade) else {
+            return;
+        };
+        let name = book.read(cx).takeover_phone_name(device);
+        let owner = cx.entity();
+        crate::ui::confirm_execution_handoff(
+            crate::ui::ExecutionHandoffPrompt {
+                title: "交给 RV",
+                icon: FunctionIcon::Monitor,
+                device: name,
+                backup: backup.name.clone(),
+                acknowledgement: Some("已保存该环境的最新备份，且手机不再使用该环境"),
+            },
+            window,
+            cx,
+            move |_, cx| {
+                owner.update(cx, |this, cx| this.start_rv_takeover(backup.clone(), cx));
+            },
+        );
+    }
+    fn start_rv_takeover(&mut self, backup: Backup, cx: &mut Context<Self>) {
+        let result = (|| {
+            if !self.can_handoff_backup() {
+                return Err("请先连接可写手机并完成当前操作".into());
+            }
+            let device = self.req.connection_id.ok_or("手机连接未保存")?;
+            let id = rv_core::workspace::AppId::from_idfv(
+                backup
+                    .id
+                    .strip_prefix("snapshot:")
+                    .ok_or("请选择账号备份")?,
+            )
+            .map_err(|_| "备份身份无效")?;
+            let book = self
+                .address_book
+                .as_ref()
+                .and_then(WeakEntity::upgrade)
+                .ok_or("本地账号列表不可用")?;
+            let owner = cx.entity().entity_id();
+            let command = book.update(cx, |book, cx| {
+                book.prepare_rv_takeover(&id, &backup.app, &backup.id, device, owner, cx)
+            })?;
+            self.handle.app(command);
+            Ok::<_, String>(())
+        })();
+        match result {
+            Ok(()) => self.functions.message = "正在读取手机备份并交给 RV…".into(),
+            Err(error) => {
+                tracing::error!(bundle_id=%backup.app,error=%error,"RV takeover start failed");
+                self.functions.message = error.into();
+            }
+        }
+        cx.notify();
+    }
+    pub(in crate::session_window) fn rv_takeover_result(
+        &mut self,
+        saved: bool,
         cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let backup = baseline.clone();
-        let activate = baseline.clone();
-        let entity = cx.entity();
-        let focus = self.focus.clone();
-        let version = if baseline.version.is_empty() {
-            baseline
-                .id
-                .strip_prefix("baseline:")
-                .unwrap_or(&baseline.name)
+    ) {
+        self.functions.message = if saved {
+            "已采用手机备份凭据，Token 由 RV 刷新"
         } else {
-            &baseline.version
-        };
-        let label = if baseline.build.is_empty() {
-            format!("基线 {version}")
-        } else {
-            format!("基线 {version} ({})", baseline.build)
-        };
-        h_flex()
-            .gap_2()
-            .py_2()
-            .items_center()
-            .debug_selector({
-                let id = baseline.id.clone();
-                move || format!("baseline-{id}")
-            })
-            .child(Icon::new(FunctionIcon::Archive).text_color(theme::muted(cx)))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .text_sm()
-                    .text_ellipsis()
-                    .child(label),
+            "交给 RV 未完成，原凭据和 Token 来源保持不变"
+        }
+        .into();
+        cx.notify();
+    }
+    fn confirm_sync_backup_to_home(
+        &mut self,
+        backup: Backup,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let owner = cx.entity();
+        crate::ui::confirm_backup_sync(backup.name.clone(), window, cx, move |_, cx| {
+            owner.update(cx, |this, cx| this.sync_backup_to_home(backup.clone(), cx));
+        });
+    }
+    fn sync_backup_to_home(&mut self, backup: Backup, cx: &mut Context<Self>) {
+        let result = (|| {
+            if self.phase != Phase::Connected
+                || self.view_only()
+                || self.functions.app_state_unsettled()
+            {
+                return Err("请先连接手机并完成当前操作".to_string());
+            }
+            let device = self.req.connection_id.ok_or("备份来源设备未保存")?;
+            let id = rv_core::workspace::AppId::from_idfv(
+                backup
+                    .id
+                    .strip_prefix("snapshot:")
+                    .ok_or("请选择账号备份")?,
             )
-            .child(
-                Button::new(format!("switch-{}", baseline.id))
-                    .ghost()
-                    .icon(IconName::ArrowRight)
-                    .debug_selector({
-                        let id = baseline.id.clone();
-                        move || format!("switch-{id}")
-                    })
-                    .tooltip("启用基线")
-                    .accessibility_label("启用基线")
-                    .disabled(disabled)
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.environment_action("app-switch", Some(activate.clone()), window, cx)
-                    })),
-            )
-            .child(
-                Button::new(format!("baseline-menu-{}", baseline.id))
-                    .ghost()
-                    .icon(IconName::Ellipsis)
-                    .tooltip("更多")
-                    .accessibility_label("更多")
-                    .disabled(disabled)
-                    .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
-                        let delete = entity.clone();
-                        let backup = backup.clone();
-                        menu.action_context(focus.clone()).item(
-                            PopupMenuItem::new("删除基线…")
-                                .icon(FunctionIcon::Trash)
-                                .on_click(move |_, window, cx| {
-                                    delete.update(cx, |this, cx| {
-                                        this.environment_action(
-                                            "app-delete",
-                                            Some(backup.clone()),
-                                            window,
-                                            cx,
-                                        )
-                                    });
-                                }),
-                        )
-                    }),
-            )
-            .into_any_element()
+            .map_err(|_| "备份身份无效，请刷新列表".to_string())?;
+            let book = self
+                .address_book
+                .as_ref()
+                .and_then(WeakEntity::upgrade)
+                .ok_or("本地账号列表不可用")?;
+            book.update(cx, |book, cx| {
+                book.reimport_phone_backup(device, &backup.app, &id, &backup.id, cx)
+            })?;
+            if backup.app == "lt.manodrabuziai.fr" {
+                let owner = cx.entity().entity_id();
+                if !book.update(cx, |book, cx| {
+                    book.begin_backup_sync(&id, device, owner, cx)
+                }) {
+                    return Err("此账号正在同步，请稍后重试".into());
+                }
+                if !self.read_home_profile(id.clone(), backup.app.clone(), backup.id.clone(), cx) {
+                    book.update(cx, |book, cx| book.backup_sync_failed(&id, owner, cx));
+                    return Err("请先连接手机并完成当前备份操作".into());
+                }
+            }
+            Ok::<_, String>(())
+        })();
+        match result {
+            Ok(()) => {
+                self.functions.message = if backup.app == "lt.manodrabuziai.fr" {
+                    "正在从手机读取账号备份…"
+                } else {
+                    "备份信息已同步到本地"
+                }
+                .into()
+            }
+            Err(error) => {
+                tracing::error!(bundle_id=%backup.app,error=%error,"Backup local sync failed");
+                self.functions.message = error.into();
+            }
+        }
+        cx.notify();
     }
     fn render_backup_row(
         &self,
@@ -1502,10 +1512,30 @@ impl SessionView {
         disabled: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let switch = backup.clone();
+        let takeover_target = backup.clone();
         let menu_backup = backup.clone();
         let entity = cx.entity();
         let focus = self.focus.clone();
+        let mode = backup
+            .id
+            .strip_prefix("snapshot:")
+            .and_then(|id| rv_core::workspace::AppId::from_idfv(id).ok())
+            .and_then(|id| {
+                self.address_book
+                    .as_ref()
+                    .and_then(WeakEntity::upgrade)
+                    .map(|book| book.read(cx).execution_mode(&id))
+            })
+            .unwrap_or_default();
+        let show_sync = backup.snapshot && mode == rv_core::workspace::ExecutionMode::Rv;
+        let can_takeover = self
+            .address_book
+            .as_ref()
+            .and_then(WeakEntity::upgrade)
+            .is_some_and(|book| {
+                book.read(cx)
+                    .rv_takeover_available(&backup.app, &backup.id, self.req.connection_id)
+            });
         let current = self.functions.environment.current.as_ref() == Some(&backup.id);
         h_flex()
             .gap_2()
@@ -1556,26 +1586,26 @@ impl SessionView {
                     )),
             )
             .child(
-                Button::new(format!("switch-{}", backup.id))
+                Button::new(format!("takeover-{}", backup.id))
                     .ghost()
                     .debug_selector({
                         let id = backup.id.clone();
-                        move || format!("switch-{id}")
+                        move || format!("takeover-{id}")
                     })
-                    .icon(IconName::ArrowRight)
-                    .tooltip(if current && self.functions.environment.restore_pending {
-                        "恢复"
+                    .icon(if mode == rv_core::workspace::ExecutionMode::ToPhone {
+                        FunctionIcon::Recent
                     } else {
-                        "切换"
+                        FunctionIcon::Monitor
                     })
-                    .accessibility_label(if current && self.functions.environment.restore_pending {
-                        "恢复"
-                    } else {
-                        "切换"
-                    })
-                    .disabled(disabled || (current && !self.functions.environment.restore_pending))
+                    .tooltip(if can_takeover { "交给 RV" } else { match mode {
+                        rv_core::workspace::ExecutionMode::Phone => "交给 RV",
+                        rv_core::workspace::ExecutionMode::ToPhone => "交接未完成",
+                        rv_core::workspace::ExecutionMode::Rv => "RV 接管",
+                    } })
+                    .accessibility_label("交给 RV")
+                    .disabled(disabled || !can_takeover)
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        this.environment_action("app-switch", Some(switch.clone()), window, cx)
+                        this.confirm_rv_takeover(takeover_target.clone(), window, cx)
                     })),
             )
             .child(
@@ -1587,11 +1617,26 @@ impl SessionView {
                     .disabled(disabled)
                     .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
                         let edit = entity.clone();
-                        let delete = entity.clone();
+                        let sync = entity.clone();
+                        let sync_backup = menu_backup.clone();
                         let edit_backup = menu_backup.clone();
-                        let delete_backup = menu_backup.clone();
                         let copy = menu_backup.id.clone();
                         menu.action_context(focus.clone())
+                            .when(show_sync, |menu| {
+                                menu.item(
+                                    PopupMenuItem::new("从手机同步账号备份…")
+                                        .icon(IconName::Redo)
+                                        .on_click(move |_, window, cx| {
+                                            sync.update(cx, |this, cx| {
+                                                this.confirm_sync_backup_to_home(
+                                                    sync_backup.clone(),
+                                                    window,
+                                                    cx,
+                                                )
+                                            })
+                                        }),
+                                )
+                            })
                             .item(
                                 PopupMenuItem::new("编辑名称与备注")
                                     .icon(FunctionIcon::Edit)
@@ -1614,21 +1659,6 @@ impl SessionView {
                                         cx.write_to_clipboard(ClipboardItem::new_string(
                                             copy.clone(),
                                         ))
-                                    }),
-                            )
-                            .separator()
-                            .item(
-                                PopupMenuItem::new("删除备份…")
-                                    .icon(FunctionIcon::Trash)
-                                    .on_click(move |_, window, cx| {
-                                        delete.update(cx, |this, cx| {
-                                            this.environment_action(
-                                                "app-delete",
-                                                Some(delete_backup.clone()),
-                                                window,
-                                                cx,
-                                            )
-                                        });
                                     }),
                             )
                     }),
@@ -1765,7 +1795,7 @@ impl SessionView {
             {"backup_id":"baseline:1","kind":"baseline","display_name":"空白基线","note":"首次启动前","date":"2026-10-08 09:12"}
         ]}})}, cx);
         if state == "save" {
-            self.environment_action("app-save", None, window, cx);
+            self.environment_action("app-edit", None, window, cx);
             self.functions.text.update(cx, |input, cx| {
                 input.set_value("名称=工作账号 C\n备注=备用环境", window, cx)
             });
@@ -1806,7 +1836,7 @@ mod tests {
         for stashed in [false, true] {
             cx.update(|window, cx| {
                 view.update(cx, |view, cx| {
-                    view.functions.selected = OPERATIONS.iter().find(|s| s.id == "app-switch");
+                    view.functions.selected = OPERATIONS.iter().find(|s| s.id == "app-edit");
                     view.functions.busy = true;
                     view.functions.operation = Some((32, "original-operation".into()));
                     if stashed {
@@ -1888,7 +1918,7 @@ mod tests {
         );
     }
     #[gpui::test]
-    fn app_first_grid_and_record_switch_keep_target_context(cx: &mut TestAppContext) {
+    fn app_first_grid_and_record_takeover_replace_switch(cx: &mut TestAppContext) {
         let (view, cx, mut peer) = setup(cx, false);
         cx.update(|window, cx| {
             view.update(cx, |view, cx| {
@@ -1915,14 +1945,9 @@ mod tests {
         while peer.commands.try_recv().map(unscoped).is_ok() {}
         cx.simulate_resize(size(px(640.), px(400.)));
         cx.update(|window, cx| window.draw(cx).clear(cx));
-        assert!(cx.debug_bounds("switch-baseline:1").is_some());
+        assert!(cx.debug_bounds("switch-baseline:1").is_none());
         let actions = cx.debug_bounds("environment-actions").unwrap();
-        for selector in [
-            "environment-launch",
-            "environment-stop",
-            "environment-save",
-            "environment-refresh",
-        ] {
+        for selector in ["environment-refresh"] {
             let button = cx.debug_bounds(selector).unwrap();
             assert!(button.left() >= actions.left() && button.right() <= actions.right());
             assert!(button.top() >= actions.top() && button.bottom() <= actions.bottom());
@@ -1938,22 +1963,14 @@ mod tests {
             );
             assert_eq!(view.functions.environment.records[0].name, "工作账号 A");
         });
-        let row = cx.debug_bounds("switch-snapshot:spare").unwrap();
+        assert!(cx.debug_bounds("switch-snapshot:spare").is_none());
+        let row = cx.debug_bounds("takeover-snapshot:spare").unwrap();
         cx.simulate_click(row.center(), Modifiers::default());
+        cx.update(|window, cx| assert!(!window.has_active_dialog(cx)));
         assert!(
-            peer.commands
-                .try_recv()
-                .into_iter()
-                .all(|cmd| !matches!(cmd, SessionCommand::Function(_)))
+            std::iter::from_fn(|| peer.commands.try_recv().map(unscoped).ok())
+                .all(|command| !matches!(command, SessionCommand::Function(_)))
         );
-        cx.update(|window, cx| {
-            assert!(window.has_active_dialog(cx));
-            window.draw(cx).clear(cx);
-        });
-        assert!(cx.debug_bounds("switch-backup-current").is_some());
-        assert!(cx.debug_bounds("function-input-area").is_none());
-        cx.update(|window, cx| window.close_dialog(cx));
-        assert!(peer.commands.try_recv().is_err());
     }
     #[gpui::test]
     fn stale_record_and_readonly_do_not_dispatch_mutations(cx: &mut TestAppContext) {
@@ -1966,8 +1983,6 @@ mod tests {
                     app: "com.other.app".into(),
                     id: "snapshot:spare".into(),
                     name: "stale".into(),
-                    version: "".into(),
-                    build: "".into(),
                     note: "".into(),
                     date: "".into(),
                     snapshot: true,
@@ -1983,7 +1998,7 @@ mod tests {
         cx.update(|window, cx| {
             readonly.update(cx, |view, cx| {
                 view.functions.busy = false;
-                view.environment_action("app-save", None, window, cx);
+                view.environment_action("app-edit", None, window, cx);
                 view.functions
                     .text
                     .update(cx, |input, cx| input.set_value("名称=不应保存", window, cx));
@@ -2001,24 +2016,24 @@ mod tests {
             view.functions.selected = OPERATIONS.iter().find(|s| s.id == "app-list");
             view.functions.busy = true;
             view.functions.stash_panel();
-            view.select_function(OPERATIONS.iter().find(|s| s.id == "app-save").unwrap(), window, cx);
+            view.select_function(OPERATIONS.iter().find(|s| s.id == "app-edit").unwrap(), window, cx);
             let before = view.functions.environment.records.iter().map(|r| r.id.clone()).collect::<Vec<_>>();
             view.apply_function_event(FunctionEvent::ForOperation { id:"app-list".into(), event:Box::new(FunctionEvent::State {task:32,record:serde_json::json!({
                 "operation_id":"old-list","status":"completed","result":{"bundle_id":"fr.vinted","backups":[{"backup_id":"background-only"}]}
             })})}, cx);
             assert_eq!(view.functions.environment.records.iter().map(|r| r.id.clone()).collect::<Vec<_>>(), before);
-            assert_eq!(view.functions.selected.unwrap().id,"app-save");
+            assert_eq!(view.functions.selected.unwrap().id,"app-edit");
             assert!(view.functions.environment.open);
         }));
         assert!(peer.commands.try_recv().is_err());
     }
     #[gpui::test]
-    fn completed_save_refreshes_list_but_unknown_never_replays(cx: &mut TestAppContext) {
+    fn completed_edit_refreshes_list_but_unknown_never_replays(cx: &mut TestAppContext) {
         let (view, cx, mut peer) = setup(cx, false);
         fixture(&view, cx);
         while peer.commands.try_recv().map(unscoped).is_ok() {}
         cx.update(|window,cx|view.update(cx,|view,cx| {
-            view.environment_action("app-save",None,window,cx);
+            view.environment_action("app-edit",None,window,cx);
             view.functions.busy=true;
             view.apply_function_event(FunctionEvent::State {task:32,record:serde_json::json!({"operation_id":"save-1","status":"completed","result":{}})},cx);
         }));
@@ -2026,7 +2041,7 @@ mod tests {
             matches!(peer.commands.try_recv().map(unscoped),Ok(SessionCommand::Function(FunctionCommand::Invoke{id,..})) if id=="app-list")
         );
         view.update(cx,|view,cx| {
-            view.functions.selected=OPERATIONS.iter().find(|spec|spec.id=="app-save");
+            view.functions.selected=OPERATIONS.iter().find(|spec|spec.id=="app-edit");
             view.apply_function_event(FunctionEvent::State {task:32,record:serde_json::json!({"operation_id":"save-2","status":"completed","error":{"domain":"TVAppStateServices","code":3}})},cx);
             assert!(!view.functions.uncertain);
             assert_eq!(view.functions.selected.unwrap().id, "app-list");
@@ -2065,29 +2080,33 @@ mod tests {
         assert!(peer.commands.try_recv().map(unscoped).is_err());
     }
     #[gpui::test]
-    fn pending_restore_blocks_save_and_allows_explicit_recovery(cx: &mut TestAppContext) {
+    fn backup_toolbar_only_exposes_refresh(cx: &mut TestAppContext) {
         let (view, cx, mut peer) = setup(cx, false);
         fixture(&view, cx);
-        while peer.commands.try_recv().map(unscoped).is_ok() {}
-        cx.update(|window,cx| view.update(cx, |view,cx| {
-            view.functions.selected = OPERATIONS.iter().find(|spec|spec.id=="app-list");
-            view.apply_function_event(FunctionEvent::State {task:32,record:serde_json::json!({"operation_id":"pending-list","status":"completed","result":{"bundle_id":"fr.vinted","backups":[],"current_backup_id":"snapshot:current","restore_pending":true}})},cx);
-            assert!(view.functions.environment.restore_pending);
-            view.environment_action("app-save", None, window, cx);
-            assert!(view.functions.selected.is_none());
-            view.environment_action("app-status", None, window, cx);
-            assert_eq!(view.functions.selected.unwrap().id,"app-status");
-        }));
-        assert!(matches!(peer.commands.try_recv().map(unscoped).unwrap(),
-            SessionCommand::Function(FunctionCommand::Invoke { id, text })
-            if id == "app-status" && text == "App=fr.vinted"));
-        assert!(peer.commands.try_recv().map(unscoped).is_err());
+        while peer.commands.try_recv().is_ok() {}
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        for selector in [
+            "environment-launch",
+            "environment-stop",
+            "environment-status",
+            "environment-save",
+            "app-baseline",
+            "app-describe",
+        ] {
+            assert!(
+                cx.debug_bounds(selector).is_none(),
+                "obsolete toolbar action {selector}"
+            );
+        }
+        let refresh = cx.debug_bounds("environment-refresh").unwrap();
+        cx.simulate_click(refresh.center(), Modifiers::default());
+        assert!(std::iter::from_fn(||peer.commands.try_recv().map(unscoped).ok()).any(|cmd|matches!(cmd,SessionCommand::Function(FunctionCommand::Invoke{id,..}) if id=="app-list")));
     }
     #[test]
     fn record_identifiers_are_injected_and_cannot_be_overridden() {
         let spec = OPERATIONS
             .iter()
-            .find(|spec| spec.id == "app-switch")
+            .find(|spec| spec.id == "app-edit")
             .unwrap();
         let text = operation_text(
             spec,

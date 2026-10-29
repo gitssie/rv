@@ -6,12 +6,14 @@ use rv_core::{ConnectRequest, Connection};
 pub(in crate::app) struct PhoneControl {
     pub view: Entity<SessionView>,
     endpoint: (String, u16, bool, bool),
+    _updates: Option<Subscription>,
 }
 impl PhoneControl {
     pub(in crate::app) fn new(view: Entity<SessionView>, connection: &Connection) -> Self {
         Self {
             view,
             endpoint: endpoint(connection),
+            _updates: None,
         }
     }
 }
@@ -24,6 +26,17 @@ fn endpoint(connection: &Connection) -> (String, u16, bool, bool) {
     )
 }
 impl AddressBookApp {
+    pub(in crate::app) fn sync_phone_unlock_dialogs(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        for control in self.home.controls.values() {
+            control
+                .view
+                .update(cx, |view, cx| view.sync_unlock_dialog(window, cx));
+        }
+    }
     pub(in crate::app) fn sync_phone_controls(
         &mut self,
         window: &mut Window,
@@ -126,9 +139,10 @@ impl AddressBookApp {
             .map(|app| app.bundle_id.clone())
             .collect();
         view.update(cx, |view, cx| view.request_home_app_icons(bundles, cx));
-        self.home
-            .controls
-            .insert(device.id, PhoneControl::new(view, device));
+        let updates = cx.observe(&view, |_, _, cx| cx.notify());
+        let mut control = PhoneControl::new(view, device);
+        control._updates = Some(updates);
+        self.home.controls.insert(device.id, control);
         cx.notify();
     }
 }

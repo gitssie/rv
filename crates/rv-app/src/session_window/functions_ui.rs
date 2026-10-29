@@ -15,6 +15,8 @@ mod environments;
 use environments::EnvironmentUi;
 #[path = "apple_ui.rs"]
 mod apple_ui;
+#[path = "registration_ui.rs"]
+mod registration_ui;
 
 #[derive(Clone)]
 struct FunctionPanel {
@@ -111,6 +113,7 @@ pub(super) struct FunctionUi {
     target_app: Option<(String, String)>,
     expected_account: Option<String>,
     environment: EnvironmentUi,
+    registration: registration_ui::RegistrationUi,
     text: Entity<TextareaState>,
     cloud_password: Entity<InputState>,
     cloud_preparation: Option<u64>,
@@ -268,6 +271,7 @@ impl FunctionUi {
             target_app: None,
             expected_account: None,
             environment: EnvironmentUi::new(environment_apps),
+            registration: registration_ui::RegistrationUi::new(window, cx),
             text,
             cloud_password,
             cloud_preparation: None,
@@ -489,6 +493,10 @@ impl SessionView {
             return;
         }
         match event {
+            FunctionEvent::Registration(status) => {
+                self.functions.registration.busy = status.running;
+                self.functions.registration.message = status.message.into();
+            }
             FunctionEvent::AccountStateLoading => {
                 self.functions.account_loading = true;
                 self.functions.account_state = None;
@@ -1313,6 +1321,9 @@ impl SessionView {
         if self.functions.environment.open {
             return self.render_app_environment(width, height, cx);
         }
+        if self.functions.category == "功能" {
+            return self.render_registration_panel(width, height, cx);
+        }
         let selected = self
             .functions
             .selected
@@ -1439,10 +1450,12 @@ impl SessionView {
     }
     fn render_function_navigation(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let environment = self.functions.environment.open;
-        let editor = self
-            .functions
-            .selected
-            .filter(|spec| spec.task == 31 && !self.functions.editor_hidden && !environment);
+        let editor = self.functions.selected.filter(|spec| {
+            spec.task == 31
+                && !self.functions.editor_hidden
+                && !environment
+                && self.functions.category != "功能"
+        });
         h_flex()
             .debug_selector(|| "function-navigation-bar".into())
             .gap_1()
@@ -1451,11 +1464,18 @@ impl SessionView {
                 gpui_component::tab::TabBar::new("function-navigation")
                     .underline()
                     .flex_shrink_0()
-                    .selected_index(if environment { 1 } else { 0 })
+                    .selected_index(if environment {
+                        1
+                    } else if self.functions.category == "功能" {
+                        2
+                    } else {
+                        0
+                    })
                     .children(
                         [
                             ("Apple", FunctionIcon::User),
                             ("App 环境", FunctionIcon::All),
+                            ("功能", FunctionIcon::All),
                         ]
                         .into_iter()
                         .map(|(category, icon)| {
@@ -1476,7 +1496,12 @@ impl SessionView {
                         }),
                     )
                     .on_click(cx.listener(|this, index: &usize, window, cx| {
-                        if *index == 1 {
+                        if *index == 2 {
+                            this.functions.stash_panel();
+                            this.functions.environment.open = false;
+                            this.functions.category = "功能";
+                            cx.notify();
+                        } else if *index == 1 {
                             if !this.functions.environment.open {
                                 this.open_app_environment(None, window, cx);
                             }
@@ -1491,7 +1516,9 @@ impl SessionView {
             )
             .child(div().flex_1())
             .when(
-                !environment && (self.functions.selected.is_none() || self.functions.editor_hidden),
+                !environment
+                    && self.functions.category != "功能"
+                    && (self.functions.selected.is_none() || self.functions.editor_hidden),
                 |row| {
                     row.child(
                         Button::new("function-account-refresh")
@@ -2283,7 +2310,9 @@ fn apple_profile_action(id: &str) -> bool {
 }
 fn account_action_known(id: &str, state: Option<&serde_json::Value>) -> bool {
     match id {
-        "apple-password-change" => ["identity", "icloud", "app_store"].iter().all(|d| domain_signed(state, d).is_some()),
+        "apple-password-change" => ["identity", "icloud", "app_store"]
+            .iter()
+            .all(|d| domain_signed(state, d).is_some()),
         "store-login" | "store-logout" => domain_signed(state, "app_store").is_some(),
         "cloud-login" => {
             domain_signed(state, "app_store") == Some(true)
@@ -2309,7 +2338,9 @@ fn account_action_known(id: &str, state: Option<&serde_json::Value>) -> bool {
 }
 fn account_action_visible(id: &str, state: Option<&serde_json::Value>) -> bool {
     match id {
-        "apple-password-change" => ["identity", "icloud", "app_store"].iter().any(|d| domain_signed(state, d) == Some(true)),
+        "apple-password-change" => ["identity", "icloud", "app_store"]
+            .iter()
+            .any(|d| domain_signed(state, d) == Some(true)),
         "store-login" => domain_signed(state, "app_store") == Some(false),
         "store-logout" => domain_signed(state, "app_store") == Some(true),
         "cloud-login" => {

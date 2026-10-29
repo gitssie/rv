@@ -36,6 +36,7 @@ fn emit(
     receipts: &mut HashMap<String, (u8, String)>,
 ) {
     match event {
+        FunctionEvent::Registration(_) => {}
         FunctionEvent::ForOperation { id, event } => {
             emit(*event, Some(id), target, mailbox, name, receipts)
         }

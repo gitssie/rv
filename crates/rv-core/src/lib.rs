@@ -4,6 +4,7 @@ mod app_shortcuts;
 pub mod assistant;
 mod connection;
 mod database;
+pub mod events;
 pub mod workspace;
 pub use app_shortcuts::{AppShortcut, default_app_shortcuts, move_app_shortcut};
 mod keyboard;

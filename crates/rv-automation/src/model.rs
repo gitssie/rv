@@ -100,6 +100,14 @@ impl TextSelector {
             && self.region.is_none_or(Rect::is_normalized)
     }
     pub(crate) fn matches(&self, element: &crate::TextElement, frame: Frame) -> bool {
+        self.matches_value(&self.text, element, frame)
+    }
+    pub(crate) fn matches_value(
+        &self,
+        expected: &str,
+        element: &crate::TextElement,
+        frame: Frame,
+    ) -> bool {
         let center = element.bounds.center();
         if let Some(region) = self.region {
             let x = center.x / f64::from(frame.width);
@@ -113,11 +121,11 @@ impl TextSelector {
             }
         }
         let (candidate, expected) = if self.case_sensitive {
-            (element.text.trim().to_owned(), self.text.trim().to_owned())
+            (element.text.trim().to_owned(), expected.trim().to_owned())
         } else {
             (
                 element.text.trim().to_lowercase(),
-                self.text.trim().to_lowercase(),
+                expected.trim().to_lowercase(),
             )
         };
         match self.mode {
@@ -137,6 +145,8 @@ pub enum Target {
     },
     /// A point in [0, 1) screen fractions, resolved against a fresh observation.
     Screen { point: Point },
+    /// Native coordinates derived from one observation; reject a changed frame.
+    FramePoint { frame: Frame, point: Point },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -145,6 +155,12 @@ pub enum Action {
     WaitForText {
         selector: TextSelector,
         present: bool,
+    },
+    /// Compare against a runtime value without putting it in a saved selector.
+    WaitForInput {
+        input: String,
+        case_sensitive: bool,
+        region: Option<Rect>,
     },
     Tap {
         target: Target,
@@ -161,6 +177,9 @@ impl Action {
     pub(crate) fn is_valid(&self) -> bool {
         match self {
             Self::WaitForText { selector, .. } => selector.is_valid(),
+            Self::WaitForInput { input, region, .. } => {
+                valid_id(input) && region.is_none_or(Rect::is_normalized)
+            }
             Self::Tap {
                 target: Target::Text { selector, offset },
             } => {
@@ -174,6 +193,9 @@ impl Action {
             } => [point.x, point.y]
                 .iter()
                 .all(|n| n.is_finite() && (0. ..1.).contains(n)),
+            Self::Tap {
+                target: Target::FramePoint { frame, point },
+            } => frame.contains(*point),
             Self::InputText { input } => valid_id(input),
             Self::Delay { milliseconds } => *milliseconds <= 60_000,
         }
@@ -238,7 +260,9 @@ impl InputValues {
     pub fn insert(&mut self, key: impl Into<String>, value: String) {
         self.0.insert(key.into(), Zeroizing::new(value));
     }
-    pub(crate) fn get(&self, key: &str) -> Option<&str> {
+    /// Runtime access for business postconditions. Never include the returned
+    /// value in progress, logs, or serialized workflow definitions.
+    pub fn get(&self, key: &str) -> Option<&str> {
         self.0.get(key).map(|value| value.as_str())
     }
 }

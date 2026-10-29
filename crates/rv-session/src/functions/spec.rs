@@ -19,9 +19,28 @@ macro_rules! op {
     };
 }
 
-static PASSWORD_CHANGE:OperationSpec=OperationSpec{id:"apple-password-change-internal",title:"首次登录修改密码",category:"Apple",task:31,method:"changePassword",fields:&["apple_id","password","new_password","device_passcode?","code_url?"],example:"",hint:""};
-pub(super) fn operation(id:&str)->Option<&'static OperationSpec>{
- if id==PASSWORD_CHANGE.id{Some(&PASSWORD_CHANGE)}else{OPERATIONS.iter().find(|s|s.id==id)}
+static PASSWORD_CHANGE: OperationSpec = OperationSpec {
+    id: "apple-password-change-internal",
+    title: "首次登录修改密码",
+    category: "Apple",
+    task: 31,
+    method: "changePassword",
+    fields: &[
+        "apple_id",
+        "password",
+        "new_password",
+        "device_passcode?",
+        "code_url?",
+    ],
+    example: "",
+    hint: "",
+};
+pub(super) fn operation(id: &str) -> Option<&'static OperationSpec> {
+    if id == PASSWORD_CHANGE.id {
+        Some(&PASSWORD_CHANGE)
+    } else {
+        OPERATIONS.iter().find(|s| s.id == id)
+    }
 }
 pub static OPERATIONS: &[OperationSpec] = &[
     op!(
@@ -35,8 +54,14 @@ pub static OPERATIONS: &[OperationSpec] = &[
         "也支持：账号----密码----验证码链接；链接可省略。"
     ),
     op!(
-        "apple-password-change", "修改密码", "Apple", 31, "changePassword",
-        ["password?", "code_url?"], "", "自动生成八位大小写字母和数字密码。已保存资料可留空；无记录时填写 密码=当前密码，验证码链接可选。"
+        "apple-password-change",
+        "修改密码",
+        "Apple",
+        31,
+        "changePassword",
+        ["password?", "code_url?"],
+        "",
+        "自动生成八位大小写字母和数字密码。已保存资料可留空；无记录时填写 密码=当前密码，验证码链接可选。"
     ),
     op!(
         "cloud-login",
@@ -169,42 +194,6 @@ pub static OPERATIONS: &[OperationSpec] = &[
         "移除该账户的其它关联设备。"
     ),
     op!(
-        "app-save",
-        "保存 App 环境",
-        "App 环境",
-        32,
-        "save",
-        ["bundle_id", "display_name?", "note?"],
-        "App=fr.vinted\n名称=工作账号 A\n备注=备用环境",
-        "首次保存必须提供名称；保存后 App 保持停止。"
-    ),
-    op!(
-        "app-switch",
-        "切换 App 环境",
-        "App 环境",
-        32,
-        "switch",
-        [
-            "bundle_id",
-            "backup_id",
-            "display_name?",
-            "note?",
-            "discard_current?"
-        ],
-        "App=fr.vinted\n备份=填写备份标识\n名称=当前环境名称",
-        "默认先保存当前环境。放弃当前环境=是 时不填写名称和备注。"
-    ),
-    op!(
-        "app-baseline",
-        "创建空白基线",
-        "App 环境",
-        32,
-        "createBaseline",
-        ["bundle_id"],
-        "App=fr.vinted",
-        "创建当前 App 版本的空白模板，不改变正在使用的数据。"
-    ),
-    op!(
         "app-list",
         "选择备份 / 查看标识",
         "App 环境",
@@ -223,36 +212,6 @@ pub static OPERATIONS: &[OperationSpec] = &[
         ["bundle_id", "backup_id", "display_name", "note"],
         "App=fr.vinted\n备份=填写备份标识\n名称=工作账号 B\n备注=备用环境",
         "仅编辑快照名称与备注；备注允许为空。"
-    ),
-    op!(
-        "app-delete",
-        "删除备份",
-        "App 环境",
-        32,
-        "delete",
-        ["bundle_id", "backup_id"],
-        "App=fr.vinted\n备份=填写备份标识",
-        "删除所选快照或版本基线；当前关联快照与正在恢复的归档不能删除。"
-    ),
-    op!(
-        "app-open",
-        "打开 App",
-        "App 环境",
-        32,
-        "launch",
-        ["bundle_id"],
-        "App=fr.vinted",
-        "打开所选 App。"
-    ),
-    op!(
-        "app-stop",
-        "停止 App",
-        "App 环境",
-        32,
-        "stop",
-        ["bundle_id"],
-        "App=fr.vinted",
-        "停止 App 及其扩展。"
     ),
     op!(
         "apple-query",
@@ -283,26 +242,6 @@ pub static OPERATIONS: &[OperationSpec] = &[
         [],
         "",
         "按需读取邮箱与验证信息。"
-    ),
-    op!(
-        "app-describe",
-        "读取 App 环境详情",
-        "App 环境",
-        32,
-        "describe",
-        ["bundle_id"],
-        "App=fr.vinted",
-        "按需读取环境详情。"
-    ),
-    op!(
-        "app-status",
-        "确认 App 是否停止",
-        "App 环境",
-        32,
-        "status",
-        ["bundle_id"],
-        "App=fr.vinted",
-        "按需确认 App 和扩展进程。"
     ),
 ];
 
@@ -471,13 +410,24 @@ mod tests {
     use super::*;
     #[test]
     fn cloud_login_only_requires_password_and_never_accepts_a_pasted_account() {
-        let spec = OPERATIONS.iter().find(|spec| spec.id == "cloud-login").unwrap();
-        assert_eq!(parse_operation(spec, "test-password").unwrap().params,
-            serde_json::json!({"password":"test-password"}));
+        let spec = OPERATIONS
+            .iter()
+            .find(|spec| spec.id == "cloud-login")
+            .unwrap();
+        assert_eq!(
+            parse_operation(spec, "test-password").unwrap().params,
+            serde_json::json!({"password":"test-password"})
+        );
         assert!(parse_operation(spec, "账号=other@test\n密码=test-password").is_err());
-        let parsed = parse_operation(spec,
-            "密码=test-password\n设备密码=001234\n验证码链接=https://code.example.test/get?id=123").unwrap();
-        assert_eq!(parsed.params, serde_json::json!({"password":"test-password","device_passcode":"001234"}));
+        let parsed = parse_operation(
+            spec,
+            "密码=test-password\n设备密码=001234\n验证码链接=https://code.example.test/get?id=123",
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.params,
+            serde_json::json!({"password":"test-password","device_passcode":"001234"})
+        );
         assert!(parsed.code_url.is_some());
     }
 
@@ -524,15 +474,20 @@ mod tests {
         assert!(parse_operation(&OPERATIONS[0], "账号=a\n密码=b\n未知=secret").is_err());
     }
     #[test]
-    fn typed_switch_and_explicit_logout_policy() {
-        let spec = OPERATIONS.iter().find(|s| s.id == "app-switch").unwrap();
-        assert_eq!(
-            parse_operation(spec, "App=fr.vinted\n备份=baseline:1\n放弃当前环境=是")
-                .unwrap()
-                .params["discard_current"],
-            true
-        );
-        assert!(parse_operation(spec, "App=fr.vinted\n备份=x\n放弃当前环境=是\n名称=A").is_err());
+    fn switch_is_removed_and_logout_uses_current_account() {
+        assert!(OPERATIONS.iter().all(|s| {
+            ![
+                "app-switch",
+                "app-save",
+                "app-baseline",
+                "app-delete",
+                "app-describe",
+                "app-open",
+                "app-stop",
+                "app-status",
+            ]
+            .contains(&s.id)
+        }));
         assert!(
             parse_operation(
                 OPERATIONS.iter().find(|s| s.id == "apple-logout").unwrap(),

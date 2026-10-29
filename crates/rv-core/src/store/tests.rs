@@ -119,7 +119,7 @@ fn password_and_unlock_clear_independently_and_device_delete_clears_both() {
         .save_unlock_code(&req, &UnlockCode::new("001234".into()).unwrap())
         .unwrap();
     req.host = "b".into();
-    assert!(book.paths.load_unlock_code(&req).unwrap().is_none());
+    assert!(book.paths.load_unlock_code(&req).unwrap().is_some());
     req.host = "a".into();
     book.paths.delete_password(id).unwrap();
     assert!(book.paths.load_unlock_code(&req).unwrap().is_some());
@@ -182,4 +182,44 @@ fn ad_hoc_credentials_are_endpoint_scoped_in_database() {
     req.port = 5900;
     book.paths.delete_unlock_code(&req).unwrap();
     assert!(book.paths.load_unlock_code(&req).unwrap().is_none());
+}
+
+#[test]
+fn editing_device_ip_preserves_passwords_and_other_device_settings() {
+    let (mut book, _) = book();
+    let mut device = Connection::new("phone", "old.example", 5900);
+    device.remember_password = true;
+    device.zxtouch_port = Some(6001);
+    device.labels = vec!["keep-label".into()];
+    let id = device.id;
+    book.upsert(device.clone());
+    book.save().unwrap();
+    let request = ConnectRequest::from_connection(&device, None);
+    book.paths.save_password(id, "saved-vnc").unwrap();
+    book.paths
+        .save_unlock_code(&request, &UnlockCode::new("001234".into()).unwrap())
+        .unwrap();
+    book.get_mut(id).unwrap().host = "new.example".into();
+    book.save().unwrap();
+    let loaded = AddressBook::load(book.paths.clone()).unwrap();
+    let saved = loaded.get(id).unwrap();
+    assert_eq!(saved.name, device.name);
+    assert_eq!(saved.port, device.port);
+    assert_eq!(saved.labels, device.labels);
+    assert_eq!(saved.zxtouch_port, device.zxtouch_port);
+    assert_eq!(saved.remember_password, device.remember_password);
+    assert_eq!(
+        loaded.paths.load_password(id).unwrap().as_deref(),
+        Some("saved-vnc")
+    );
+    let changed = ConnectRequest::from_connection(saved, None);
+    assert_eq!(
+        loaded
+            .paths
+            .load_unlock_code(&changed)
+            .unwrap()
+            .unwrap()
+            .digits(),
+        b"001234"
+    );
 }

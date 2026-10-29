@@ -1,13 +1,19 @@
 //! Home controller. Phone sessions, persistence, shared cards and App renderers
 //! have explicit boundaries; no file import or manual App creation exists here.
+mod avatar;
+mod backup_info;
 mod business_ui;
 mod cards;
 pub(in crate::app) mod control;
 mod deletion;
 mod devices;
 mod editor;
+mod handoff;
 mod plugins;
 mod proxies;
+mod task_config;
+mod token_expiry;
+mod token_source;
 use super::{AddressBookApp, Modal};
 use gpui::*;
 use gpui_component::input::{InputEvent, InputState, TextareaState};
@@ -20,11 +26,18 @@ pub(super) struct PhoneWindow {
     pub view: WeakEntity<crate::session_window::SessionView>,
     pub window: WindowHandle<gpui_component::Root>,
 }
+#[derive(Default)]
+pub(super) struct CardContext {
+    pub expiry: TokenExpirations,
+    pub proxy_name: Option<String>,
+    pub execution: AppExecution,
+}
 pub(super) struct HomeState {
     pub apps: Vec<AppInstance>,
     pub icons: HashMap<String, std::sync::Arc<RenderImage>>,
     pub links: HashMap<AppId, Vec<BackupLink>>,
     pub previews: HashMap<AppId, rv_business::data::BusinessRow>,
+    pub card_context: HashMap<AppId, CardContext>,
     pub available_tags: Vec<String>,
     pub(in crate::app) plugins: plugins::RenderRegistry,
     pub device_search: Entity<InputState>,
@@ -40,13 +53,21 @@ pub(super) struct HomeState {
     pub control_loading: HashMap<ConnectionId, u64>,
     pub control_revision: u64,
     pub editing: Option<AppInstance>,
+    pub token_expirations: TokenExpirations,
     pub proxies: proxies::ProxyView,
     pub deletion: Option<deletion::AppDeletion>,
-    pub tasks: Vec<AppTask>,
+    pub task_worker: Option<rv_business::tasks::TaskWorker>,
+    pub change_subscription: Option<gpui::Task<()>>,
     pub jobs: std::collections::HashSet<AppId>,
+    pub token_updates: Option<Task<()>>,
+    pub manual_syncs: std::collections::HashSet<(AppId,rv_business::Operation)>,
+    pub backup_syncing: HashMap<AppId, (ConnectionId, EntityId)>,
+    pub handoff_running: HashMap<AppId, EntityId>,
+    pub avatar_preparing: std::collections::HashSet<AppId>,
+    pub avatar_setting: std::collections::HashSet<AppId>,
     pub business: business_ui::BusinessView,
+    pub task_config: task_config::TaskConfigView,
     pub component_dialog: Option<u8>,
-    pub title: Entity<InputState>,
     pub tags: Entity<InputState>,
     pub note: Entity<TextareaState>,
 }
@@ -61,6 +82,7 @@ impl HomeState {
             apps,
             links,
             previews: HashMap::new(),
+            card_context: HashMap::new(),
             available_tags,
             error,
             plugins: plugins::RenderRegistry::default(),
@@ -69,7 +91,6 @@ impl HomeState {
                     .placeholder("搜索设备…")
                     .clean_on_escape()
             }),
-            title: cx.new(|cx| InputState::new(window, cx).placeholder("名称")),
             tags: cx.new(|cx| InputState::new(window, cx).placeholder("多个标签，用逗号分隔")),
             note: cx.new(|cx| TextareaState::new(window, cx).rows(3).placeholder("备注")),
             icons: HashMap::new(),
@@ -84,11 +105,20 @@ impl HomeState {
             control_loading: HashMap::new(),
             control_revision: 0,
             editing: None,
+            token_expirations: Default::default(),
             proxies: proxies::ProxyView::new(window, cx),
             deletion: None,
-            tasks: vec![],
+            task_worker: None,
+            change_subscription: None,
             jobs: Default::default(),
+            token_updates: None,
+            manual_syncs: Default::default(),
+            backup_syncing: Default::default(),
+            handoff_running: Default::default(),
+            avatar_preparing: Default::default(),
+            avatar_setting: Default::default(),
             business: business_ui::BusinessView::new(window, cx),
+            task_config: task_config::TaskConfigView::new(window, cx),
             component_dialog: None,
         }
     }
@@ -106,7 +136,7 @@ fn read_home(
     tag: Option<&str>,
 ) -> Result<HomeData, String> {
     let store = WorkspaceStore::open(paths).map_err(|e| e.to_string())?;
-    let apps = store
+    let mut apps = store
         .list(&AppQuery {
             text,
             filter,
@@ -115,6 +145,20 @@ fn read_home(
             ..Default::default()
         })
         .map_err(|e| e.to_string())?;
+    if matches!(sort, AppSort::Title) {
+        let renderers = plugins::RenderRegistry::default();
+        apps.sort_by_cached_key(|app| {
+            (
+                std::cmp::Reverse(app.pinned),
+                app.position,
+                renderers
+                    .for_bundle(&app.bundle_id)
+                    .display_title(app)
+                    .to_lowercase(),
+                app.id.as_str().to_string(),
+            )
+        });
+    }
     let links = apps
         .iter()
         .map(|a| store.backups(&a.id).map(|v| (a.id.clone(), v)))
@@ -140,8 +184,37 @@ impl AddressBookApp {
             None => avatar,
         }
     }
+    pub(in crate::app) fn virtual_app_avatar(
+        &self,
+        app: &AppInstance,
+    ) -> gpui_component::avatar::Avatar {
+        match self
+            .home
+            .plugins
+            .for_bundle(&app.bundle_id)
+            .avatar_path(app, self.book.paths())
+        {
+            Some(path) => gpui_component::avatar::Avatar::new().src(path),
+            None => self.app_avatar(&app.bundle_id),
+        }
+    }
+    fn reload_token_expirations(&mut self, id: &AppId) {
+        match WorkspaceStore::open(self.book.paths()).and_then(|s| s.auth(id)) {
+            Ok(auth) => {
+                self.home.token_expirations =
+                    auth.map(|a| a.token_expirations()).unwrap_or_default();
+                self.home.card_context.entry(id.clone()).or_default().expiry =
+                    self.home.token_expirations;
+            }
+            Err(error) => {
+                tracing::error!(app_id=id.as_str(),error=%error,"Token expiry read failed");
+                self.home.token_expirations = Default::default();
+            }
+        }
+    }
     pub(super) fn subscribe_home(&mut self, cx: &mut Context<Self>) {
         self.subscribe_business(cx);
+        self.subscribe_proxy_form(cx);
         self.reload_home(cx);
         self._subscriptions.push(
             cx.subscribe(&self.search, |this, _, event: &InputEvent, cx| {
@@ -172,6 +245,36 @@ impl AddressBookApp {
                 .background_executor()
                 .spawn(async move {
                     let data = read_home(&paths, &query, filter, sort, tag.as_deref())?;
+                    let store = WorkspaceStore::open(&paths).map_err(|e| e.to_string())?;
+                    let proxy_names: HashMap<_, _> = store
+                        .proxies()
+                        .map_err(|e| e.to_string())?
+                        .into_iter()
+                        .map(|proxy| (proxy.id, proxy.name))
+                        .collect();
+                    let mut card_context = HashMap::new();
+                    for app in &data.0 {
+                        if rv_business::strategy(&app.bundle_id).is_none() {
+                            continue;
+                        }
+                        let expiry = store
+                            .auth(&app.id)
+                            .map_err(|e| e.to_string())?
+                            .map(|auth| auth.token_expirations())
+                            .unwrap_or_default();
+                        let proxy_name = store
+                            .proxy_binding(&app.id)
+                            .map_err(|e| e.to_string())?
+                            .and_then(|id| proxy_names.get(&id).cloned());
+                        card_context.insert(
+                            app.id.clone(),
+                            CardContext {
+                                expiry,
+                                proxy_name,
+                                execution: store.execution(&app.id).map_err(|e| e.to_string())?,
+                            },
+                        );
+                    }
                     let mut previews = HashMap::new();
                     for app in &data.0 {
                         if rv_business::strategy(&app.bundle_id).is_none() {
@@ -199,7 +302,7 @@ impl AddressBookApp {
                             crate::app_icons::load(&paths, &bundle).map(|image| (bundle, image))
                         })
                         .collect();
-                    Ok::<_, String>((data, previews, icons))
+                    Ok::<_, String>((data, previews, icons, card_context))
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
@@ -208,10 +311,10 @@ impl AddressBookApp {
                 }
                 this.home.loading = false;
                 match result {
-                    Ok(((apps, links, tags), previews, icons)) => {
+                    Ok(((apps, links, tags), previews, icons, card_context)) => {
+                        this.home.card_context = card_context;
                         this.home.icons.extend(icons);
                         this.home.previews = previews;
-                        this.load_preview_images(sequence, cx);
                         this.home.apps = apps;
                         this.home.links = links;
                         this.home.available_tags = tags;
@@ -228,43 +331,12 @@ impl AddressBookApp {
                             });
                         }
                     }
-                    Err(e) => this.home.error = Some(e),
+                    Err(error) => {
+                        tracing::error!(error=%error, "Virtual App list read failed");
+                        this.home.error = Some("读取账号列表失败，请查看日志".into());
+                    }
                 }
                 cx.notify();
-            });
-        })
-        .detach();
-    }
-    fn load_preview_images(&mut self, sequence: u64, cx: &mut Context<Self>) {
-        let paths = self.book.paths().clone();
-        let entries: Vec<_> = self
-            .home
-            .previews
-            .iter()
-            .map(|(id, row)| (id.clone(), row.clone()))
-            .collect();
-        cx.spawn(async move |this, cx| {
-            let previews = cx
-                .background_executor()
-                .spawn(async move {
-                    entries
-                        .into_iter()
-                        .map(|(id, mut row)| {
-                            rv_business::assets::hydrate(
-                                &paths,
-                                &id,
-                                std::slice::from_mut(&mut row),
-                            );
-                            (id, row)
-                        })
-                        .collect()
-                })
-                .await;
-            let _ = this.update(cx, |this, cx| {
-                if this.home.sequence == sequence {
-                    this.home.previews = previews;
-                    cx.notify();
-                }
             });
         })
         .detach();
@@ -277,9 +349,6 @@ impl AddressBookApp {
                 return;
             }
         };
-        self.home
-            .title
-            .update(cx, |s, cx| s.set_value(app.title.clone(), window, cx));
         self.home
             .tags
             .update(cx, |s, cx| s.set_value(app.tags.join(", "), window, cx));
@@ -299,10 +368,8 @@ impl AddressBookApp {
                 return;
             }
         }
+        self.reload_token_expirations(&id);
         self.home.editing = Some(app);
-        self.home.tasks = WorkspaceStore::open(self.book.paths())
-            .and_then(|store| store.tasks(&id))
-            .unwrap_or_default();
         self.modal = Modal::App;
         cx.notify();
     }
@@ -340,7 +407,6 @@ impl AddressBookApp {
         let Some(mut app) = self.home.editing.clone() else {
             return;
         };
-        app.title = self.home.title.read(cx).value().to_string();
         app.tags = super::parse_labels(&self.home.tags.read(cx).value().replace('，', ","));
         app.note = self.home.note.read(cx).value().to_string();
         match WorkspaceStore::open(self.book.paths())
@@ -358,33 +424,150 @@ impl AddressBookApp {
     pub(crate) fn import_app_profile(
         &mut self,
         id: &AppId,
-        profile: &serde_json::Value,
+        profile: &rv_core::workspace::ShadowAppState,
+        source: Option<rv_core::ConnectionId>,
+        owner: EntityId,
         cx: &mut Context<Self>,
-    ) {
-        if self.read_only {
-            return;
-        }
-        match WorkspaceStore::open(self.book.paths())
-            .and_then(|mut store| store.import_profile(id, profile))
+    ) -> bool {
+        if self
+            .home
+            .backup_syncing
+            .get(id)
+            .is_some_and(|(_, current)| *current != owner)
         {
-            Ok(()) => self.set_status("账号资料已保存，可脱离手机执行任务", cx),
-            Err(error) => self.set_status(format!("账号资料保存失败：{error}"), cx),
+            return false;
+        }
+        self.home.backup_syncing.remove(id);
+        if self.read_only {
+            return false;
+        }
+        let mut imported = false;
+        match WorkspaceStore::open(self.book.paths())
+            .and_then(|mut store| store.import_app_state(id, source, profile))
+        {
+            Ok(()) => {
+                imported = true;
+                match rv_business::tasks::initialize(self.book.paths(), id) {
+                    Ok(()) => {
+                        let bound = WorkspaceStore::open(self.book.paths())
+                            .and_then(|s| s.proxy_binding(id))
+                            .ok()
+                            .flatten()
+                            .is_some();
+                        self.set_status(
+                            if bound {
+                                "账号备份已保存，任务按现有计划执行"
+                            } else {
+                                "账号资料已保存，请编辑虚拟 App 关联代理，任务随后自动执行"
+                            },
+                            cx,
+                        );
+                    }
+                    Err(error) => {
+                        tracing::error!(app_id=id.as_str(),error=%error,"Task workflow initialization failed");
+                        self.set_status("账号资料已保存，初始化任务创建失败，请查看日志", cx)
+                    }
+                }
+            }
+            Err(error) => {
+                let message = self.task_error_message("保存账号资料", None, &error);
+                self.set_status(message, cx);
+            }
         }
         self.reload_chat(cx);
         self.refresh_editing_baseline(id);
         self.reload_home(cx);
+        imported
     }
     fn refresh_editing_baseline(&mut self, id: &AppId) {
         if self.home.editing.as_ref().is_some_and(|app| app.id == *id) {
+            self.reload_token_expirations(id);
             if let Ok(latest) =
                 WorkspaceStore::open(self.book.paths()).and_then(|store| store.load(id))
             {
-                // Input entities retain the user's unsaved title, tags and note.
+                // Input entities retain the user's unsaved tags and note.
                 self.home.editing = Some(latest);
             }
         }
     }
-    pub(super) fn read_backup_profile(
+    pub(super) fn confirm_backup_profile_sync(
+        &mut self,
+        id: AppId,
+        link: BackupLink,
+        bundle: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.read_only || self.home.backup_syncing.contains_key(&id) {
+            return;
+        }
+        let owner = cx.entity();
+        let source = self
+            .backup_source_labels(std::slice::from_ref(&link))
+            .join("");
+        crate::ui::confirm_backup_sync(source, window, cx, move |_, cx| {
+            owner.update(cx, |this, cx| {
+                this.read_backup_profile(id.clone(), link.clone(), bundle.clone(), cx);
+            });
+        });
+    }
+    pub(crate) fn begin_backup_sync(
+        &mut self,
+        id: &AppId,
+        source: ConnectionId,
+        owner: EntityId,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.read_only || self.home.backup_syncing.contains_key(id) {
+            return false;
+        }
+        self.home.backup_syncing.insert(id.clone(), (source, owner));
+        self.set_status("正在从手机读取账号备份…", cx);
+        true
+    }
+    pub(crate) fn backup_sync_failed(
+        &mut self,
+        id: &AppId,
+        owner: EntityId,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .home
+            .backup_syncing
+            .get(id)
+            .is_some_and(|(_, current)| *current != owner)
+        {
+            return;
+        }
+        self.home.backup_syncing.remove(id);
+        self.set_status("账号备份同步失败，请查看日志", cx);
+    }
+    pub(crate) fn backup_sync_disconnected(&mut self, owner: EntityId, cx: &mut Context<Self>) {
+        let interrupted: Vec<_> = self
+            .home
+            .handoff_running
+            .iter()
+            .filter(|(_, source)| **source == owner)
+            .map(|(id, _)| id.clone())
+            .collect();
+        let refresh_owner = !interrupted.is_empty();
+        for id in interrupted {
+            self.home.handoff_running.remove(&id);
+            self.set_status("手机连接已结束，交接状态保留，RV 任务保持停止", cx);
+        }
+        if refresh_owner {
+            self.reload_home(cx);
+        }
+        let count = self.home.backup_syncing.len();
+        self.home
+            .backup_syncing
+            .retain(|_, (_, source_owner)| *source_owner != owner);
+        if self.home.backup_syncing.len() != count {
+            self.set_status("手机已断开，账号备份同步未完成", cx);
+        }
+    }
+
+    fn read_backup_profile(
         &mut self,
         id: AppId,
         link: BackupLink,
@@ -403,62 +586,40 @@ impl AddressBookApp {
             self.set_status("请先连接来源手机，再读取账号资料", cx);
             return;
         };
-        view.update(cx, |view, cx| {
-            view.read_home_profile(id, bundle, link.backup_id, cx)
-        });
-    }
-    pub(super) fn run_offline_job(
-        &mut self,
-        id: AppId,
-        operation: rv_business::Operation,
-        cx: &mut Context<Self>,
-    ) {
-        self.dispatch_offline_job(id, operation, None, cx);
-    }
-    pub(super) fn dispatch_offline_job(
-        &mut self,
-        id: AppId,
-        operation: rv_business::Operation,
-        scheduled: Option<rv_business::schedules::ScheduledJob>,
-        cx: &mut Context<Self>,
-    ) {
-        if self.read_only || !self.home.jobs.insert(id.clone()) {
+        if self.home.backup_syncing.contains_key(&id) {
             return;
         }
-        let paths = self.book.paths().clone();
-        let task_id = id.clone();
+        let started = view.update(cx, |view, cx| {
+            view.read_home_profile(id.clone(), bundle, link.backup_id, cx)
+        });
+        if started {
+            self.begin_backup_sync(&id, link.device_id, view.entity_id(), cx);
+        } else {
+            self.set_status("请先连接来源手机并完成当前备份操作", cx);
+        }
+    }
+    pub(super) fn run_shop_sync(
+        &mut self,id:AppId,operation:rv_business::Operation,cx:&mut Context<Self>,
+    ) {
+        if self.read_only || !self.home.manual_syncs.insert((id.clone(),operation)){return;}
+        self.home.jobs.insert(id.clone());
+        let paths=self.book.paths().clone();
         cx.notify();
-        cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move {
-                    let runner = rv_business::OfflineRunner::new(None)?;
-                    if let Some(job) = scheduled {
-                        runner.run_scheduled_blocking(&paths, &job)
-                    } else {
-                        runner.run_blocking(&paths, &task_id, operation)
-                    }
-                })
-                .await;
-            let _ = this.update(cx, |this, cx| {
-                this.home.jobs.remove(&id);
+        cx.spawn(async move |this,cx| {
+            let result=rv_business::shop_sync::synchronize(paths,id.clone(),operation).await;
+            let _=this.update(cx,|this,cx| {
+                this.home.manual_syncs.remove(&(id.clone(),operation));
+                if !this.home.manual_syncs.iter().any(|(app,_)|app==&id)&&!this.home.avatar_setting.contains(&id){this.home.jobs.remove(&id);}
                 match result {
-                    Ok(()) => this.set_status(format!("{}已完成", operation.label()), cx),
-                    Err(message) => this.set_status(message, cx),
-                };
-                if this.home.editing.as_ref().is_some_and(|app| app.id == id) {
-                    this.home.tasks = WorkspaceStore::open(this.book.paths())
-                        .and_then(|store| store.tasks(&id))
-                        .unwrap_or_default();
+                    Ok(_)=>this.set_status(format!("{}完成",operation.label()),cx),
+                    Err(error)=>{
+                        tracing::error!(app_id=%id.as_str(),operation=operation.key(),%error,"Manual shop sync failed");
+                        this.set_error_status(format!("{}失败：{error}",operation.label()),cx);
+                    }
                 }
-                this.refresh_editing_baseline(&id);
-                if this.home.editing.as_ref().is_some_and(|app| app.id == id) {
-                    this.reload_business_data(cx);
-                }
-                this.reload_home(cx);
+                cx.notify();
             });
-        })
-        .detach();
+        }).detach();
     }
     pub(super) fn change_app(
         &mut self,

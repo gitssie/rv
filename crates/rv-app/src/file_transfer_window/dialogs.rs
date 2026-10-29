@@ -6,14 +6,36 @@ use gpui_component::{
     dialog::{Dialog, DialogButtonProps, DialogFooter},
 };
 
-pub(super) struct TransferShell(pub Entity<FileTransferView>);
+pub(super) struct TransferShell {
+    view: Entity<FileTransferView>,
+    _updates: Subscription,
+}
+impl TransferShell {
+    pub(super) fn new(view: Entity<FileTransferView>, cx: &mut Context<Self>) -> Self {
+        let updates = cx.observe(&view, |_, _, cx| cx.notify());
+        Self {
+            view,
+            _updates: updates,
+        }
+    }
+}
 impl Render for TransferShell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Synchronize before Root evaluates the saved dialog builder.
+        self.view
+            .update(cx, |view, cx| view.sync_component_dialog(window, cx));
         div()
             .size_full()
             .relative()
-            .child(self.0.clone())
-            .children(gpui_component::Root::render_dialog_layer(window, cx))
+            .child(self.view.clone())
+            .children(
+                gpui_component::Root::render_dialog_layer(window, cx).map(|layer| {
+                    div()
+                        .id("transfer-dialog-layer")
+                        .debug_selector(|| "transfer-dialog-layer".into())
+                        .child(layer)
+                }),
+            )
     }
 }
 impl FileTransferView {
@@ -209,7 +231,10 @@ impl FileTransferView {
                 let title = if kind == 3 {
                     "New folder".to_owned()
                 } else {
-                    format!("Rename {}", self.pending_rename.as_ref().unwrap().name)
+                    let Some(details) = self.pending_rename.as_ref() else {
+                        return dialog;
+                    };
+                    format!("Rename {}", details.name)
                 };
                 let ok = Button::new("transfer-dialog-submit")
                     .primary()

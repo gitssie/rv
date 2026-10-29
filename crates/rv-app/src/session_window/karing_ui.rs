@@ -1,4 +1,5 @@
 use super::*;
+use gpui_component::switch::Switch;
 use rv_session::{
     AppCommand, KaringCatalogue, KaringRequest, KaringResponse, KaringSelection, karing_component,
 };
@@ -100,15 +101,15 @@ impl SessionView {
             body: body.to_string().into_bytes(),
         }));
     }
-    fn connect_karing(&mut self, cx: &mut Context<Self>) {
-        if !self.karing_allowed() || !self.karing.pending.is_empty() {
+    fn connect_karing(&mut self, connected: bool, cx: &mut Context<Self>) {
+        if !self.karing_allowed()
+            || !self.karing.pending.is_empty()
+            || self.karing.vpn_connected.is_none()
+            || self.karing.vpn_connected == Some(connected)
+        {
             return;
         }
-        let operation = if self.karing.vpn_connected == Some(true) {
-            "disconnect"
-        } else {
-            "connect"
-        };
+        let operation = if connected { "connect" } else { "disconnect" };
         self.karing.message = if operation == "connect" {
             "连接 VPN…"
         } else {
@@ -684,15 +685,13 @@ impl SessionView {
                     .child(div().text_color(theme::muted(cx)).child(status))
                     .when(self.karing_native(), |row| {
                         row.child(
-                            Button::new("karing-vpn-toggle")
-                                .ghost()
-                                .label(match self.karing.vpn_connected {
-                                    Some(true) => "断开 VPN",
-                                    Some(false) => "连接 VPN",
-                                    None => "读取 VPN",
-                                })
+                            Switch::new("karing-vpn-toggle")
+                                .label("VPN")
+                                .checked(self.karing.vpn_connected == Some(true))
                                 .disabled(!enabled || self.karing.vpn_connected.is_none())
-                                .on_click(cx.listener(|this, _, _, cx| this.connect_karing(cx))),
+                                .on_click(cx.listener(|this, connected: &bool, _, cx| {
+                                    this.connect_karing(*connected, cx)
+                                })),
                         )
                     }),
             )
@@ -885,7 +884,7 @@ impl SessionView {
                     .child(
                         Button::new("karing-refresh-nodes")
                             .ghost()
-                            .label("刷新节点")
+                            .label("读取配置")
                             .debug_selector(|| "karing-refresh-nodes".into())
                             .disabled(!enabled)
                             .on_click(cx.listener(|this, _, _, cx| this.refresh_karing(cx))),

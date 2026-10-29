@@ -132,7 +132,10 @@ mod tests {
     #[test]
     fn cloud_login_uses_authenticated_store_account() {
         let mut value = state(None, Some("identity@test"), Some("store@test"));
-        assert_eq!(current_account("enableICloud", &value).unwrap(), "store@test");
+        assert_eq!(
+            current_account("enableICloud", &value).unwrap(),
+            "store@test"
+        );
         value["app_store"]["account"]["authenticated"] = json!(false);
         assert!(current_account("enableICloud", &value).is_err());
         assert!(current_account("enableICloud", &state(Some("cloud@test"), None, None)).is_err());

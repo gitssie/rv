@@ -1,0 +1,3 @@
+Message and Bubble originate from https://github.com/longbridge/gpui-component at commit 80230b65 (Apache-2.0). Source files are preserved separately from RV business/UI code, retaining native component layout and styling. This adapter re-exports RV's pinned GPUI Component dependencies; it can be removed when RV adopts an upstream release containing these components. Translation text is supplied through native content slots, not a new bubble implementation.
+
+Compatibility change: inline the upstream radius_2xl accessor (Theme::radius * 2.5), which is not exposed by 0.5.2. No new colors or control dimensions are introduced.

@@ -6,8 +6,18 @@ use serde_json::Value;
 const COLUMNS: &str = "a.id,a.bundle_id,a.title,a.identity_key,a.tags,a.note,a.metadata,a.favorite,a.pinned,a.archived,a.position,a.group_name,a.created_at,a.updated_at,a.last_used_at,a.revision";
 pub struct WorkspaceStore {
     pub(super) db: Connection,
+    pub(super) changes: super::changes::ChangeTracker,
+    pub(super) events: crate::events::EventBus,
+}
+impl Drop for WorkspaceStore {
+    fn drop(&mut self) {
+        self.publish_changes();
+    }
 }
 impl WorkspaceStore {
+    pub(super) fn publish_changes(&self) {
+        self.changes.publish(&self.db, &self.events);
+    }
     /// Trusted Bundle plugins own their schema and repositories in this database.
     /// The callback must not start/commit transactions or perform network I/O.
     pub fn business_transaction<T>(
@@ -19,11 +29,17 @@ impl WorkspaceStore {
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let result = action(&tx)?;
         tx.commit()?;
+        self.publish_changes();
         Ok(result)
     }
     pub fn open(paths: &StorePaths) -> Result<Self, StoreError> {
+        let db = crate::database::open(&paths.database)?;
+        let changes = super::changes::ChangeTracker::install(&db)?;
+        let events = crate::events::workspace_bus(paths)?;
         Ok(Self {
-            db: crate::database::open(&paths.database)?,
+            db,
+            changes,
+            events,
         })
     }
     pub fn delete_app(&mut self, id: &AppId) -> Result<(), StoreError> {
@@ -36,6 +52,7 @@ impl WorkspaceStore {
         )?;
         tx.execute("DELETE FROM app_instances WHERE id=?1", [id.as_str()])?;
         tx.commit()?;
+        self.publish_changes();
         Ok(())
     }
     pub fn load(&self, id: &AppId) -> Result<AppInstance, StoreError> {
@@ -137,6 +154,7 @@ impl WorkspaceStore {
             [result.id.as_str()],
             |row| row.get(0),
         )?;
+        self.publish_changes();
         Ok(result)
     }
     /// Browsing is usage, not a content edit. Preserve update time and revision.
@@ -148,6 +166,7 @@ impl WorkspaceStore {
         {
             return Err(StoreError::Invalid("App 不存在".into()));
         }
+        self.publish_changes();
         Ok(())
     }
     pub fn backups(&self, id: &AppId) -> Result<Vec<BackupLink>, StoreError> {
@@ -176,6 +195,44 @@ impl WorkspaceStore {
         bundle: &str,
         result: &Value,
     ) -> Result<SyncResult, StoreError> {
+        self.sync_backups_inner(device, bundle, result, None)
+    }
+    /// Explicitly re-import just the selected phone snapshot. Background sync
+    /// continues to respect all other local deletion/dismissal records.
+    pub fn reimport_backup(
+        &mut self,
+        device: ConnectionId,
+        bundle: &str,
+        result: &Value,
+        id: &AppId,
+        backup: &str,
+    ) -> Result<SyncResult, StoreError> {
+        if backup != format!("snapshot:{}", id.as_str())
+            || !result["backups"].as_array().is_some_and(|rows| {
+                rows.iter().any(|row| {
+                    row["kind"] == "snapshot"
+                        && row["backup_id"].as_str() == Some(backup)
+                        && row["idfv"]
+                            .as_str()
+                            .and_then(|v| AppId::from_idfv(v).ok())
+                            .as_ref()
+                            == Some(id)
+                })
+            })
+        {
+            return Err(StoreError::Invalid(
+                "所选备份不在当前手机列表中，请先刷新备份列表".into(),
+            ));
+        }
+        self.sync_backups_inner(device, bundle, result, Some(id))
+    }
+    fn sync_backups_inner(
+        &mut self,
+        device: ConnectionId,
+        bundle: &str,
+        result: &Value,
+        reimport: Option<&AppId>,
+    ) -> Result<SyncResult, StoreError> {
         if result["bundle_id"].as_str() != Some(bundle) || bundle.is_empty() {
             return Err(StoreError::Invalid("备份回复与 App 不匹配".into()));
         }
@@ -192,6 +249,9 @@ impl WorkspaceStore {
         )?;
         if !exists {
             return Err(StoreError::UnknownConnection);
+        }
+        if let Some(id) = reimport {
+            tx.execute("DELETE FROM app_dismissed WHERE id=?1", [id.as_str()])?;
         }
         tx.execute("INSERT INTO phone_app_state VALUES(?1,?2,?3,?4) ON CONFLICT(device_id,bundle_id) DO UPDATE SET result=excluded.result,updated_at=excluded.updated_at",params![device.to_string(),bundle,serde_json::to_string(result)?,now()])?;
         tx.execute("DELETE FROM app_backups WHERE device_id=?1 AND app_id IN(SELECT id FROM app_instances WHERE bundle_id=?2)",params![device.to_string(),bundle])?;
@@ -254,6 +314,7 @@ impl WorkspaceStore {
             report.linked += 1;
         }
         tx.commit()?;
+        self.publish_changes();
         Ok(report)
     }
     pub fn phone_state(

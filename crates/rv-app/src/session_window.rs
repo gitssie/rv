@@ -246,7 +246,10 @@ impl SessionView {
         cx: &mut Context<Self>,
     ) -> Self {
         let title = req.display_name().to_string();
-        let handle = SessionHandle::spawn_control(req.clone());
+        let handle = match &options.app_icon_cache {
+            Some(paths) => SessionHandle::spawn_control_with_store(req.clone(), paths.clone()),
+            None => SessionHandle::spawn_control(req.clone()),
+        };
         Self::with_transport(
             req,
             title,
@@ -294,6 +297,19 @@ impl SessionView {
             app_shortcuts,
             remember_password,
         } = options;
+        let release_book = address_book.clone();
+        let release_owner = cx.entity().entity_id();
+        cx.on_release(move |_, cx| {
+            // Releasing a control may happen while the address book is updating it.
+            cx.defer(move |cx| {
+                if let Some(book) = release_book.and_then(|book| book.upgrade()) {
+                    book.update(cx, |book, cx| {
+                        book.backup_sync_disconnected(release_owner, cx)
+                    });
+                }
+            });
+        })
+        .detach();
         let store_paths = app_icon_cache
             .clone()
             .or_else(|| rv_core::StorePaths::default_dir().ok());
@@ -455,7 +471,7 @@ impl SessionView {
     }
 
     fn view_only(&self) -> bool {
-        self.req.view_only
+        self.req.view_only || self.functions.registration_busy()
     }
 
     fn host(&self) -> String {
@@ -630,6 +646,10 @@ impl SessionView {
                     self.status = e.into();
                 }
                 SessionEvent::Disconnected => {
+                    if self.functions.registration_busy() {
+                        self.handle
+                            .function(rv_session::FunctionCommand::StopRegistration);
+                    }
                     let deliberate = self.phase == Phase::Disconnecting;
                     if !deliberate {
                         self.recovery
@@ -775,7 +795,9 @@ impl SessionView {
     }
 
     fn send_pointer(&mut self, x: u16, y: u16) {
-        if self.touch_gesture.busy() { return; }
+        if self.touch_gesture.busy() {
+            return;
+        }
         // Hover is not a takeover. Its zero-button packet would also release
         // a scripted long press, so suppress it until the sequence ends.
         if self.buttons == 0 && self.clipboard_transfer.post_paste.is_some() {
@@ -800,7 +822,12 @@ impl SessionView {
             return;
         }
         self.cancel_post_paste_touch();
-        if bit == 1 && down && !self.view_only() && !self.unlock.blocks_input() && self.phase == Phase::Connected {
+        if bit == 1
+            && down
+            && !self.view_only()
+            && !self.unlock.blocks_input()
+            && self.phase == Phase::Connected
+        {
             if let Some(point) = self.map_pointer(position) {
                 self.clipboard_transfer.last_click = Some(point);
             }
@@ -853,7 +880,9 @@ impl SessionView {
     fn send_keys(&mut self, events: impl IntoIterator<Item = (u32, bool)>) {
         let mut events = events.into_iter().peekable();
         if self.touch_gesture.busy() {
-            if events.peek().is_some() { self.cancel_touch_gesture(); }
+            if events.peek().is_some() {
+                self.cancel_touch_gesture();
+            }
             // Callers may have updated Keyboard while constructing the suppressed
             // events. Remote keys were released before playback; keep that state
             // so the next real input resends any physically held modifiers.
@@ -893,6 +922,14 @@ impl SessionView {
     }
 
     fn disconnect(&mut self, cx: &mut Context<Self>) {
+        if let Some(book) = self.address_book.as_ref().and_then(WeakEntity::upgrade) {
+            let owner = cx.entity().entity_id();
+            book.update(cx, |book, cx| book.backup_sync_disconnected(owner, cx));
+        }
+        if self.functions.registration_busy() {
+            self.handle
+                .function(rv_session::FunctionCommand::StopRegistration);
+        }
         self.cancel_touch_gesture();
         self.cancel_post_paste_touch();
         self.recovery.stop();
@@ -1155,6 +1192,20 @@ impl SessionView {
                     }))
                     .text_color(self.clipboard_transfer.color(cx))
                     .disabled(!live || self.clipboard_transfer.busy() || self.touch_gesture.busy()),
+            )
+            .child(
+                crate::ui::icon_button(
+                    "post-paste-touch",
+                    crate::assets::FunctionIcon::PasteTouch,
+                    if self.clipboard_transfer.post_paste_enabled { "粘贴后触摸：已开启" } else { "粘贴后触摸：已关闭" },
+                )
+                .selected(self.clipboard_transfer.post_paste_enabled)
+                .debug_selector(|| "post-paste-touch".into())
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.clipboard_transfer.post_paste_enabled = !this.clipboard_transfer.post_paste_enabled;
+                    if !this.clipboard_transfer.post_paste_enabled { this.cancel_post_paste_touch(); }
+                    cx.notify();
+                })),
             )
             .child(div().flex_1())
             .child(self.render_function_button(true, cx))
@@ -1568,6 +1619,10 @@ impl Focusable for SessionView {
 
 impl Drop for SessionView {
     fn drop(&mut self) {
+        if self.functions.registration_busy() {
+            self.handle
+                .function(rv_session::FunctionCommand::StopRegistration);
+        }
         // Window closed mid-session: keep the last picture as the preview.
         if self.phase == Phase::Connected {
             self.save_thumb();
@@ -1684,9 +1739,7 @@ impl Render for SessionView {
                                             })
                                     })
                                     .child(self.render_keyboard_shortcuts(cx))
-                                    .when(cfg!(target_os = "windows"), |bar| {
-                                        bar.child(self.render_mailbox_launcher(cx))
-                                    })
+                                    .child(self.render_mailbox_launcher(cx))
                                     .child(
                                         crate::ui::icon_button(
                                             "files",
@@ -2161,14 +2214,14 @@ mod tests {
 mod apps_ui;
 mod assistant_bridge;
 mod clipboard_ui;
-mod paste_touch;
-mod touch_ui;
 mod controls_ui;
 mod functions_ui;
 mod karing_ui;
 mod mailbox_service;
 mod mailbox_ui;
+mod paste_touch;
 mod reconnect;
+mod touch_ui;
 mod unlock_ui;
 
 #[cfg(test)]

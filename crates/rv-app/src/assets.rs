@@ -2,8 +2,23 @@ use gpui::{AssetSource, Result, SharedString};
 use gpui_component::IconNamed;
 use std::borrow::Cow;
 
-const ICONS: [(&str, &[u8]); 22] = [
-    ("rv-icons/move.svg", include_bytes!("../../../assets/icons/move.svg")),
+const ICONS: [(&str, &[u8]); 25] = [
+    (
+        "rv-icons/mouse-pointer-click.svg",
+        include_bytes!("../../../assets/icons/mouse-pointer-click.svg"),
+    ),
+    (
+        "rv-icons/send.svg",
+        include_bytes!("../../../assets/icons/send.svg"),
+    ),
+    (
+        "rv-icons/languages.svg",
+        include_bytes!("../../../assets/icons/languages.svg"),
+    ),
+    (
+        "rv-icons/move.svg",
+        include_bytes!("../../../assets/icons/move.svg"),
+    ),
     (
         "rv-icons/trash.svg",
         include_bytes!("../../../assets/icons/trash.svg"),
@@ -172,9 +187,11 @@ mod tests {
 
 #[derive(Clone)]
 pub enum FunctionIcon {
+    PasteTouch,
+    Send,
+    Languages,
     Move,
     Edit,
-    Trash,
     Products,
     Orders,
     All,
@@ -198,9 +215,11 @@ pub enum FunctionIcon {
 impl IconNamed for FunctionIcon {
     fn path(self) -> SharedString {
         match self {
+            Self::PasteTouch => "rv-icons/mouse-pointer-click.svg",
+            Self::Send => "rv-icons/send.svg",
+            Self::Languages => "rv-icons/languages.svg",
             Self::Move => "rv-icons/move.svg",
             Self::Edit => "rv-icons/pencil.svg",
-            Self::Trash => "rv-icons/trash.svg",
             Self::Products => "rv-icons/shopping-bag.svg",
             Self::Orders => "rv-icons/receipt-text.svg",
             Self::All => "icons/layout-dashboard.svg",

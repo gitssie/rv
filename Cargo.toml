@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/rv-core", "crates/rv-session", "crates/rv-app", "crates/rv-business", "crates/rv-automation"]
+members = ["crates/rv-core", "crates/rv-session", "crates/rv-app", "crates/rv-business", "crates/rv-automation", "crates/rv-gpui-chat"]
 exclude = ["vendor/vnc-rs"]
 resolver = "2"
 default-members = ["crates/rv-app"]

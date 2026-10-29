@@ -171,7 +171,7 @@ fn export_management_previews() {
                         _ => {}
                     }
                 });
-                let shell = cx.new(|_| WindowRoot::new(app));
+                let shell = cx.new(|cx| WindowRoot::new(app, cx));
                 cx.new(|cx| Root::new(shell, window, cx))
             })
             .unwrap();
@@ -215,7 +215,7 @@ fn export_connection_port_preview() {
                 AddressBookApp::with_book(book, false, "Connecting to iPhonX…".into(), window, cx)
             });
             app.update(cx, |app, cx| app.open_editor(Some(&connection), window, cx));
-            let shell = cx.new(|_| WindowRoot::new(app));
+            let shell = cx.new(|cx| WindowRoot::new(app, cx));
             cx.new(|cx| Root::new(shell, window, cx))
         })
         .unwrap();
@@ -253,6 +253,8 @@ fn export_settings_previews() {
     WorkspaceStore::open(&paths)
         .unwrap()
         .save_proxy(&SocksProxy {
+            protocol: Default::default(),
+            front_proxy_id: None,
             id: uuid::Uuid::new_v4().to_string(),
             name: "法国出口".into(),
             host: "192.168.1.20".into(),
@@ -260,6 +262,7 @@ fn export_settings_previews() {
             username: "proxy_user".into(),
             password: "preview".into(),
             mode: ProxyMode::Exclusive,
+            ip: Default::default(),
         })
         .unwrap();
     let output = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tempdir/design");
@@ -292,7 +295,7 @@ fn export_settings_previews() {
                         app.open_proxy_manager(window, cx);
                     }
                 });
-                let shell = cx.new(|_| WindowRoot::new(app));
+                let shell = cx.new(|cx| WindowRoot::new(app, cx));
                 cx.new(|cx| Root::new(shell, window, cx))
             })
             .unwrap();
@@ -306,4 +309,55 @@ fn export_settings_previews() {
             .save(output.join(name))
             .unwrap();
     }
+}
+
+#[test]
+#[ignore = "manual macOS Metal chat screenshot export"]
+fn export_chat_preview() {
+    let platform = gpui_platform::current_platform(true);
+    let mut cx = HeadlessAppContext::with_platform(
+        platform.text_system(),
+        Arc::new(crate::assets::Assets),
+        gpui_platform::current_headless_renderer,
+    );
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        crate::bind_keys(cx);
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let mut book = AddressBook::load(StorePaths::in_dir(dir.path().to_owned())).unwrap();
+    book.prefs_mut().theme = ThemePref::Dark;
+    let device = Connection::new("fixture", "example.invalid", 5900);
+    book.upsert(device.clone());
+    book.save().unwrap();
+    let mut entity = None;
+    let handle = cx
+        .open_window(size(px(1200.), px(840.)), |window, cx| {
+            let app = cx.new(|cx| AddressBookApp::with_book(book, false, "".into(), window, cx));
+            app.update(cx, |app, cx| {
+                app.home.task_worker.take();
+                let ids = super::chat::test_support::seed(app.book.paths(), device.id);
+                app.open_chat_for(ids[0].clone(), window, cx);
+            });
+            entity = Some(app.clone());
+            let shell = cx.new(|cx| WindowRoot::new(app, cx));
+            cx.new(|cx| Root::new(shell, window, cx))
+        })
+        .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle.into(), |_, window, cx| {
+        entity.as_ref().unwrap().update(cx, |app, cx| {
+            app.select_chat("conversation-0".into(), window, cx)
+        });
+    })
+    .unwrap();
+    for _ in 0..3 {
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+    }
+    cx.capture_screenshot(handle.into())
+        .unwrap()
+        .save("/tmp/rv-chat-fixture-implemented.png")
+        .unwrap();
 }

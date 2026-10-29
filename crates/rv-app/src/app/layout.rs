@@ -8,10 +8,8 @@ use crate::{actions::*, theme};
 
 impl Render for AddressBookApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.sync_component_dialog(window, cx);
         self.notify_status(window, cx);
         self.sync_phone_controls(window, cx);
-        self.apply_chat_input_result(window, cx);
         self.window_controls.sync(window, theme::is_dark(cx));
         let sidebar_width = if self.collapsed {
             px(0.)

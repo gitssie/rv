@@ -109,13 +109,16 @@ impl SessionHandle {
     }
 
     pub fn spawn(request: ConnectRequest) -> Self {
-        Self::spawn_worker(request, false)
+        Self::spawn_worker(request, false, None)
     }
     /// Runs only ZXTouch HTTP/2. Never opens the VNC port or requests frames.
     pub fn spawn_control(request: ConnectRequest) -> Self {
-        Self::spawn_worker(request, true)
+        Self::spawn_worker(request, true, None)
     }
-    fn spawn_worker(request: ConnectRequest, control_only: bool) -> Self {
+    pub fn spawn_control_with_store(request: ConnectRequest, paths: rv_core::StorePaths) -> Self {
+        Self::spawn_worker(request, true, Some(paths))
+    }
+    fn spawn_worker(request: ConnectRequest, control_only: bool, token_paths: Option<rv_core::StorePaths>) -> Self {
         let framebuffer = Arc::new(Mutex::new(Framebuffer::default()));
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let (event_tx, event_rx) = mpsc::channel();
@@ -131,7 +134,7 @@ impl SessionHandle {
                     .build()
                     .expect("tokio runtime");
                 if control_only {
-                    rt.block_on(crate::phone_control::run(request, cmd_rx, event_tx));
+                    rt.block_on(crate::phone_control::run_with_store(request, cmd_rx, event_tx, token_paths));
                 } else {
                     rt.block_on(run(request, fb, cmd_rx, event_tx, worker_file_state));
                 }
@@ -571,6 +574,7 @@ async fn session_loop(
         }
         apps.advance(&client, &app_send).await;
         functions.advance(&function_send);
+        files.advance_safari_lookup().await;
         files.advance_photo_confirmation(apps.http_client());
         files.advance_upload(&client).await;
         if let Some((offset, album)) = files.next_photo_page.take() {
@@ -650,7 +654,11 @@ async fn apply_command(
             Ok(true)
         }
         SessionCommand::File(command) => {
-            files.command(client, command).await;
+            if matches!(command, FileCommand::SafariDownloads) {
+                files.start_safari_lookup(apps.http_client());
+            } else {
+                files.command(client, command).await;
+            }
             file_transfer::update(&files.state, |state| {
                 state.pending_commands = state.pending_commands.saturating_sub(1)
             });
@@ -809,6 +817,7 @@ struct PendingPhotoUpload {
 
 struct FileRuntime {
     state: Arc<Mutex<FileTransferSnapshot>>,
+    safari_lookup: Option<tokio::task::JoinHandle<Result<Vec<crate::SafariFolder>, String>>>,
     active: Option<ActiveFile>,
     pending_upload: Option<PendingUploadVerification>,
     pending_management: Option<(u32, u8, String)>,
@@ -828,9 +837,76 @@ struct FileRuntime {
 }
 
 impl FileRuntime {
+    fn start_safari_lookup(&mut self, client: Option<crate::phone_http::PhoneHttpClient>) {
+        if self.safari_lookup.is_some() {
+            return;
+        }
+        let ready = {
+            let state = self.state.lock().unwrap();
+            state.caps.is_some_and(|caps| caps.list)
+                && !state.listing
+                && !state.management_busy
+                && self.active.is_none()
+                && self.pending_upload.is_none()
+        };
+        if !ready || client.is_none() {
+            file_transfer::update(&self.state, |state| {
+                state.safari_busy = false;
+                state.safari_error = Some(
+                    if ready {
+                        "ZXTouch must be connected to locate Safari Downloads"
+                    } else {
+                        "Wait for current file operations to finish"
+                    }
+                    .into(),
+                );
+            });
+            return;
+        }
+        let client = client.unwrap();
+        self.safari_lookup = Some(tokio::spawn(async move {
+            tokio::time::timeout(
+                Duration::from_secs(15),
+                crate::safari_downloads::resolve(&client),
+            )
+            .await
+            .unwrap_or_else(|_| Err("Safari directory lookup timed out".into()))
+        }));
+    }
+    async fn advance_safari_lookup(&mut self) {
+        if !self
+            .safari_lookup
+            .as_ref()
+            .is_some_and(|task| task.is_finished())
+        {
+            return;
+        }
+        let result = self
+            .safari_lookup
+            .take()
+            .unwrap()
+            .await
+            .unwrap_or_else(|_| Err("Safari directory lookup stopped".into()));
+        file_transfer::update(&self.state, |state| {
+            state.safari_busy = false;
+            match result {
+                Ok(folders) => {
+                    state.safari_path = folders.first().map(|folder| folder.path.clone());
+                    state.safari_folders = folders;
+                    state.safari_error = None;
+                }
+                Err(error) => {
+                    state.safari_path = None;
+                    state.safari_folders.clear();
+                    state.safari_error = Some(error);
+                }
+            }
+        });
+    }
     fn new(state: Arc<Mutex<FileTransferSnapshot>>, allow_upload: bool) -> Self {
         Self {
             state,
+            safari_lookup: None,
             active: None,
             pending_upload: None,
             pending_management: None,
@@ -1351,6 +1427,7 @@ impl FileRuntime {
             FileCommand::UploadToPhotosQueued(_) | FileCommand::UploadToPhotosTask { .. }
         );
         match command {
+            FileCommand::SafariDownloads => self.start_safari_lookup(None),
             FileCommand::List(path) => {
                 if !caps.list || !valid_remote_path(&path) {
                     self.fail("Remote file browsing is unavailable");
@@ -2516,6 +2593,12 @@ fn photo_staging_path(task_id: Option<&str>, name: &str) -> String {
 
 impl Drop for FileRuntime {
     fn drop(&mut self) {
+        if let Some(task) = self.safari_lookup.take() {
+            task.abort();
+        }
+        file_transfer::update(&self.state, |state| {
+            state.safari_busy = false;
+        });
         self.stop(TransferStatus::Failed("Connection closed".into()));
         if let Some(pending) = self.pending_checksum.take() {
             if let Some(destination) = pending.destination {

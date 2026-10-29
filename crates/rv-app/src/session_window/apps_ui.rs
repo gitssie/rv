@@ -101,6 +101,9 @@ pub(super) struct AppToolbar {
 }
 
 impl AppToolbar {
+    pub(in crate::session_window) fn mutations_pending(&self) -> bool {
+        !self.busy.is_empty()
+    }
     pub(in crate::session_window) fn home_foreground(&self) -> Option<String> {
         self.foreground.clone()
     }
@@ -325,10 +328,18 @@ impl SessionView {
         }
         match event {
             AppEvent::Profile(profile) => {
+                let owner = cx.entity().entity_id();
                 if let Some(book) = self.address_book.as_ref().and_then(WeakEntity::upgrade) {
-                    book.update(cx, |book, cx| {
-                        book.import_app_profile(&profile.app_id, &profile.data, cx)
+                    let saved = book.update(cx, |book, cx| {
+                        book.import_app_profile(
+                            &profile.app_id,
+                            &profile.state,
+                            self.req.connection_id,
+                            owner,
+                            cx,
+                        )
                     });
+                    self.backup_profile_result(saved, cx);
                 }
             }
             AppEvent::DeviceInfo(info) => {
@@ -435,6 +446,27 @@ impl SessionView {
                 }
             }
             AppEvent::Finished(command) => {
+                if let AppCommand::TakeoverBackup { app_id, .. } = &command {
+                    let owner = cx.entity().entity_id();
+                    if let Some(book) = self.address_book.as_ref().and_then(WeakEntity::upgrade) {
+                        book.update(cx, |book, cx| {
+                            book.rv_takeover_finished(app_id, owner, true, cx)
+                        });
+                    }
+                    self.rv_takeover_result(true, cx);
+                    return;
+                }
+
+                if let AppCommand::HandoffBackup { app_id, .. } = &command {
+                    let owner = cx.entity().entity_id();
+                    if let Some(book) = self.address_book.as_ref().and_then(WeakEntity::upgrade) {
+                        book.update(cx, |book, cx| {
+                            book.phone_handoff_finished(app_id, owner, true, cx)
+                        });
+                    }
+                    self.phone_handoff_result(true, cx);
+                    return;
+                }
                 if let AppCommand::WriteClipboard { token, .. } = &command {
                     self.clipboard_transfer_finished(token, cx);
                     self.status = "Clipboard written".into();
@@ -452,6 +484,37 @@ impl SessionView {
                 }
             }
             AppEvent::Failed { command, message } => {
+                if let AppCommand::TakeoverBackup { app_id, .. } = &command {
+                    tracing::error!(app_id=app_id.as_str(),error=%message,"RV takeover failed");
+                    let owner = cx.entity().entity_id();
+                    if let Some(book) = self.address_book.as_ref().and_then(WeakEntity::upgrade) {
+                        book.update(cx, |book, cx| {
+                            book.rv_takeover_finished(app_id, owner, false, cx)
+                        });
+                    }
+                    self.rv_takeover_result(false, cx);
+                    return;
+                }
+
+                if let AppCommand::HandoffBackup { app_id, .. } = &command {
+                    tracing::error!(app_id=app_id.as_str(),error=%message,"Phone backup handoff failed");
+                    let owner = cx.entity().entity_id();
+                    if let Some(book) = self.address_book.as_ref().and_then(WeakEntity::upgrade) {
+                        book.update(cx, |book, cx| {
+                            book.phone_handoff_finished(app_id, owner, false, cx)
+                        });
+                    }
+                    self.phone_handoff_result(false, cx);
+                    return;
+                }
+                if let AppCommand::ReadProfile { app_id, bundle, .. } = &command {
+                    tracing::error!(app_id=app_id.as_str(),bundle_id=%bundle,error=%message,"Shadow state import failed");
+                    let owner = cx.entity().entity_id();
+                    if let Some(book) = self.address_book.as_ref().and_then(WeakEntity::upgrade) {
+                        book.update(cx, |book, cx| book.backup_sync_failed(app_id, owner, cx));
+                    }
+                    self.backup_profile_result(false, cx);
+                }
                 if let AppCommand::Karing(request) = &command {
                     self.karing_failure(request.id, message, cx);
                     return;

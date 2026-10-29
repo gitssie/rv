@@ -1,6 +1,7 @@
 //! Full-window settings use the component library's Settings hierarchy.
 mod apple_accounts;
 mod general;
+mod tasks;
 use super::{AddressBookApp, Modal};
 use gpui::*;
 use gpui_component::{
@@ -18,11 +19,13 @@ pub(super) enum SettingsPage {
     General,
     Proxies,
     AppleAccounts,
+    Tasks,
 }
 pub(super) struct SettingsState {
     pub page: Option<SettingsPage>,
     pub revision: u64,
     apple_accounts: apple_accounts::AppleAccountsView,
+    tasks: tasks::TasksView,
     pub theme: Entity<SelectState<Vec<String>>>,
     pub scale: Entity<SelectState<Vec<String>>>,
     pub menu_key: Entity<SelectState<Vec<String>>>,
@@ -32,6 +35,7 @@ impl SettingsState {
         Self {
             page: None,
             apple_accounts: apple_accounts::AppleAccountsView::new(window, cx),
+            tasks: tasks::TasksView::new(window, cx),
             revision: 0,
             theme: cx.new(|cx| {
                 SelectState::new(
@@ -81,6 +85,7 @@ impl AddressBookApp {
     }
     pub(super) fn subscribe_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.subscribe_apple_accounts(window, cx);
+        self.subscribe_task_list(window, cx);
         self._subscriptions.push(cx.subscribe_in(
             &self.settings.theme,
             window,
@@ -133,12 +138,31 @@ impl AddressBookApp {
                 cx.notify();
             },
         ));
+        self._subscriptions.push(cx.subscribe(
+            &self.home.proxies.rotation_select,
+            |this, _, event: &SelectEvent<Vec<String>>, cx| {
+                if !this.read_only {
+                    if let SelectEvent::Confirm(Some(value)) = event {
+                        this.home.proxies.password_rotation = value == "密码 Session";
+                        cx.notify();
+                    }
+                }
+            },
+        ));
+        self._subscriptions.push(cx.subscribe(
+            &self.home.proxies.protocol_select,
+            |this, _, event: &SelectEvent<Vec<String>>, cx| {
+                if let SelectEvent::Confirm(Some(value)) = event {
+                    this.set_proxy_protocol(value, cx);
+                }
+            },
+        ));
         self._subscriptions.push(cx.subscribe_in(
-            &self.home.proxies.select,
+            &self.home.proxies.front_select,
             window,
-            |this, _, event: &SelectEvent<Vec<super::home::ProxyChoice>>, window, cx| {
+            |this, _, event: &SelectEvent<Vec<super::home::ProxyChoice>>, _window, cx| {
                 if let SelectEvent::Confirm(Some(id)) = event {
-                    this.select_proxy_config(id, window, cx);
+                    this.set_proxy_front(id, cx);
                 }
             },
         ));
@@ -234,12 +258,16 @@ impl AddressBookApp {
             if page == SettingsPage::AppleAccounts {
                 self.load_apple_accounts(cx);
             }
+            if page == SettingsPage::Tasks {
+                self.load_task_list(cx);
+            }
             self.focus.focus(window, cx);
         }
         match page {
             SettingsPage::General => self.render_general_settings(cx),
-            SettingsPage::Proxies => self.render_proxy_manager(cx),
+            SettingsPage::Proxies => self.render_proxy_manager(window, cx),
             SettingsPage::AppleAccounts => self.render_apple_accounts(cx),
+            SettingsPage::Tasks => self.render_task_list(cx),
         }
     }
     pub(super) fn render_settings(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -266,6 +294,18 @@ impl AddressBookApp {
                 move |_, window, cx| {
                     owner.update(cx, |this, cx| {
                         this.render_settings_content(SettingsPage::Proxies, window, cx)
+                    })
+                }
+            })));
+        let tasks = SettingPage::new("任务")
+            .icon(IconName::Redo)
+            .resettable(false)
+            .header_style(&StyleRefinement::default().hidden())
+            .group(SettingGroup::new().item(SettingItem::render({
+                let owner = owner.clone();
+                move |_, window, cx| {
+                    owner.update(cx, |this, cx| {
+                        this.render_settings_content(SettingsPage::Tasks, window, cx)
                     })
                 }
             })));
@@ -296,12 +336,14 @@ impl AddressBookApp {
                             SettingsPage::General => 0,
                             SettingsPage::Proxies => 1,
                             SettingsPage::AppleAccounts => 2,
+                            SettingsPage::Tasks => 3,
                         },
                         group_ix: None,
                     })
                     .page(general)
                     .page(proxies)
-                    .page(accounts),
+                    .page(accounts)
+                    .page(tasks),
             )
             .into_any_element()
     }

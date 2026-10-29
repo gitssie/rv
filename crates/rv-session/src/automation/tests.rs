@@ -22,18 +22,20 @@ const APP: &str = "local.fixture.app";
 fn ocr(text: &str) -> Value {
     json!({"value":format!("{text},,100,,200,,200,,40"),"frame":{"width":1000,"height":2000,"orientation":0}})
 }
-struct Expected {
-    path: &'static str,
-    status: u16,
-    body: Option<Value>,
-    reply: Value,
+pub(super) struct Expected {
+    pub(super) path: &'static str,
+    pub(super) status: u16,
+    pub(super) body: Option<Value>,
+    pub(super) reply: Value,
+    pub(super) pause: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
 }
-fn response(path: &'static str, reply: Value) -> Expected {
+pub(super) fn response(path: &'static str, reply: Value) -> Expected {
     Expected {
         path,
         status: 200,
         body: None,
         reply,
+        pause: None,
     }
 }
 fn observe(text: &str) -> Vec<Expected> {
@@ -43,9 +45,18 @@ fn observe(text: &str) -> Vec<Expected> {
         response("/api/apps/foreground", json!({"bundle_id":APP})),
     ]
 }
+pub(super) fn post_paste_replies(bundle: &str) -> Vec<Expected> {
+    vec![
+        response("/api/apps/foreground", json!({"bundle_id":bundle})),
+        response("/api/device/tap", json!({"ok":true})),
+        response("/api/apps/foreground", json!({"bundle_id":bundle})),
+        response("/api/device/tap", json!({"ok":true})),
+    ]
+}
+
 type Calls = Arc<Mutex<Vec<String>>>;
 type Pending = Arc<Mutex<VecDeque<Expected>>>;
-async fn fixture(
+pub(super) async fn fixture(
     expected: Vec<Expected>,
 ) -> (ZxTouchDevice, Calls, Pending, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -73,6 +84,11 @@ async fn fixture(
                         received.lock().unwrap().push(path.clone());
                         let bytes = request.into_body().collect().await.unwrap().to_bytes();
                         let payload: Value = serde_json::from_slice(&bytes).unwrap();
+                        if let Some(hold) = payload.get("hold_ms").and_then(Value::as_u64) {
+                            assert!((900..=1100).contains(&hold) || (100..=120).contains(&hold));
+                            assert!(payload["x"].as_u64().is_some_and(|x| x < 1000));
+                            assert!(payload["y"].as_u64().is_some_and(|y| y < 2000));
+                        }
                         let next = replies
                             .lock()
                             .unwrap()
@@ -81,6 +97,10 @@ async fn fixture(
                         assert_eq!(path, next.path);
                         if let Some(body) = next.body {
                             assert_eq!(payload, body);
+                        }
+                        if let Some((started, resume)) = next.pause {
+                            started.notify_one();
+                            resume.notified().await;
                         }
                         Ok::<_, std::convert::Infallible>(
                             Response::builder()
@@ -142,10 +162,16 @@ async fn complete_engine_uses_authenticated_http2_and_observable_postcondition()
         ..response("/api/device/tap", json!({"ok":true}))
     });
     replies.extend(observe("Email"));
+    replies.push(response(
+        "/api/control/authorize",
+        json!({"keyboard_literal":1,"device_tap_hold":1}),
+    ));
+    replies.push(response("/api/apps/foreground", json!({"bundle_id":APP})));
     replies.push(Expected {
-        body: Some(json!({"fields":["1","fixture@example.invalid"]})),
+        body: Some(json!({"fields":["8","fixture@example.invalid"]})),
         ..response("/api/device/keyboard", json!({"value":""}))
     });
+    replies.extend(post_paste_replies(APP));
     replies.extend(observe("Complete"));
     let (device, calls, pending, server) = fixture(replies).await;
     let mut inputs = InputValues::default();
@@ -173,7 +199,7 @@ async fn complete_engine_uses_authenticated_http2_and_observable_postcondition()
     assert_eq!(result.state, RunState::Succeeded);
     assert_eq!(result.completed_steps, 4);
     assert!(pending.lock().unwrap().is_empty());
-    assert_eq!(calls.lock().unwrap().len(), 14);
+    assert_eq!(calls.lock().unwrap().len(), 20);
     server.abort();
 }
 
@@ -223,6 +249,10 @@ async fn app_change_during_ocr_prevents_tap() {
 async fn malformed_keyboard_ack_is_unknown_and_not_replayed() {
     let mut replies = observe("Email");
     replies.push(response(
+        "/api/control/authorize",
+        json!({"keyboard_literal":1,"device_tap_hold":1}),
+    ));
+    replies.push(response(
         "/api/device/keyboard",
         json!({"unexpected":"response"}),
     ));
@@ -242,17 +272,20 @@ async fn malformed_keyboard_ack_is_unknown_and_not_replayed() {
         )
         .await;
     assert_eq!(result.state, RunState::OutcomeUnknown);
-    assert_eq!(calls.lock().unwrap().len(), 4);
+    assert_eq!(calls.lock().unwrap().len(), 5);
     server.abort();
 }
 
 #[tokio::test]
 async fn supports_both_daemon_and_foreground_adapter_keyboard_acknowledgements() {
     for acknowledgement in [json!({"value":""}), json!({"ok":true})] {
-        let (mut device, calls, _, server) =
-            fixture(vec![response("/api/device/keyboard", acknowledgement)]).await;
+        let (mut device, calls, _, server) = fixture(vec![
+            response("/api/control/authorize", json!({"keyboard_literal":1})),
+            response("/api/device/keyboard", acknowledgement),
+        ])
+        .await;
         assert_eq!(device.input_text("fixture").await, Ok(()));
-        assert_eq!(calls.lock().unwrap().len(), 1);
+        assert_eq!(calls.lock().unwrap().len(), 2);
         server.abort();
     }
 }
@@ -260,6 +293,10 @@ async fn supports_both_daemon_and_foreground_adapter_keyboard_acknowledgements()
 #[tokio::test]
 async fn keyboard_http400_after_dispatch_remains_unknown_and_stops_later_actions() {
     let mut replies = observe("Email");
+    replies.push(response(
+        "/api/control/authorize",
+        json!({"keyboard_literal":1,"device_tap_hold":1}),
+    ));
     replies.push(Expected {
         status: 400,
         ..response(
@@ -284,7 +321,7 @@ async fn keyboard_http400_after_dispatch_remains_unknown_and_stops_later_actions
         .await;
     assert_eq!(result.state, RunState::OutcomeUnknown);
     assert!(result.failure.unwrap().mutation_may_have_executed);
-    assert_eq!(calls.lock().unwrap().len(), 4);
+    assert_eq!(calls.lock().unwrap().len(), 5);
     server.abort();
 }
 
@@ -295,6 +332,12 @@ async fn interrupted_keyboard_request_never_reconnects_to_replay() {
     let server = tokio::spawn(async move {
         let (socket, _) = listener.accept().await.unwrap();
         let mut connection = h2::server::handshake(socket).await.unwrap();
+        let (request, mut reply) = connection.accept().await.unwrap().unwrap();
+        assert_eq!(request.uri().path(), "/api/control/authorize");
+        let mut stream = reply.send_response(Response::new(()), false).unwrap();
+        stream
+            .send_data(Bytes::from_static(b"{\"keyboard_literal\":1}"), true)
+            .unwrap();
         let (request, _) = connection.accept().await.unwrap().unwrap();
         assert_eq!(request.uri().path(), "/api/device/keyboard");
         drop(connection);
@@ -312,6 +355,21 @@ async fn interrupted_keyboard_request_never_reconnects_to_replay() {
         Err(DeviceError::OutcomeUnknown)
     );
     server.await.unwrap();
+}
+
+#[tokio::test]
+async fn missing_literal_capability_never_dispatches_physical_or_clipboard_fallback() {
+    let (mut device, calls, _, server) = fixture(vec![response(
+        "/api/control/authorize",
+        json!({"device_tap":1}),
+    )])
+    .await;
+    assert_eq!(
+        device.input_text("fixture").await,
+        Err(DeviceError::Rejected)
+    );
+    assert_eq!(*calls.lock().unwrap(), vec!["/api/control/authorize"]);
+    server.abort();
 }
 
 #[test]
@@ -337,4 +395,83 @@ fn validates_ocr_coordinates_and_requires_frame_metadata() {
     }
     let empty = json!({"value":"","frame":valid["frame"]});
     assert!(parse_observation(&empty, None).unwrap().elements.is_empty());
+}
+
+#[tokio::test]
+async fn cancellation_during_long_hold_does_not_send_short_tap_or_replay_text() {
+    let started = Arc::new(tokio::sync::Notify::new());
+    let resume = Arc::new(tokio::sync::Notify::new());
+    let (mut device, calls, pending, server) = fixture(vec![
+        response(
+            "/api/control/authorize",
+            json!({"keyboard_literal":1,"device_tap_hold":1}),
+        ),
+        response("/api/apps/foreground", json!({"bundle_id":APP})),
+        response("/api/device/keyboard", json!({"value":""})),
+        response("/api/apps/foreground", json!({"bundle_id":APP})),
+        Expected {
+            pause: Some((started.clone(), resume.clone())),
+            ..response("/api/device/tap", json!({"ok":true}))
+        },
+    ])
+    .await;
+    device.last_tap = Some((
+        Frame {
+            width: 1000,
+            height: 2000,
+            orientation: 0,
+        },
+        Point { x: 200., y: 220. },
+    ));
+    {
+        let input = device.input_text("fixture");
+        tokio::pin!(input);
+        tokio::select! {
+            _ = &mut input => panic!("long hold must remain pending"),
+            _ = started.notified() => {}
+        }
+        // Dropping the in-flight input is how Runner cancels a mutation.
+    }
+    resume.notify_one();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(pending.lock().unwrap().is_empty());
+    let calls = calls.lock().unwrap();
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|p| p.as_str() == "/api/device/keyboard")
+            .count(),
+        1
+    );
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|p| p.as_str() == "/api/device/tap")
+            .count(),
+        1
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn missing_timed_tap_capability_rejects_before_sending_text() {
+    let (mut device, calls, _, server) = fixture(vec![response(
+        "/api/control/authorize",
+        json!({"keyboard_literal":1}),
+    )])
+    .await;
+    device.last_tap = Some((
+        Frame {
+            width: 1000,
+            height: 2000,
+            orientation: 0,
+        },
+        Point { x: 200., y: 220. },
+    ));
+    assert_eq!(
+        device.input_text("fixture").await,
+        Err(DeviceError::Rejected)
+    );
+    assert_eq!(*calls.lock().unwrap(), vec!["/api/control/authorize"]);
+    server.abort();
 }

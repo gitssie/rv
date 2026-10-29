@@ -13,6 +13,7 @@ actions!(
         ToggleSidebar,
         FocusSearch,
         CloseModal,
+        ChatClose,
         QuitApp,
         HomeFullscreen,
         SessionFullscreen,

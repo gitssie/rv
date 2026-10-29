@@ -1,7 +1,7 @@
 //! HTML notices become inert readable text; original markup stays in payload.
 use html5ever::tendril::TendrilSink;
 use markup5ever_rcdom::{NodeData, RcDom};
-pub(super) fn plain_text(body: &str) -> String {
+pub(crate) fn plain_text(body: &str) -> String {
     let dom = html5ever::parse_document(RcDom::default(), Default::default()).one(body);
     let mut stack = vec![dom.document.clone()];
     let mut output = String::new();

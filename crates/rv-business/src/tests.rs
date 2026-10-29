@@ -124,47 +124,6 @@ fn orders_preserve_direction_and_distinct_ids_and_support_full_text_search() {
     assert_eq!(data.rows[0].id, "order-1");
 }
 #[test]
-fn schedule_clock_starts_fresh_and_never_catches_up_after_restart() {
-    let (_dir, paths, _store, id) = fixture();
-    let mut clock = schedules::ScheduleClock::default();
-    schedules::set(&paths, &id, Operation::Products, true, 900).unwrap();
-    assert!(clock.due(&paths, 100).unwrap().is_empty());
-    assert!(clock.due(&paths, 999).unwrap().is_empty());
-    assert_eq!(clock.due(&paths, 1000).unwrap().len(), 1);
-    assert!(clock.due(&paths, 1000).unwrap().is_empty());
-    let mut restarted = schedules::ScheduleClock::default();
-    assert!(restarted.due(&paths, 10000).unwrap().is_empty());
-    assert!(restarted.due(&paths, 10899).unwrap().is_empty());
-    assert_eq!(restarted.due(&paths, 10900).unwrap().len(), 1);
-    schedules::set(&paths, &id, Operation::Products, false, 900).unwrap();
-    assert!(restarted.due(&paths, 20000).unwrap().is_empty());
-    assert!(schedules::set(&paths, &id, Operation::Refresh, true, 900).is_err());
-}
-#[test]
-fn disabled_or_archived_schedule_never_starts_a_task() {
-    let (_dir, paths, mut store, id) = fixture();
-    let job = schedules::ScheduledJob {
-        app_id: id.clone(),
-        operation: Operation::Products,
-    };
-    schedules::set(&paths, &id, Operation::Products, false, 900).unwrap();
-    assert!(
-        store
-            .start_task_when(&id, "products", |db| schedules::authorize(db, &job))
-            .is_err()
-    );
-    schedules::set(&paths, &id, Operation::Products, true, 900).unwrap();
-    let mut app = store.load(&id).unwrap();
-    app.archived = true;
-    store.save(&app).unwrap();
-    assert!(
-        store
-            .start_task_when(&id, "products", |db| schedules::authorize(db, &job))
-            .is_err()
-    );
-    assert!(store.tasks(&id).unwrap().is_empty());
-}
-#[test]
 fn vinted_collection_contract_requires_consistent_pagination_and_separates_buy_sell() {
     let mut combined = Value::Null;
     assert!(
@@ -324,6 +283,49 @@ fn same_platform_product_id_in_two_shops_never_shares_records_or_search_results(
     );
 }
 struct FixtureStrategy(&'static str);
+#[tokio::test]
+async fn vinted_queries_require_the_virtual_apps_proxy_binding() {
+    let (_dir, paths, mut store, id) = fixture();
+    let mut auth = store.auth(&id).unwrap().unwrap();
+    auth.refresh_token = Some("fixture-refresh".into());
+    store.save_auth(&id, &auth).unwrap();
+    assert!(store.proxy_binding(&id).unwrap().is_none());
+    let before = store.tasks(&id).unwrap().len();
+    let runner = OfflineRunner::new(None).unwrap();
+    for operation in [
+        Operation::Session,
+        Operation::Inbox,
+        Operation::NotificationStats,
+        Operation::Refresh,
+        Operation::Products,
+        Operation::Orders,
+    ] {
+        let error = runner.run(&paths, &id, operation).await.unwrap_err();
+        assert!(error.contains("关联代理"), "{operation:?}: {error}");
+    }
+    assert!(
+        runner
+            .chat(&paths, &id, chat::Action::Inbox)
+            .await
+            .unwrap_err()
+            .contains("关联代理")
+    );
+    assert_eq!(store.tasks(&id).unwrap().len(), before);
+    assert!(
+        assets::fetch_for_app(&paths, &id, "https://images.vinted.net/avatar.jpg")
+            .unwrap_err()
+            .contains("关联代理")
+    );
+}
+#[test]
+fn request_headers_use_the_persisted_session_without_replacement() {
+    let mut auth=AppAuth::default();let session=uuid::Uuid::new_v4().to_string();auth.headers.insert("X-Session-Id".into(),session.clone());
+    let client=reqwest::Client::new();
+    for path in ["first","next","another-operation"] {
+        let request=device_headers(client.get(format!("http://127.0.0.1/{path}")),&auth).build().unwrap();
+        assert_eq!(request.headers()["x-session-id"],session);
+    }
+}
 impl BusinessStrategy for FixtureStrategy {
     fn request(&self, _: Operation, _: &AppAuth) -> Result<RequestPlan, String> {
         Ok(RequestPlan {
@@ -334,6 +336,9 @@ impl BusinessStrategy for FixtureStrategy {
     }
     fn project(&self, operation: Operation, status: u16, response: &Value) -> Value {
         vinted::Vinted.project(operation, status, response)
+    }
+    fn task_result(&self, operation: Operation, result: &Value) -> Value {
+        vinted::Vinted.task_result(operation, result)
     }
 }
 #[tokio::test]
@@ -371,7 +376,7 @@ async fn task_completes_on_host_without_phone_and_result_survives_reopen() {
                 .to_ascii_lowercase()
                 .contains("authorization: bearer fixture-access")
         );
-        let body = r#"{"user":{"id":123,"login":"fixture shop","country_code":"FR"},"access_token":"must-not-be-saved"}"#;
+        let body = r#"{"user":{"id":123,"login":"fixture shop","country_code":"FR","country_title":"France","photo":{"url":"https://images.vinted.net/avatar.jpg"},"feedback_reputation":0.98,"feedback_count":12,"item_count":6,"email":"private-email"},"access_token":"must-not-be-saved"}"#;
         socket
             .write_all(
                 format!(
@@ -404,6 +409,22 @@ async fn task_completes_on_host_without_phone_and_result_survives_reopen() {
     let data: Value = serde_json::from_str(&reopened.load(&id).unwrap().metadata).unwrap();
     assert_eq!(data["session_status"], "有效");
     assert_eq!(data["login"], "fixture shop");
+    assert_eq!(data["shop"]["country_title"], "France");
+    assert_eq!(data["shop"]["feedback_count"], 12);
+    assert_eq!(data["shop"]["item_count"], 6);
+    assert_eq!(
+        data["shop"]["avatar_url"],
+        "https://images.vinted.net/avatar.jpg"
+    );
+    assert!(!data.to_string().contains("private-email"));
+    assert!(
+        !tasks[0]
+            .result
+            .as_ref()
+            .unwrap()
+            .to_string()
+            .contains("private-email")
+    );
 }
 #[test]
 fn compact_detail_reads_all_local_rows_and_preview_uses_newest_product_id() {
@@ -437,6 +458,8 @@ async fn waiting_for_another_idfv_does_not_create_or_expire_a_running_task() {
     let port = closed.local_addr().unwrap().port();
     drop(closed);
     let proxy = SocksProxy {
+        protocol: Default::default(),
+        front_proxy_id: None,
         id: uuid::Uuid::new_v4().to_string(),
         name: "exclusive".into(),
         host: "127.0.0.1".into(),
@@ -444,6 +467,7 @@ async fn waiting_for_another_idfv_does_not_create_or_expire_a_running_task() {
         username: String::new(),
         password: String::new(),
         mode: ProxyMode::Exclusive,
+        ip: Default::default(),
     };
     store.save_proxy(&proxy).unwrap();
     store.bind_proxy(&id, Some(&proxy.id)).unwrap();
@@ -471,5 +495,254 @@ async fn waiting_for_another_idfv_does_not_create_or_expire_a_running_task() {
             .unwrap()
             .is_err()
     );
-    assert_eq!(store.tasks(&id).unwrap().len(), 1);
+    assert!(store.tasks(&id).unwrap().is_empty());
+}
+
+struct ProfileWithAvatar;
+impl BusinessStrategy for ProfileWithAvatar {
+    fn requires_proxy(&self) -> bool {
+        true
+    }
+    fn request(&self, _: Operation, _: &AppAuth) -> Result<RequestPlan, String> {
+        Ok(RequestPlan {
+            method: reqwest::Method::GET,
+            url: "http://rv-fixture.invalid/user".into(),
+            body: None,
+        })
+    }
+    fn project(&self, op: Operation, status: u16, reply: &Value) -> Value {
+        vinted::Vinted.project(op, status, reply)
+    }
+    fn image_urls(&self, op: Operation, result: &Value) -> Vec<String> {
+        let urls = vinted::Vinted.image_urls(op, result);
+        assert_eq!(urls, ["https://rv-fixture.invalid/avatar"]);
+        // Local SOCKS fixture serves HTTP; production keeps the original HTTPS URL.
+        urls.into_iter()
+            .map(|url| url.replacen("https://", "http://", 1))
+            .collect()
+    }
+}
+#[tokio::test]
+async fn profile_task_caches_its_avatar_before_success_and_reuses_it_on_the_next_pull() {
+    let (_dir, paths, mut store, id) = fixture();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy = SocksProxy {
+        protocol: Default::default(),
+        front_proxy_id: None,
+        id: uuid::Uuid::new_v4().to_string(),
+        name: "fixture".into(),
+        host: "127.0.0.1".into(),
+        port: listener.local_addr().unwrap().port(),
+        username: String::new(),
+        password: String::new(),
+        mode: ProxyMode::Exclusive,
+        ip: Default::default(),
+    };
+    store.save_proxy(&proxy).unwrap();
+    store.bind_proxy(&id, Some(&proxy.id)).unwrap();
+    let mut png = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::new_rgb8(2, 2)
+        .write_to(&mut png, image::ImageFormat::Png)
+        .unwrap();
+    let png = png.into_inner();
+    let server = tokio::spawn(async move {
+        let mut images = 0;
+        for _ in 0..3 {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            assert_eq!(socket.read_u8().await.unwrap(), 5);
+            let count = socket.read_u8().await.unwrap();
+            let mut methods = vec![0; usize::from(count)];
+            socket.read_exact(&mut methods).await.unwrap();
+            socket.write_all(&[5, 0]).await.unwrap();
+            let mut connect = [0; 4];
+            socket.read_exact(&mut connect).await.unwrap();
+            assert_eq!(&connect[..3], &[5, 1, 0]);
+            match connect[3] {
+                3 => {
+                    let n = socket.read_u8().await.unwrap();
+                    let mut host = vec![0; usize::from(n)];
+                    socket.read_exact(&mut host).await.unwrap();
+                }
+                1 => {
+                    let mut host = [0; 4];
+                    socket.read_exact(&mut host).await.unwrap();
+                }
+                _ => panic!("unexpected address type"),
+            }
+            let _port = socket.read_u16().await.unwrap();
+            socket
+                .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 80])
+                .await
+                .unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut b = [0; 1024];
+                let n = socket.read(&mut b).await.unwrap();
+                assert!(n > 0);
+                request.extend_from_slice(&b[..n]);
+                if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let avatar = String::from_utf8_lossy(&request).starts_with("GET /avatar ");
+            if avatar {
+                assert!(
+                    !String::from_utf8_lossy(&request)
+                        .to_lowercase()
+                        .contains("authorization:")
+                );
+            }
+            let body = if avatar {
+                images += 1;
+                png.clone()
+            } else {
+                json!({"code":0,"user":{"id":123,"login":"fixture","photo":{"url":"https://rv-fixture.invalid/avatar"}}}).to_string().into_bytes()
+            };
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            socket.write_all(&body).await.unwrap();
+        }
+        images
+    });
+    let runner = OfflineRunner::new(None).unwrap();
+    for _ in 0..2 {
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            runner.run_with_strategy(&paths, &id, Operation::Session, &ProfileWithAvatar),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    }
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap(),
+        1
+    );
+    assert!(assets::cached(&paths, "http://rv-fixture.invalid/avatar").is_some());
+    assert!(
+        store
+            .tasks(&id)
+            .unwrap()
+            .iter()
+            .all(|t| t.status == "completed")
+    );
+}
+
+#[test]
+fn http_error_details_preserve_cause_and_strip_credentials() {
+    let auth=AppAuth{access_token:"access-secret".into(),refresh_token:Some("refresh-secret".into()),..Default::default()};
+    let value=redact_http_detail("failed https://user:password@host/path?token=other-secret connection refused access-secret refresh-secret".into(),&auth);
+    assert!(value.contains("connection refused"));
+    for secret in ["password","other-secret","access-secret","refresh-secret"]{assert!(!value.contains(secret));}
+}
+
+#[tokio::test]
+async fn manual_shop_sync_reuses_pagination_and_session_without_touching_tasks() {
+    for fail_second in [false,true] {
+        let (_dir,paths,mut store,id)=fixture();
+        tasks::initialize(&paths,&id).unwrap();
+        for task in store.configured_tasks(&id).unwrap(){tasks::set_task_enabled(&paths,&task.id,false).unwrap();}
+        // An already-running scheduler task must not force this read into its queue.
+        store.start_task(&id,"session").unwrap();
+        let before=store.tasks(&id).unwrap();
+        let bus=rv_core::events::workspace_bus(&paths).unwrap();
+        let events=bus.subscribe::<rv_core::events::WorkspaceChanged>();
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint=format!("http://{}",listener.local_addr().unwrap());
+        let server=tokio::spawn(async move {
+            let mut session=None;
+            for page in 1..=2 {
+                let (mut socket,_)=listener.accept().await.unwrap();
+                let mut bytes=vec![0;8192];let n=socket.read(&mut bytes).await.unwrap();
+                let request=String::from_utf8_lossy(&bytes[..n]);
+                assert!(request.starts_with(&format!("GET /{page} ")));
+                let current=request.lines().find_map(|line|line.split_once(':').filter(|(key,_)|key.eq_ignore_ascii_case("x-session-id")).map(|(_,value)|value.trim().to_string())).unwrap();
+                if let Some(first)=&session {assert_eq!(first,&current)}else{assert_eq!(uuid::Uuid::parse_str(&current).unwrap().get_version_num(),4);session=Some(current);}
+                let body=json!({"code":0,"items":[{"id":page,"user_id":123,"title":format!("page {page}")}],"pagination":{"current_page":page,"total_pages":2}}).to_string();
+                let status=if fail_second&&page==2 {503}else{200};
+                socket.write_all(format!("HTTP/1.1 {status} Fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+            }
+        });
+        let result=OfflineRunner::new(None).unwrap().execute_business(&paths,&id,Operation::Products,&PagedFixture(endpoint),None,false).await;
+        server.await.unwrap();
+        assert_eq!(result.is_err(),fail_second);
+        assert_eq!(store.tasks(&id).unwrap(),before);
+        assert_eq!(data::read_data(&paths,&id,Dataset::Products,"",0).unwrap().total,if fail_second {0}else{2});
+        let changes:Vec<_>=std::iter::from_fn(||events.try_recv().ok()).flat_map(|event|event.changes.clone()).collect();
+        assert!(!changes.iter().any(|c|c.domain==rv_core::events::ChangeDomain::Tasks));
+        assert_eq!(changes.iter().any(|c|c.domain==rv_core::events::ChangeDomain::Products),!fail_second);
+    }
+}
+
+#[tokio::test]
+async fn manual_sync_can_continue_when_ownership_changes_but_token_is_unchanged() {
+    let (_dir,paths,store,id)=fixture();
+    let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint=format!("http://{}",listener.local_addr().unwrap());
+    let phone_paths=paths.clone();let phone_id=id.clone();
+    let server=tokio::spawn(async move {
+        let (mut socket,_)=listener.accept().await.unwrap();let mut request=vec![0;8192];socket.read(&mut request).await.unwrap();
+        let mut owner=WorkspaceStore::open(&phone_paths).unwrap();
+        owner.business_transaction(|db| {db.execute("INSERT INTO app_execution(app_id,mode,operation_id,updated_at) VALUES(?1,'to_phone','test-handoff',0)",[phone_id.as_str()])?;Ok(())}).unwrap();
+        let body=json!({"code":0,"items":[{"id":1,"user_id":123,"title":"first"}],"pagination":{"current_page":1,"total_pages":2}}).to_string();
+        socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+        let (mut second,_)=tokio::time::timeout(Duration::from_secs(2),listener.accept()).await.unwrap().unwrap();
+        second.read(&mut request).await.unwrap();
+        let body=json!({"code":0,"items":[{"id":2,"user_id":123,"title":"second"}],"pagination":{"current_page":2,"total_pages":2}}).to_string();
+        second.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+    });
+    OfflineRunner::new(None).unwrap().execute_business(&paths,&id,Operation::Products,&PagedFixture(endpoint),None,false).await.unwrap();
+    server.await.unwrap();
+    assert!(store.tasks(&id).unwrap().is_empty());
+    assert_eq!(data::read_data(&paths,&id,Dataset::Products,"",0).unwrap().total,2);
+}
+
+#[tokio::test]
+async fn manual_401_marks_shared_token_invalid_without_creating_a_task() {
+    let (_dir,paths,store,id)=fixture();
+    let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint=format!("http://{}",listener.local_addr().unwrap());
+    let server=tokio::spawn(async move {
+        let (mut socket,_)=listener.accept().await.unwrap();let mut request=vec![0;8192];socket.read(&mut request).await.unwrap();
+        let body=r#"{"message":"Authorization failed."}"#;
+        socket.write_all(format!("HTTP/1.1 401 Unauthorized\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+    });
+    let plugin=PagedFixture(endpoint);let runner=OfflineRunner::new(None).unwrap();
+    let error=runner.execute_business(&paths,&id,Operation::Products,&plugin,None,false).await.unwrap_err();
+    assert!(error.contains("401"));server.await.unwrap();
+    assert!(store.auth(&id).unwrap().unwrap().access_token_rejected());
+    assert!(store.tasks(&id).unwrap().is_empty());
+    assert!(runner.execute_business(&paths,&id,Operation::Products,&plugin,None,false).await.unwrap_err().contains("访问令牌已失效"));
+}
+
+#[tokio::test]
+async fn refresh_rechecks_rv_ownership_and_latest_token_pair_before_sending() {
+    for changed_source in [true,false] {
+        let (_dir,paths,mut store,id)=fixture();
+        let mut original=store.auth(&id).unwrap().unwrap();
+        original.refresh_token=Some("original-refresh".into());store.save_auth(&id,&original).unwrap();
+        let runner=OfflineRunner {credentials:Some((paths.clone(),id.clone())),..OfflineRunner::new(None).unwrap()};
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let request=runner.client.post(format!("http://{}/refresh",listener.local_addr().unwrap())).body("fixture");
+        if changed_source {
+            let device=AddressBook::load(paths.clone()).unwrap().connections()[0].id;
+            store.set_token_source(&id,TokenSource::Phone(Some(device))).unwrap();
+        } else {
+            let mut current=original.clone();current.refresh_token=Some("newer-refresh".into());store.save_auth(&id,&current).unwrap();
+        }
+        let error=runner.send_authenticated(request,&original,true).await.unwrap_err();
+        assert!(error.contains(if changed_source {"RV 不刷新"} else {"不使用旧 refresh token"}),"{error}");
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(30),listener.accept()).await.is_err(),"no refresh HTTP request may leave after ownership/credentials change");
+    }
 }

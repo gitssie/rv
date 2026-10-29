@@ -2,7 +2,7 @@
 use crate::{theme, typography};
 use gpui::*;
 use gpui_component::{
-    ThemeStyled, WindowExt,
+    Disableable, Sizable as _, ThemeStyled, WindowExt,
     button::{Button, ButtonVariants},
     dialog::Dialog,
     h_flex,
@@ -119,4 +119,143 @@ pub(crate) fn empty_state(message: impl Into<SharedString>, cx: &App) -> Div {
         .items_center()
         .justify_center()
         .child(typography::caption(message, cx))
+}
+
+pub(crate) fn empty_icon(cx: &App) -> Div {
+    div().flex_1().flex().items_center().justify_center().child(
+        gpui_component::Icon::new(gpui_component::IconName::Inbox)
+            .large()
+            .text_color(theme::muted(cx)),
+    )
+}
+
+/// All explicit imports from a phone use the same direction and credential warning.
+pub(crate) fn confirm_backup_sync(
+    source: String,
+    window: &mut Window,
+    cx: &mut App,
+    on_confirm: impl Fn(&mut Window, &mut App) + 'static,
+) {
+    let on_confirm = std::rc::Rc::new(on_confirm);
+    window.open_alert_dialog(cx, move |alert, _, _| {
+        let on_confirm = on_confirm.clone();
+        alert
+            .title("从手机同步账号备份？")
+            .description(format!(
+                "将从“{source}”读取账号备份，更新 RV 中保存的 state 和设备请求参数。\n手机备份中的令牌与 RV 不同时，保留 RV 当前的 Access Token 和 Refresh Token。此操作不会将 RV 状态写回手机。"
+            ))
+            .confirm()
+            .button_props(
+                gpui_component::dialog::DialogButtonProps::default()
+                    .show_cancel(true)
+                    .ok_text("确认同步")
+                    .cancel_text("取消"),
+            )
+            .on_ok(move |_, window, cx| {
+                on_confirm(window, cx);
+                true
+            })
+    });
+}
+
+pub(crate) struct ExecutionHandoffPrompt {
+    pub title: &'static str,
+    pub icon: crate::assets::FunctionIcon,
+    pub device: String,
+    pub backup: String,
+    pub acknowledgement: Option<&'static str>,
+}
+
+/// Shared compact confirmation for either execution owner. The optional user
+/// acknowledgement is explicit because a backup does not capture live changes.
+pub(crate) fn confirm_execution_handoff(
+    prompt: ExecutionHandoffPrompt,
+    window: &mut Window,
+    cx: &mut App,
+    on_confirm: impl Fn(&mut Window, &mut App) + 'static,
+) {
+    use gpui_component::{
+        Icon, IconName,
+        checkbox::Checkbox,
+        dialog::{Cancel, Confirm, DialogFooter},
+    };
+    let accepted = std::rc::Rc::new(std::cell::Cell::new(prompt.acknowledgement.is_none()));
+    let on_confirm = std::rc::Rc::new(on_confirm);
+    window.open_alert_dialog(cx, move |alert, _, cx| {
+        let accept = accepted.clone();
+        let confirm = on_confirm.clone();
+        let checked = accepted.clone();
+        let mut content = v_flex()
+            .gap_2()
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        Icon::new(crate::assets::FunctionIcon::Smartphone)
+                            .text_color(theme::accent(cx)),
+                    )
+                    .child(typography::label(prompt.device.clone(), cx)),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(Icon::new(IconName::File).text_color(theme::muted(cx)))
+                    .child(typography::caption(prompt.backup.clone(), cx)),
+            );
+        if let Some(label) = prompt.acknowledgement {
+            content = content.child(
+                Checkbox::new("handoff-acknowledgement")
+                    .debug_selector(|| "handoff-acknowledgement".into())
+                    .label(label)
+                    .checked(accepted.get())
+                    .on_click(move |value, window, _| {
+                        checked.set(*value);
+                        window.refresh();
+                    }),
+            );
+        } else {
+            content = content.child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .text_color(theme::warning(cx))
+                    .child(Icon::new(IconName::Pause))
+                    .child(
+                        typography::label("RV 全部任务将停止", cx).text_color(theme::warning(cx)),
+                    ),
+            );
+        }
+        alert
+            .title(prompt.title)
+            .icon(Icon::new(prompt.icon.clone()).text_color(theme::accent(cx)))
+            .child(content)
+            .on_ok(move |_, window, cx| {
+                if !accept.get() {
+                    return false;
+                }
+                confirm(window, cx);
+                true
+            })
+            .footer(
+                DialogFooter::new()
+                    .child(
+                        Button::new("handoff-cancel")
+                            .label("取消")
+                            .on_click(|_, window, cx| window.dispatch_action(Box::new(Cancel), cx)),
+                    )
+                    .child(
+                        Button::new("handoff-confirm")
+                            .primary()
+                            .icon(prompt.icon.clone())
+                            .label(prompt.title)
+                            .debug_selector(|| "handoff-confirm".into())
+                            .disabled(!accepted.get())
+                            .on_click(|_, window, cx| {
+                                window.dispatch_action(Box::new(Confirm { secondary: false }), cx)
+                            }),
+                    ),
+            )
+    });
 }

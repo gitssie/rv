@@ -1,7 +1,7 @@
 //! Vinted owns its tables, migration, projection and offline search.
 use super::*;
 use crate::data::*;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, params};
 use rv_core::StoreError;
 use std::time::{SystemTime, UNIX_EPOCH};
 fn now() -> i64 {
@@ -99,12 +99,6 @@ pub fn persist(
         }
     }
     // No destructive replacement: absence from a list never implies deletion.
-    let dataset = if operation == Operation::Products {
-        "products"
-    } else {
-        "orders"
-    };
-    db.execute("INSERT INTO vinted_sync_state VALUES(?1,?2,?3) ON CONFLICT(app_id,dataset) DO UPDATE SET last_sync=excluded.last_sync",params![id.as_str(),dataset,timestamp])?;
     Ok(())
 }
 pub fn read(
@@ -116,9 +110,9 @@ pub fn read(
 ) -> Result<BusinessPage, StoreError> {
     schema(db)?;
     scoped(db, id)?;
-    let (table, search, key) = match dataset {
-        Dataset::Products => ("vinted_products", "vinted_product_search", "products"),
-        Dataset::Orders => ("vinted_orders", "vinted_order_search", "orders"),
+    let (table, search) = match dataset {
+        Dataset::Products => ("vinted_products", "vinted_product_search"),
+        Dataset::Orders => ("vinted_orders", "vinted_order_search"),
     };
     let query = search_text.trim();
     let predicate = if query.is_empty() {
@@ -197,16 +191,8 @@ pub fn read(
             fetched_at: row.get(1)?,
         });
     }
-    let last_sync = db
-        .query_row(
-            "SELECT last_sync FROM vinted_sync_state WHERE app_id=?1 AND dataset=?2",
-            params![id.as_str(), key],
-            |r| r.get(0),
-        )
-        .optional()?;
     Ok(BusinessPage {
         rows: output,
         total: total as usize,
-        last_sync,
     })
 }

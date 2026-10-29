@@ -1,13 +1,7 @@
 //! UI plugins own business-specific rendering; the common card knows no Bundle IDs.
 use crate::{assets::FunctionIcon, theme};
 use gpui::*;
-use gpui_component::{
-    Icon, StyledExt,
-    button::{Button, ButtonVariants},
-    h_flex,
-    skeleton::Skeleton,
-    v_flex,
-};
+use gpui_component::{Icon, IconName, Sizable, StyledExt, h_flex, tooltip::Tooltip, v_flex};
 use rv_core::workspace::{
     AppInstance,
     strategies::{AppStrategy, EnvironmentStrategy, VintedStrategy},
@@ -15,9 +9,31 @@ use rv_core::workspace::{
 use std::collections::HashMap;
 
 pub(in crate::app) trait AppRenderer {
-    fn details(&self, app: &AppInstance, backups: usize, cx: &App) -> AnyElement;
+    fn details(
+        &self,
+        app: &AppInstance,
+        backups: usize,
+        expiry: rv_core::workspace::TokenExpirations,
+        cx: &App,
+    ) -> AnyElement;
     fn identity(&self, app: &AppInstance) -> (String, &'static str, u32, &'static str);
-    fn header_info(&self, _app: &AppInstance, _cx: &App) -> AnyElement {
+    fn display_title(&self, app: &AppInstance) -> String {
+        app.title.clone()
+    }
+    fn avatar_path(
+        &self,
+        _app: &AppInstance,
+        _paths: &rv_core::StorePaths,
+    ) -> Option<std::path::PathBuf> {
+        None
+    }
+
+    fn profile_details(
+        &self,
+        _app: &AppInstance,
+        _paths: &rv_core::StorePaths,
+        _cx: &App,
+    ) -> AnyElement {
         div().into_any_element()
     }
     fn offline_operations(&self) -> &'static [rv_business::Operation] {
@@ -29,9 +45,6 @@ pub(in crate::app) trait AppRenderer {
     fn card_preview(&self, row: Option<&rv_business::data::BusinessRow>, cx: &App) -> AnyElement {
         row.map(|row| self.business_row(row, cx))
             .unwrap_or_else(|| div().into_any_element())
-    }
-    fn detail_placeholder(&self, _cx: &App) -> AnyElement {
-        div().into_any_element()
     }
     fn business_row(&self, row: &rv_business::data::BusinessRow, cx: &App) -> AnyElement {
         v_flex()
@@ -83,7 +96,14 @@ impl AppRenderer for EnvironmentRenderer {
         let p = EnvironmentStrategy.project(app, 0);
         (p.app_name, p.symbol, p.accent, p.action_label)
     }
-    fn details(&self, app: &AppInstance, backups: usize, cx: &App) -> AnyElement {
+    fn details(
+        &self,
+        app: &AppInstance,
+        backups: usize,
+        expiry: rv_core::workspace::TokenExpirations,
+        cx: &App,
+    ) -> AnyElement {
+        let _ = expiry;
         let p = EnvironmentStrategy.project(app, backups);
         h_flex()
             .gap_4()
@@ -92,101 +112,90 @@ impl AppRenderer for EnvironmentRenderer {
     }
 }
 impl AppRenderer for VintedRenderer {
-    fn header_info(&self, app: &AppInstance, cx: &App) -> AnyElement {
-        let data: serde_json::Value = serde_json::from_str(&app.metadata).unwrap_or_default();
-        let state = data["session_status"].as_str().unwrap_or("尚未检测");
-        let market = data["market"]
-            .as_str()
-            .or_else(|| data["profile"]["market"].as_str())
-            .unwrap_or("");
+    fn display_title(&self, app: &AppInstance) -> String {
+        rv_business::shop::ShopProfile::from_app(app)
+            .and_then(|p| p.login)
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "Vinted".into())
+    }
+    fn avatar_path(
+        &self,
+        app: &AppInstance,
+        paths: &rv_core::StorePaths,
+    ) -> Option<std::path::PathBuf> {
+        rv_business::shop::ShopProfile::from_app(app)?
+            .avatar_url
+            .as_deref()
+            .and_then(|url| rv_business::assets::cached(paths, url))
+    }
+    fn profile_details(
+        &self,
+        app: &AppInstance,
+        _paths: &rv_core::StorePaths,
+        _cx: &App,
+    ) -> AnyElement {
+        let Some(profile) = rv_business::shop::ShopProfile::from_app(app) else {
+            return div().into_any_element();
+        };
+        let country = profile
+            .country_code
+            .or(profile.country_title)
+            .unwrap_or_else(|| "—".into());
+        let score = profile
+            .feedback_reputation
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "—".into());
+        let feedback = profile
+            .feedback_count
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "—".into());
+        let items = profile
+            .item_count
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "—".into());
         h_flex()
-            .gap_1()
-            .text_xs()
-            .text_color(theme::muted(cx))
-            .child(market.to_owned())
-            .child(div().size(px(5.)).rounded_full().bg(if state == "有效" {
-                theme::success(cx)
-            } else {
-                theme::muted(cx)
-            }))
-            .child(state.to_owned())
+            .gap_2()
+            .flex_wrap()
+            .items_center()
+            .child(metric(
+                "shop-country".into(),
+                gpui_component::IconName::Globe.into(),
+                country,
+                "国家",
+                _cx,
+            ))
+            .child(metric(
+                "shop-score".into(),
+                gpui_component::IconName::Star.into(),
+                score,
+                "评分",
+                _cx,
+            ))
+            .child(metric(
+                "shop-feedback".into(),
+                FunctionIcon::Chat.into(),
+                feedback,
+                "评价数量",
+                _cx,
+            ))
+            .child(metric(
+                "shop-items".into(),
+                FunctionIcon::Products.into(),
+                items,
+                "商品数量",
+                _cx,
+            ))
             .into_any_element()
     }
+
     fn business_row(&self, row: &rv_business::data::BusinessRow, cx: &App) -> AnyElement {
-        vinted_product(row, 64., cx)
-    }
-    fn detail_placeholder(&self, cx: &App) -> AnyElement {
-        v_flex()
-            .id("shop-detail-skeleton")
-            .debug_selector(|| "shop-detail-skeleton".into())
-            .children((0..4).map(|_| {
-                div()
-                    .py_2()
-                    .border_b_1()
-                    .border_color(theme::line(cx))
-                    .child(self.card_preview(None, cx))
-            }))
-            .into_any_element()
+        vinted_product(row, 64., false, cx)
     }
     fn card_preview(&self, row: Option<&rv_business::data::BusinessRow>, cx: &App) -> AnyElement {
         if let Some(row) = row {
-            return vinted_product(row, 72., cx);
+            return vinted_product(row, 72., true, cx);
         }
-        h_flex()
-            .id("shop-product-skeleton")
-            .debug_selector(|| "shop-product-skeleton".into())
-            .gap_3()
-            .items_center()
-            .py_1()
-            .child(
-                Skeleton::new()
-                    .bg(theme::line(cx))
-                    .w(px(72.))
-                    .h(px(72.))
-                    .flex_shrink_0()
-                    .rounded(theme::radius(cx)),
-            )
-            .child(
-                v_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .gap_2()
-                    .child(
-                        Skeleton::new()
-                            .bg(theme::line(cx))
-                            .w(relative(0.85))
-                            .h(px(14.))
-                            .rounded(theme::radius_small(cx)),
-                    )
-                    .child(
-                        Skeleton::new()
-                            .bg(theme::line(cx))
-                            .w(px(58.))
-                            .h(px(12.))
-                            .rounded(theme::radius_small(cx)),
-                    )
-                    .child(
-                        h_flex()
-                            .gap_1p5()
-                            .child(
-                                Skeleton::new()
-                                    .bg(theme::line(cx))
-                                    .secondary()
-                                    .w(px(44.))
-                                    .h(px(20.))
-                                    .rounded(theme::radius_small(cx)),
-                            )
-                            .child(
-                                Skeleton::new()
-                                    .bg(theme::line(cx))
-                                    .secondary()
-                                    .w(px(60.))
-                                    .h(px(20.))
-                                    .rounded(theme::radius_small(cx)),
-                            ),
-                    ),
-            )
-            .into_any_element()
+        div().into_any_element()
     }
     fn datasets(&self) -> &'static [rv_business::data::Dataset] {
         &[
@@ -199,27 +208,39 @@ impl AppRenderer for VintedRenderer {
             rv_business::Operation::Session,
             rv_business::Operation::Inbox,
             rv_business::Operation::NotificationStats,
-            rv_business::Operation::Refresh,
         ]
     }
     fn identity(&self, app: &AppInstance) -> (String, &'static str, u32, &'static str) {
         let p = VintedStrategy.project(app, 0);
         (p.app_name, p.symbol, p.accent, p.action_label)
     }
-    fn details(&self, app: &AppInstance, backups: usize, cx: &App) -> AnyElement {
-        vinted_status(app, backups, cx)
+    fn details(
+        &self,
+        app: &AppInstance,
+        backups: usize,
+        expiry: rv_core::workspace::TokenExpirations,
+        cx: &App,
+    ) -> AnyElement {
+        let _ = backups;
+        vinted_status(app, expiry, cx)
     }
 }
-fn vinted_product(row: &rv_business::data::BusinessRow, size: f32, cx: &App) -> AnyElement {
-    let mut photo = div()
-        .size(px(size))
-        .flex_shrink_0()
-        .rounded(theme::radius(cx))
-        .overflow_hidden()
-        .bg(theme::selected(cx));
-    if let Some(path) = &row.visual.image_path {
-        photo = photo.child(img(path.clone()).size_full().object_fit(ObjectFit::Cover));
-    }
+fn vinted_product(row: &rv_business::data::BusinessRow, size: f32, compact: bool, cx: &App) -> AnyElement {
+    let photo:AnyElement=if let Some(path)=&row.visual.image_path {
+        img(path.clone())
+            .size(px(size))
+            .flex_shrink_0()
+            .object_fit(ObjectFit::Cover)
+            .rounded(theme::radius_large(cx))
+            .into_any_element()
+    } else {
+        div().size(px(size)).flex_shrink_0()
+            .rounded(theme::radius_large(cx))
+            .bg(theme::selected(cx))
+            .flex().items_center().justify_center()
+            .child(Icon::new(FunctionIcon::Products).text_color(theme::muted(cx)))
+            .into_any_element()
+    };
     h_flex()
         .gap_3()
         .items_center()
@@ -244,55 +265,86 @@ fn vinted_product(row: &rv_business::data::BusinessRow, size: f32, cx: &App) -> 
                         .gap_1()
                         .child(div().text_xs().mr_1().child(row.visual.price.clone()))
                         .children(row.visual.badges.iter().map(|label| {
-                            let tag = match label.as_str() {
-                                "隐藏" | "不可交易" => gpui_component::tag::Tag::danger(),
-                                "延迟发布" | "处理中" | "待发货" => {
-                                    gpui_component::tag::Tag::warning()
-                                }
-                                "预留" | "已完成" => gpui_component::tag::Tag::success(),
-                                "已关闭" => gpui_component::tag::Tag::secondary(),
-                                _ => gpui_component::tag::Tag::info(),
-                            };
-                            tag.child(label.clone())
+                            let (icon,color)=product_status(label,cx);
+                            let tooltip=label.clone();
+                            let mut status=h_flex()
+                                .id(SharedString::from(format!("product-status-{}-{label}",row.id)))
+                                .items_center()
+                                .gap_1()
+                                .text_color(color)
+                                .tooltip(move |window,cx|Tooltip::new(tooltip.clone()).build(window,cx))
+                                .child(icon.small());
+                            if !compact {status=status.child(div().text_xs().child(label.clone()));}
+                            status
                         })),
                 ),
         )
         .into_any_element()
 }
-fn vinted_status(app: &AppInstance, backups: usize, cx: &App) -> AnyElement {
-    let details = VintedStrategy.project(app, backups);
-    let state = details.facts[0].value.clone();
-    let unread = details.facts[1].value.clone();
-    let color = if state == "有效" {
-        theme::success(cx)
-    } else if state == "尚未检测" {
-        theme::muted(cx)
-    } else {
-        theme::danger(cx)
+fn product_status(label:&str,cx:&App)->(Icon,Hsla) {
+    let icon=match label {
+        "隐藏"=>Icon::new(IconName::EyeOff),
+        "不可交易"=>Icon::new(IconName::CircleX),
+        "延迟发布"=>Icon::new(FunctionIcon::Recent),
+        "草稿"=>Icon::new(FunctionIcon::Edit),
+        "预留"=>Icon::new(IconName::Pause),
+        "处理中"=>Icon::new(IconName::LoaderCircle),
+        "已关闭"=>Icon::new(FunctionIcon::Archive),
+        "已完成"=>Icon::new(IconName::CircleCheck),
+        "待发货"=>Icon::new(FunctionIcon::Products),
+        "卖出"=>Icon::new(IconName::ArrowUp),
+        "买入"=>Icon::new(IconName::ArrowDown),
+        _=>Icon::new(IconName::Info),
     };
+    let color=match label {
+        "隐藏"=>theme::muted(cx),
+        "不可交易"=>theme::warning(cx),
+        "延迟发布"|"处理中"|"待发货"=>theme::warning(cx),
+        "预留"|"已完成"=>theme::success(cx),
+        "已关闭"|"草稿"=>theme::muted(cx),
+        _=>theme::accent(cx),
+    };
+    (icon,color)
+}
+fn metric(
+    id: SharedString,
+    icon: Icon,
+    value: String,
+    tooltip: &'static str,
+    cx: &App,
+) -> AnyElement {
+    h_flex()
+        .id(id)
+        .gap_1()
+        .items_center()
+        .text_xs()
+        .text_color(theme::muted(cx))
+        .tooltip(move |window, cx| Tooltip::new(tooltip).build(window, cx))
+        .child(icon)
+        .child(crate::typography::caption(value, cx))
+        .into_any_element()
+}
+fn vinted_status(
+    app: &AppInstance,
+    expiry: rv_core::workspace::TokenExpirations,
+    cx: &App,
+) -> AnyElement {
+    let details = VintedStrategy.project(app, 0);
     h_flex()
         .gap_2()
         .items_center()
-        .child(
-            Button::new(format!("card-session-{}", app.id.as_str()))
-                .debug_selector({
-                    let id = app.id.clone();
-                    move || format!("card-session-{}", id.as_str())
-                })
-                .ghost()
-                .icon(Icon::new(FunctionIcon::Shield))
-                .text_color(color)
-                .tooltip(format!("会话：{state}"))
-                .accessibility_label(format!("会话：{state}")),
-        )
-        .child(
-            Button::new(format!("card-unread-{}", app.id.as_str()))
-                .ghost()
-                .icon(Icon::new(FunctionIcon::Chat))
-                .label(unread)
-                .text_color(theme::muted(cx))
-                .tooltip("未读消息")
-                .accessibility_label("未读消息"),
-        )
+        .child(super::token_expiry::token_indicator(
+            format!("card-token-{}", app.id.as_str()).into(),
+            expiry,
+            false,
+            cx,
+        ))
+        .child(metric(
+            format!("card-unread-{}", app.id.as_str()).into(),
+            FunctionIcon::Chat.into(),
+            details.facts[1].value.clone(),
+            "未读消息",
+            cx,
+        ))
         .into_any_element()
 }

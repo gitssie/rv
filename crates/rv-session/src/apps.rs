@@ -56,6 +56,22 @@ pub enum AppCommand {
         bundle: String,
         backup: String,
     },
+    HandoffBackup {
+        app_id: rv_core::workspace::AppId,
+        bundle: String,
+        backup: String,
+        store_root: std::path::PathBuf,
+        device_id: rv_core::ConnectionId,
+        operation_id: String,
+    },
+    TakeoverBackup {
+        app_id: rv_core::workspace::AppId,
+        bundle: String,
+        backup: String,
+        store_root: std::path::PathBuf,
+        device_id: rv_core::ConnectionId,
+        operation_id: String,
+    },
     Icon(String),
     ScreenState(u32),
     PrepareUnlock(u32),
@@ -103,7 +119,9 @@ impl AppCommand {
             Self::Restart(_) => 4,
             Self::Foreground => 5,
             Self::DeviceInfo => 25,
-            Self::ReadProfile { .. } => 0,
+            Self::ReadProfile { .. } | Self::HandoffBackup { .. } | Self::TakeoverBackup { .. } => {
+                0
+            }
             Self::Icon(_) => 6,
             Self::ScreenState(_) => 7,
             Self::PrepareUnlock(_) => 8,
@@ -122,6 +140,8 @@ impl AppCommand {
         matches!(
             self,
             Self::RandomTouch(_)
+                | Self::HandoffBackup { .. }
+                | Self::TakeoverBackup { .. }
                 | Self::Launch(_)
                 | Self::Terminate(_)
                 | Self::Restart(_)
@@ -194,10 +214,20 @@ pub(crate) struct AppRuntime {
     screen_operation: Option<crate::screen_control::ScreenOperation>,
     karing_operations: Vec<crate::karing::KaringOperation>,
     profile_operations: Vec<crate::app_profile::ProfileOperation>,
+    handoff_operations: Vec<crate::phone_handoff::HandoffOperation>,
+    profile_queue: VecDeque<AppCommand>,
     gesture: Option<crate::touch_gesture::GestureOperation>,
 }
 
 impl AppRuntime {
+    pub(crate) fn mutations_pending(&self) -> bool {
+        self.queue.iter().any(AppCommand::mutates)
+            || self.pending.values().any(|(command, _)| command.mutates())
+            || self.screen_operation.is_some()
+            || self.gesture.is_some()
+            || !self.karing_operations.is_empty()
+            || !self.handoff_operations.is_empty()
+    }
     pub fn new(allowed: bool) -> Self {
         Self {
             caps: AppCapabilities::default(),
@@ -213,6 +243,8 @@ impl AppRuntime {
             screen_operation: None,
             karing_operations: Vec::new(),
             profile_operations: Vec::new(),
+            handoff_operations: Vec::new(),
+            profile_queue: VecDeque::new(),
             gesture: None,
         }
     }
@@ -237,7 +269,9 @@ impl AppRuntime {
                 AppCommand::Restart(_) => self.caps.restart,
                 AppCommand::Foreground => self.caps.foreground,
                 AppCommand::DeviceInfo => self.caps.device_info && self.caps.zx_control.is_some(),
-                AppCommand::ReadProfile { .. } => {
+                AppCommand::ReadProfile { .. }
+                | AppCommand::HandoffBackup { .. }
+                | AppCommand::TakeoverBackup { .. } => {
                     self.caps.app_profile && self.caps.zx_control.is_some() && self.allowed
                 }
                 AppCommand::Icon(_) => self.caps.icons,
@@ -256,14 +290,18 @@ impl AppRuntime {
             return;
         }
         if let AppCommand::RandomTouch(id) = command {
-            let result = if !self.supported(&command) || !self.control_ready
-                || self.gesture.is_some() || self.screen_operation.is_some()
+            let result = if !self.supported(&command)
+                || !self.control_ready
+                || self.gesture.is_some()
+                || self.screen_operation.is_some()
                 || self.pending.values().any(|(cmd, _)| cmd.mutates())
                 || self.queue.iter().any(AppCommand::mutates)
             {
                 Err("触摸控制不可用或手机正在执行其他操作".to_string())
             } else {
-                self.http_client.clone().ok_or_else(|| "HTTP/2 控制尚未就绪".to_string())
+                self.http_client
+                    .clone()
+                    .ok_or_else(|| "HTTP/2 控制尚未就绪".to_string())
                     .and_then(|client| crate::touch_gesture::GestureOperation::start(client, id))
             };
             match result {
@@ -273,7 +311,38 @@ impl AppRuntime {
             return;
         }
         if self.gesture.is_some() && command.mutates() {
-            send(AppEvent::Failed { command, message: "请先停止触摸测试".into() });
+            send(AppEvent::Failed {
+                command,
+                message: "请先停止触摸测试".into(),
+            });
+            return;
+        }
+        if matches!(
+            command,
+            AppCommand::HandoffBackup { .. } | AppCommand::TakeoverBackup { .. }
+        ) {
+            if !self.supported(&command)
+                || !self.control_ready
+                || self.mutations_pending()
+                || !self.profile_operations.is_empty()
+            {
+                send(AppEvent::Failed {
+                    command,
+                    message: "账号接管不可用或手机正在执行其他操作".into(),
+                });
+            } else if let Some(client) = self.http_client.clone() {
+                self.handoff_operations
+                    .push(crate::phone_handoff::HandoffOperation::start(
+                        client, command,
+                    ));
+            }
+            return;
+        }
+        if !self.handoff_operations.is_empty() {
+            send(AppEvent::Failed {
+                command,
+                message: "正在回写账号备份，请等待交接完成".into(),
+            });
             return;
         }
         if let AppCommand::ReadProfile {
@@ -284,7 +353,6 @@ impl AppRuntime {
         {
             if !self.supported(&command)
                 || !self.control_ready
-                || !self.profile_operations.is_empty()
                 || !valid_bundle_id(bundle)
                 || !backup.starts_with("snapshot:")
             {
@@ -292,6 +360,24 @@ impl AppRuntime {
                     command,
                     message: "手机账号资料读取不可用或正在执行".into(),
                 });
+                return;
+            }
+            if !self.profile_operations.is_empty() {
+                if !self.profile_queue.contains(&command)
+                    && !self
+                        .profile_operations
+                        .iter()
+                        .any(|op| op.command == command)
+                {
+                    if self.profile_queue.len() >= 512 {
+                        send(AppEvent::Failed {
+                            command,
+                            message: "账号导入队列已满，请稍后重试".into(),
+                        });
+                    } else {
+                        self.profile_queue.push_back(command);
+                    }
+                }
                 return;
             }
             if let Some(client) = self.http_client.clone() {
@@ -470,6 +556,23 @@ impl AppRuntime {
                 });
             }
         }
+        self.handoff_operations.retain_mut(|operation| {
+            let result = match operation.result.try_recv() {
+                Ok(result) => Some(result),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => None,
+                Err(_) => Some(Err("手机交接已停止，RV 任务保持停止".into())),
+            };
+            if let Some(result) = result {
+                let command = operation.command.clone();
+                send(match result {
+                    Ok(()) => AppEvent::Finished(command),
+                    Err(message) => AppEvent::Failed { command, message },
+                });
+                false
+            } else {
+                true
+            }
+        });
         self.profile_operations
             .retain_mut(|operation| match operation.result.try_recv() {
                 Ok(Ok(response)) => {
@@ -492,6 +595,11 @@ impl AppRuntime {
                     false
                 }
             });
+        if self.profile_operations.is_empty() && self.control_ready {
+            if let Some(command) = self.profile_queue.pop_front() {
+                self.command(command, send);
+            }
+        }
         self.karing_operations
             .retain_mut(|operation| match operation.result.try_recv() {
                 Ok(Ok(response)) => {
@@ -869,7 +977,9 @@ impl AppRuntime {
         self.http_client.clone()
     }
     fn control_unavailable(&mut self, send: &impl Fn(AppEvent)) {
-        if let Some(operation) = &self.gesture { operation.cancel(); }
+        if let Some(operation) = &self.gesture {
+            operation.cancel();
+        }
         let queued = std::mem::take(&mut self.queue);
         for command in queued {
             if command.mutates() {
