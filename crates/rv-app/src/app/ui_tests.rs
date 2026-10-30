@@ -1170,6 +1170,7 @@ fn rv_takeover_confirmation_requires_acknowledgement_and_cancel_has_no_effect(
         crate::ui::confirm_execution_handoff(
             crate::ui::ExecutionHandoffPrompt {
                 title: "交给 RV",
+                description: crate::ui::RV_HANDOFF_DESCRIPTION,
                 icon: crate::assets::FunctionIcon::Monitor,
                 device: "iPhone7Plus".into(),
                 backup: "fixture backup".into(),
@@ -1201,6 +1202,7 @@ fn rv_takeover_confirmation_requires_acknowledgement_and_cancel_has_no_effect(
         crate::ui::confirm_execution_handoff(
             crate::ui::ExecutionHandoffPrompt {
                 title: "交给 RV",
+                description: crate::ui::RV_HANDOFF_DESCRIPTION,
                 icon: crate::assets::FunctionIcon::Monitor,
                 device: "iPhone7Plus".into(),
                 backup: "fixture backup".into(),
@@ -1215,4 +1217,48 @@ fn rv_takeover_confirmation_requires_acknowledgement_and_cancel_has_no_effect(
     cx.run_until_parked();
     assert_eq!(confirmations.get(), 1, "cancel cannot dispatch takeover");
     cx.update(|window, cx| assert!(!window.has_active_dialog(cx)));
+}
+
+#[gpui::test]
+fn shop_rv_takeover_cancel_preserves_phone_source_and_shop(cx: &mut TestAppContext) {
+    use crate::session_window::{SessionOptions, SessionView};
+    use rv_core::workspace::{AppId, ExecutionMode, WorkspaceStore};
+    use rv_session::{SessionEvent, SessionHandle};
+    let device = Connection::new("fixture", "127.0.0.1", 9);
+    let (app, cx, _dir) = setup(cx, vec![device.clone()]);
+    let id = AppId::from_idfv("C9EB7804-2062-4519-AC8D-6F68972574F3").unwrap();
+    let (handle, peer) = SessionHandle::test_pair();
+    let _view = cx.update(|window,cx| {
+        let view=cx.new(|cx| SessionView::with_control_test_handle(
+            ConnectRequest::from_connection(&device,None),
+            SessionOptions { scale:rv_core::ScaleMode::Fit,pin_toolbar:false,menu_key:"F8".into(),hide_shots:true,thumb_path:None,app_icon_cache:None,address_book:Some(app.downgrade()),transfer_folders:Default::default(),app_shortcuts:vec![],remember_password:false },handle,window,cx));
+        app.update(cx,|app,cx| {
+            app.home.control_loading.remove(&device.id);
+            app.home.controls.insert(device.id,super::home::control::PhoneControl::new(view.clone(),&device));
+            WorkspaceStore::open(app.book.paths()).unwrap().sync_backups(device.id,"lt.manodrabuziai.fr",&serde_json::json!({"bundle_id":"lt.manodrabuziai.fr","backups":[{"backup_id":format!("snapshot:{}",id.as_str()),"kind":"snapshot","display_name":"fixture backup","idfv":id.as_str()}]})).unwrap();
+            WorkspaceStore::open(app.book.paths()).unwrap().set_token_source(&id,rv_core::workspace::TokenSource::Phone(Some(device.id))).unwrap();
+            app.reload_home(cx);
+        });
+        peer.events.send(SessionEvent::ControlState(true)).unwrap();
+        view.update(cx,|view,cx|view.pump_control_test(cx));
+        view
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| app.update(cx, |app, cx| app.open_app_detail(id.clone(), window, cx)));
+    click(cx, "shop-handoff-rv");
+    click(cx, "handoff-confirm");
+    app.read_with(cx,|app,_|assert!(app.home.handoff_running.is_empty(),"unacknowledged takeover must not dispatch"));
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    app.read_with(cx, |app, _| {
+        assert!(
+            matches!(app.modal, Modal::Shop),
+            "cancelling handoff must retain the shop"
+        );
+        let store = WorkspaceStore::open(app.book.paths()).unwrap();
+        assert_eq!(store.execution(&id).unwrap().mode, ExecutionMode::Rv);
+        assert_eq!(store.token_source(&id).unwrap(),rv_core::workspace::TokenSource::Phone(Some(device.id)));
+        assert!(app.home.handoff_running.is_empty());
+    });
 }

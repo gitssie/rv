@@ -102,17 +102,10 @@ impl SessionView {
         if !self.can_handoff_backup() {
             return false;
         }
+        let to_rv=matches!(&command,AppCommand::TakeoverBackup{..});
         self.handle.app(command);
-        self.functions.message = "正在回写账号备份，RV 任务已停止…".into();
-        cx.notify();
-        true
-    }
-    pub(crate) fn takeover_backup(&mut self, command: AppCommand, cx: &mut Context<Self>) -> bool {
-        if !self.can_handoff_backup() {
-            return false;
-        }
-        self.handle.app(command);
-        self.functions.message = "正在读取手机备份并交给 RV…".into();
+        self.functions.message = if to_rv {"正在读取手机备份并交给 RV…"}
+            else {"正在回写账号备份，RV 任务已停止…"}.into();
         cx.notify();
         true
     }
@@ -1382,10 +1375,11 @@ impl SessionView {
         crate::ui::confirm_execution_handoff(
             crate::ui::ExecutionHandoffPrompt {
                 title: "交给 RV",
+                description: crate::ui::RV_HANDOFF_DESCRIPTION,
                 icon: FunctionIcon::Monitor,
                 device: name,
                 backup: backup.name.clone(),
-                acknowledgement: Some("已保存该环境的最新备份，且手机不再使用该环境"),
+                acknowledgement: Some("已在 Shadow 保存最新备份，并切换到其他环境"),
             },
             window,
             cx,

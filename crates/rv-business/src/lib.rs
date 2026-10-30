@@ -59,11 +59,17 @@ pub struct RequestPlan {
     pub body: Option<String>,
 }
 pub trait BusinessStrategy: Send + Sync {
+    fn product_refresh(&self, _: &str) -> Result<Box<dyn BusinessStrategy>, String> {
+        Err("此 App 尚未接入单商品刷新".into())
+    }
     fn requires_proxy(&self) -> bool {
         false
     }
     fn request(&self, operation: Operation, auth: &AppAuth) -> Result<RequestPlan, String>;
     fn project(&self, operation: Operation, status: u16, response: &Value) -> Value;
+    fn is_success(&self,_operation:Operation,status:u16,_result:&Value)->bool {
+        (200..300).contains(&status)
+    }
     fn image_urls(&self, _operation: Operation, _result: &Value) -> Vec<String> {
         vec![]
     }
@@ -175,11 +181,7 @@ impl OfflineRunner {
         let store = WorkspaceStore::open(paths).map_err(|e| e.to_string())?;
         let app = store.load(id).map_err(|e| e.to_string())?;
         let plugin = strategy(&app.bundle_id).ok_or("此 App 尚未接入脱机任务")?;
-        if matches!(operation,Operation::Session|Operation::Products|Operation::Orders|Operation::NotificationStats|Operation::Notifications) {
-            self.execute_business(paths,id,operation,plugin.as_ref(),None,false).await.map(|_|())
-        } else {
-            self.run_with_strategy(paths,id,operation,plugin.as_ref()).await
-        }
+        self.run_with_strategy(paths,id,operation,plugin.as_ref()).await
     }
     async fn run_with_strategy(
         &self,
@@ -198,13 +200,17 @@ impl OfflineRunner {
         plugin: &dyn BusinessStrategy,
         queued: Option<&AppTask>,
     ) -> Result<(), String> {
-        self.execute_business(paths,id,operation,plugin,queued,true).await.map(|_|())
+        self.execute_business(paths,id,operation,plugin,queued).await.map(|_|())
     }
     async fn execute_business(
         &self,paths:&StorePaths,id:&AppId,operation:Operation,
-        plugin:&dyn BusinessStrategy,queued:Option<&AppTask>,record_task:bool,
+        plugin:&dyn BusinessStrategy,queued:Option<&AppTask>,
     )->Result<Value,String> {
+        let record_task=queued.is_some();
         let mut store = WorkspaceStore::open(paths).map_err(|e| e.to_string())?;
+        if operation==Operation::Refresh && store.token_source(id).map_err(|e|e.to_string())?!=rv_core::workspace::TokenSource::Rv {
+            return Err("Token 由手机提供，RV 不刷新令牌".into());
+        }
         let auth = store
             .request_auth(id)
             .map_err(|e| e.to_string())?
@@ -233,15 +239,13 @@ impl OfflineRunner {
             credentials: Some((paths.clone(),id.clone())),
             interactive: !record_task,
         };
-        let task=if record_task {
-            Some(match queued {
-                Some(task)=>store.claim_task_when(task,|db|tasks::admit_access_token(db,id.as_str(),Some(&task.id))),
-                None=>store.start_task_when(id,operation.key(),|db|if operation==Operation::Refresh {
-                    tasks::admit_refresh(db,id.as_str())
-                } else {tasks::admit_access_token(db,id.as_str(),None)}),
-            }.map_err(|e|e.to_string())?)
+        let task=if let Some(task)=queued {
+            Some(store.claim_task_when(task,|db|tasks::admit_access_token(db,id.as_str(),Some(&task.id)))
+                .map_err(|e|e.to_string())?)
         } else {
-if auth.access_token_rejected(){return Err("访问令牌已失效，等待更新凭据".into())}
+            if operation!=Operation::Refresh && auth.access_token_rejected() {
+                return Err("访问令牌已失效，等待更新凭据".into());
+            }
             None
         };
         let budget = Duration::from_secs(queued.map_or(75, |task| u64::from(task.timeout_seconds)));
@@ -324,6 +328,7 @@ if auth.access_token_rejected(){return Err("访问令牌已失效，等待更新
                     rotated = Some(updated);
                 }
                 let result = plugin.project(operation, status, &response);
+                let successful=plugin.is_success(operation,status,&result);
                 let task_result = plugin.task_result(operation, &result);
                 let mut projection = json!({});
                 if operation != Operation::Refresh {
@@ -341,18 +346,24 @@ if auth.access_token_rejected(){return Err("访问令牌已失效，等待更新
                         }
                     }
                 }
-                if let (Some(task),Some(updated))=(&task,&rotated) {
-                    let adopted=store.complete_refresh_task(id,task,&task_result,&auth,updated,&projection)
-                        .map_err(|e|e.to_string())?;
+                if let Some(updated)=&rotated {
+                    let adopted=match &task {
+                        Some(task)=>store.complete_refresh_task(id,task,&task_result,&auth,updated,&projection),
+                        None=>store.complete_refresh_request(id,&auth,updated),
+                    }.map_err(|e|e.to_string())?;
                     return if adopted {Ok(task_result)} else {Err("Token 来源或凭据已改变，本次刷新结果未采用".into())};
                 }
                 let committed=if let Some(task)=&task {
+                    if operation == Operation::Refresh && status == 400 && task_result["error_code"] == "invalid_grant" {
+                        store.complete_invalid_refresh_task(id, task, &task_result, &auth).map(|_| ())
+                    } else {
                     store.complete_task_with_policy(
-                        id,task,if (200..300).contains(&status){"completed"}else{"failed"},
+                        id,task,if successful{"completed"}else{"failed"},
                         &task_result,rotated.as_ref(),Some(&projection),
                         TaskFinishPolicy{retryable:queued.is_some() && operation!=Operation::Refresh && (status==429 || status>=500),stop_on_failure:matches!(status,401|403)},
                         |db|plugin.persist(db,id,operation,&result),
                     )
+                    }
                 } else {
                     store.commit_business_data(id,&projection,|db|plugin.persist(db,id,operation,&result))
                 };
@@ -361,7 +372,7 @@ if auth.access_token_rejected(){return Err("访问令牌已失效，等待更新
                     if let Some(task)=&task {let _=store.finish_task(task,"unknown",&json!({"error":"业务结果保存失败，请核对状态"}));}
                     return Err("业务结果保存失败，请核对状态".into());
                 }
-                if (200..300).contains(&status) {
+                if successful {
                     Ok(task_result)
                 } else {
                     let message=task_result.get("error").and_then(Value::as_str).map(str::to_owned).unwrap_or_else(||format!("业务接口返回 HTTP {status}"));
@@ -485,8 +496,7 @@ if auth.access_token_rejected(){return Err("访问令牌已失效，等待更新
     ) -> Result<(u16, Value), String> {
         let mut request = self
             .client
-            .request(plan.method, plan.url)
-            .header("Accept", "application/json");
+            .request(plan.method, plan.url);
         request = device_headers(request, auth);
         if let Some(body) = plan.body {
             request = request
@@ -537,6 +547,8 @@ pub(crate) fn device_headers(
     mut request: reqwest::RequestBuilder,
     auth: &AppAuth,
 ) -> reqwest::RequestBuilder {
+    request = request.header("Accept", "*/*")
+        .header("Accept-Encoding", "gzip, deflate, br");
     for (key, value) in &auth.headers {
         if [
             "X-Session-Id",

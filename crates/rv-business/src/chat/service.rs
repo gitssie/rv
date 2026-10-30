@@ -42,19 +42,10 @@ impl crate::OfflineRunner {
             .block_on(self.chat(paths, id, action))
     }
     pub async fn chat(&self, paths: &StorePaths, id: &AppId, action: Action) -> Result<(), String> {
-        self.chat_internal(paths, id, action, None, false).await
+        self.chat_internal(paths, id, action, None).await
     }
     pub(crate) async fn chat_interactive(&self,paths:&StorePaths,id:&AppId,action:Action)->Result<(),String> {
-        self.chat_internal(paths,id,action,None,false).await
-    }
-    pub(crate) async fn chat_queued(
-        &self,
-        paths: &StorePaths,
-        id: &AppId,
-        action: Action,
-        task: &AppTask,
-    ) -> Result<(), String> {
-        self.chat_internal(paths, id, action, Some(task), true).await
+        self.chat_internal(paths,id,action,None).await
     }
     async fn chat_internal(
         &self,
@@ -62,7 +53,6 @@ impl crate::OfflineRunner {
         id: &AppId,
         action: Action,
         queued: Option<&AppTask>,
-        record_task: bool,
     ) -> Result<(), String> {
         let mut store = WorkspaceStore::open(paths).map_err(|e| e.to_string())?;
         let app = store.load(id).map_err(|e| e.to_string())?;
@@ -86,7 +76,7 @@ impl crate::OfflineRunner {
         let runner = Self {
             client: route.client.clone(),
             credentials: Some((paths.clone(),id.clone())),
-            interactive: !record_task,
+            interactive: queued.is_none(),
         };
         runner
             .chat_with_lease(
@@ -164,14 +154,11 @@ impl crate::OfflineRunner {
             }
             Ok(())
         };
-        let task=if self.interactive {
-store.business_transaction(admit).map_err(|e|e.to_string())?;
-            None
+        let task=if let Some(task)=queued {
+            Some(store.claim_task_when(task,admit).map_err(|e|e.to_string())?)
         } else {
-            Some(match queued {
-                Some(task)=>store.claim_task_when(task,admit),
-                None=>store.start_task_when(&app.id,action.kind(),admit),
-            }.map_err(|e|e.to_string())?)
+            store.business_transaction(admit).map_err(|e|e.to_string())?;
+            None
         };
         let budget = Duration::from_secs(queued.map_or(75, |task| u64::from(task.timeout_seconds)));
         let deadline = std::time::Instant::now() + budget;
@@ -328,6 +315,7 @@ store.business_transaction(admit).map_err(|e|e.to_string())?;
                     let next = batch.next.clone();
                     if let Some(first) = &mut detail {
                         first.messages.extend(batch.messages);
+                        first.next = next.clone();
                         first.participants.extend(batch.participants);
                     } else {
                         detail = Some(batch);
@@ -355,8 +343,7 @@ store.business_transaction(admit).map_err(|e|e.to_string())?;
         allow_empty: bool,
     ) -> Result<Value, String> {
         let mut request = crate::device_headers(self.client.request(plan.method, plan.url), auth)
-            .bearer_auth(&auth.access_token)
-            .header("Accept", "application/json");
+            .bearer_auth(&auth.access_token);
         if let Some(body) = plan.body {
             request = request.json(&body);
         }
@@ -382,7 +369,6 @@ store.business_transaction(admit).map_err(|e|e.to_string())?;
         );
         let request = crate::device_headers(self.client.post(plan.url), auth)
             .bearer_auth(&auth.access_token)
-            .header("Accept", "application/json")
             .multipart(form);
         let reply = self.chat_response(request, auth, false).await?;
         plugin.image_reference(&reply)

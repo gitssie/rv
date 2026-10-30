@@ -8,8 +8,12 @@ use std::time::{Duration, Instant};
 #[derive(Clone, Copy)]
 pub(crate) enum Workflow {
     Send,
-    Threads,
+    Sync,
     Read,
+}
+fn pending_threads(db:&rusqlite::Connection,id:&AppId)->Result<Vec<String>,StoreError> {
+    let mut stmt=db.prepare("SELECT c.remote_id FROM chat_conversations c WHERE c.app_id=?1 AND (c.detail_loaded=0 OR c.updated_at>COALESCE((SELECT inbox_updated_at FROM chat_detail_sync WHERE conversation_id=c.id),0) OR c.id=(SELECT conversation_id FROM chat_view_state WHERE app_id=?1)) ORDER BY (c.id=(SELECT conversation_id FROM chat_view_state WHERE app_id=?1)) DESC,COALESCE((SELECT fetched_at FROM chat_detail_sync WHERE conversation_id=c.id),0),c.updated_at DESC LIMIT 4")?;
+    Ok(stmt.query_map([id.as_str()],|row|row.get::<_,String>(0))?.collect::<Result<Vec<_>,_>>()?)
 }
 struct Pending {
     id: String,
@@ -18,6 +22,14 @@ struct Pending {
     image: Option<Vec<u8>>,
 }
 impl crate::OfflineRunner {
+    pub(crate) async fn chat_workflow_direct(
+        &self,paths:&StorePaths,id:&AppId,workflow:Workflow,
+    )->Result<(),String> {
+        let app=WorkspaceStore::open(paths).map_err(|e|e.to_string())?
+            .load(id).map_err(|e|e.to_string())?;
+        let plugin=strategy(&app.bundle_id).ok_or("此 App 尚未接入聊天")?;
+        self.chat_workflow_execute(paths,id,None,workflow,plugin.as_ref(),None).await.map(|_|())
+    }
     pub(crate) async fn chat_workflow(
         &self,
         paths: &StorePaths,
@@ -50,7 +62,7 @@ impl crate::OfflineRunner {
         if app.archived {
             return Err("账号已归档".into());
         }
-        let work=store.business_transaction(|db|{
+        let mut work=store.business_transaction(|db|{
    repository::schema(db)?;queue::recover(db)?;
    match workflow {
     Workflow::Send=>{
@@ -58,10 +70,10 @@ impl crate::OfflineRunner {
      Ok((pending,Vec::new()))
     },
     Workflow::Read=>{let mut stmt=db.prepare("SELECT c.remote_id FROM chat_read_requests r JOIN chat_conversations c ON c.id=r.conversation_id WHERE c.app_id=?1 AND (?2 IS NULL OR c.id=?2) ORDER BY r.requested_at LIMIT 1")?;let list=stmt.query_map(params![id.as_str(),conversation],|r|r.get::<_,String>(0))?.collect::<Result<Vec<_>,_>>()?;Ok((None,list))},
-    Workflow::Threads=>{let mut stmt=db.prepare("SELECT c.remote_id FROM chat_conversations c WHERE c.app_id=?1 AND (c.detail_loaded=0 OR c.updated_at>COALESCE((SELECT inbox_updated_at FROM chat_detail_sync WHERE conversation_id=c.id),0) OR c.id=(SELECT conversation_id FROM chat_view_state WHERE app_id=?1)) ORDER BY (c.id=(SELECT conversation_id FROM chat_view_state WHERE app_id=?1)) DESC,COALESCE((SELECT fetched_at FROM chat_detail_sync WHERE conversation_id=c.id),0),c.updated_at DESC LIMIT 4")?;let list=stmt.query_map([id.as_str()],|r|r.get::<_,String>(0))?.collect::<Result<Vec<_>,_>>()?;Ok((None,list))},
+    Workflow::Sync=>Ok((None,Vec::new())),
    }
   }).map_err(|e|e.to_string())?;
-        if work.0.is_none() && work.1.is_empty() {
+        if work.0.is_none() && work.1.is_empty() && !matches!(workflow,Workflow::Sync) {
             if let Some(task)=task {
                 let claimed=store.claim_task_when(task,|db|crate::tasks::admit_access_token(db,id.as_str(),Some(&task.id))).map_err(|e|e.to_string())?;
                 store.finish_task(&claimed,"completed",&json!({"processed":0})).map_err(|e|e.to_string())?;
@@ -123,6 +135,23 @@ impl crate::OfflineRunner {
                 }
                 return Ok((Some(reply), Vec::new()));
             }
+            if matches!(workflow, Workflow::Sync) {
+                let ChatResult::Inbox(rows) = runner.chat_fetch(plugin,&app,&auth,&service::Action::Inbox).await? else {
+                    return Err("聊天列表返回无效".into());
+                };
+                let urls=rows.iter().flat_map(|row| {
+                    row.avatar.iter().map(|image|image.url.clone())
+                        .chain(row.items.iter().filter_map(|item|item.image.as_ref().map(|image|image.url.clone())))
+                }).collect();
+                crate::assets::cache_business_images_on_route(paths,id,urls,deadline,&route,task.is_none()).await?;
+                // The same claimed task and network lease continue into details.
+                // Persist the list before selecting details so new conversations
+                // are included in this execution, rather than the next cron run.
+                work.1=store.business_transaction(|db| {
+                    repository::persist_conversations(db,id,&rows,false)?;
+                    pending_threads(db,id)
+                }).map_err(|error|error.to_string())?;
+            }
             let mut batches = Vec::new();
             for remote in &work.1 {
                 match workflow {
@@ -134,7 +163,7 @@ impl crate::OfflineRunner {
                             .chat_exchange(plugin.mark_read(remote)?, &auth, true)
                             .await?;
                     }
-                    Workflow::Threads => {
+                    Workflow::Sync => {
                         let result = runner
                             .chat_fetch(
                                 plugin,
@@ -191,7 +220,7 @@ impl crate::OfflineRunner {
                 });
                 let persist=|db:&rusqlite::Connection| {
 
-     if let Some(pending)=&work.0{repository::finish_send(db,&pending.id,"submitted",remote.as_deref())?;if task.is_some(){queue::wake(db,id,"chat_threads")?;queue::wake(db,id,"inbox")?;}}
+     if let Some(pending)=&work.0{repository::finish_send(db,&pending.id,"submitted",remote.as_deref())?;if task.is_some(){queue::wake(db,id,"chat_threads")?;}}
      for batch in &batches{repository::persist_detail(db,id,batch)?;}
      if matches!(workflow,Workflow::Read){for remote in &work.1{let key=repository::key(db,id,remote)?;db.execute("UPDATE chat_conversations SET unread=0,data=json_set(data,'$.unread',json('false')) WHERE id=?1",[&key])?;db.execute("DELETE FROM chat_read_requests WHERE conversation_id=?1",[key])?;}if task.is_some(){queue::wake(db,id,"notifications")?;}}
      Ok(())
@@ -268,7 +297,7 @@ mod tests {
             .business_transaction(|db| repository::persist_detail(db, id, &batch))
             .unwrap();
         crate::tasks::initialize(paths, id).unwrap();
-        for key in [crate::tasks::KEEPALIVE_KEY, "profile"] {
+        for key in [crate::tasks::KEEPALIVE_KEY] {
             let task = store
                 .configured_tasks(id)
                 .unwrap()
@@ -297,6 +326,66 @@ mod tests {
             .unwrap();
         store.run_task_now(&task.id).unwrap()
     }
+    #[tokio::test]
+    async fn message_sync_fetches_inbox_and_new_details_in_one_task_or_direct_execution() {
+        for scheduled in [true,false] {
+            let (_dir,paths,mut store,ids)=fixture();
+            crate::tasks::initialize(&paths,&ids[0]).unwrap();
+            let task=ready(&mut store,&ids[0],"chat_threads");
+            if !scheduled {store.set_task_enabled(&task.id,false).unwrap();}
+            let tasks_before=store.tasks(&ids[0]).unwrap();
+            let mut summary=detail();summary.as_object_mut().unwrap().remove("messages");
+            let inbox=json!({"conversations":[summary],"pagination":{"has_next":false}});
+            let (mock,http)=server(vec![(200,inbox.to_string()),(200,detail().to_string())]).await;
+            let runner=crate::OfflineRunner::new(None).unwrap();
+            runner.chat_workflow_execute(&paths,&ids[0],scheduled.then_some(&task),Workflow::Sync,&mock,None).await.unwrap();
+            let requests=http.await.unwrap();
+            assert_eq!(requests.len(),2);
+            assert!(requests[0].contains("/messaging/main/inbox"));
+            assert!(requests[1].contains(REMOTE));
+            let conversations=super::super::conversations(&paths).unwrap();
+            assert_eq!(conversations.len(),1);
+            let messages=super::super::thread(&paths,&conversations[0].id).unwrap();
+            assert_eq!(messages.messages.len(),1);
+            assert_eq!(messages.messages[0].body,"你好世界");
+            assert_eq!(store.tasks(&ids[0]).unwrap().len(),tasks_before.len());
+            if scheduled {
+                let saved=store.task(&task.id).unwrap();
+                assert_eq!(saved.last_run_status.as_deref(),Some("completed"));
+                assert!(saved.next_run_at.is_some());
+                assert_eq!(saved.result.unwrap()["processed"],1);
+            } else {assert_eq!(store.tasks(&ids[0]).unwrap(),tasks_before);}
+        }
+    }
+    #[tokio::test]
+    async fn message_sync_inbox_failure_never_fetches_details_or_reports_success() {
+        let (_dir,paths,mut store,ids)=fixture();
+        crate::tasks::initialize(&paths,&ids[0]).unwrap();
+        let task=ready(&mut store,&ids[0],"chat_threads");
+        let (mock,http)=server(vec![(503,"{}".into())]).await;
+        assert!(crate::OfflineRunner::new(None).unwrap().chat_workflow_with(&paths,&ids[0],&task,Workflow::Sync,&mock).await.is_err());
+        assert_eq!(http.await.unwrap().len(),1);
+        assert!(super::super::conversations(&paths).unwrap().is_empty());
+        let saved=store.task(&task.id).unwrap();
+        assert_eq!(saved.last_run_status.as_deref(),Some("failed"));
+        assert!(saved.enabled);
+    }
+    #[tokio::test]
+    async fn message_sync_detail_failure_keeps_new_list_but_marks_the_same_task_failed() {
+        let (_dir,paths,mut store,ids)=fixture();
+        crate::tasks::initialize(&paths,&ids[0]).unwrap();
+        let task=ready(&mut store,&ids[0],"chat_threads");
+        let mut summary=detail();summary.as_object_mut().unwrap().remove("messages");
+        let inbox=json!({"conversations":[summary],"pagination":{"has_next":false}});
+        let (mock,http)=server(vec![(200,inbox.to_string()),(503,"{}".into())]).await;
+        assert!(crate::OfflineRunner::new(None).unwrap().chat_workflow_with(&paths,&ids[0],&task,Workflow::Sync,&mock).await.is_err());
+        assert_eq!(http.await.unwrap().len(),2);
+        let rows=super::super::conversations(&paths).unwrap();
+        assert_eq!(rows.len(),1);
+        assert!(super::super::thread(&paths,&rows[0].id).unwrap().messages.is_empty());
+        assert_eq!(store.task(&task.id).unwrap().last_run_status.as_deref(),Some("failed"));
+        assert_eq!(store.configured_tasks(&ids[0]).unwrap().iter().filter(|task|task.kind=="chat_threads").count(),1);
+    }
     #[test]
     fn queued_messages_are_durable_without_creating_tasks_and_reads_are_inert() {
         let (_dir, paths, mut store, ids) = fixture();
@@ -307,7 +396,7 @@ mod tests {
         let second = super::super::queue_message(&paths, &ids[0], &conversation, "第二条").unwrap();
         assert_ne!(first, second);
         assert_eq!(store.tasks(&ids[0]).unwrap().len(), count);
-        assert_eq!(count, 10);
+        assert_eq!(count, 8);
         assert_eq!(super::super::draft(&paths, &conversation).unwrap(), "");
         let read = super::super::thread(&paths, &conversation).unwrap();
         assert_eq!(read.pending.len(), 2);
@@ -482,7 +571,7 @@ mod tests {
                 .count(),
             1
         );
-        assert_eq!(store.configured_tasks(&ids[0]).unwrap().len(), 10);
+        assert_eq!(store.configured_tasks(&ids[0]).unwrap().len(), 8);
     }
     #[tokio::test]
     async fn interrupted_send_is_not_replayed_and_phone_ownership_allows_valid_token() {
@@ -628,7 +717,8 @@ mod tests {
                 .business_transaction(|db| repository::persist_detail(db, &ids[0], &batch))
                 .unwrap();
         }
-        // All details have committed snapshots despite having no messages.
+        // Inbox still refreshes, but unchanged cached details need no HTTP.
+        let (mock,http)=server(vec![(200,json!({"conversations":[],"pagination":{"has_next":false}}).to_string())]).await;
         let task = ready(&mut store, &ids[0], "chat_threads");
         crate::OfflineRunner::new(None)
             .unwrap()
@@ -636,11 +726,12 @@ mod tests {
                 &paths,
                 &ids[0],
                 &task,
-                Workflow::Threads,
-                &super::super::vinted::VintedChat,
+                Workflow::Sync,
+                &mock,
             )
             .await
             .unwrap();
+        assert_eq!(http.await.unwrap().len(),1);
         assert_eq!(
             store.task(&task.id).unwrap().result.unwrap()["processed"],
             0
@@ -824,7 +915,8 @@ mod tests {
         let (mock,http)=server(vec![(204,String::new())]).await;
         crate::OfflineRunner::new(None).unwrap().chat_workflow_execute(&paths,&ids[0],None,Workflow::Read,&mock,Some(&second)).await.unwrap();
         let requests=http.await.unwrap();assert!(requests[0].contains(other_remote));
-        let rows=super::super::conversations(&paths).unwrap();assert!(rows.iter().find(|c|c.id==first).unwrap().unread);assert!(!rows.iter().find(|c|c.id==second).unwrap().unread);
+        let rows=super::super::conversations(&paths).unwrap();assert!(!rows.iter().find(|c|c.id==first).unwrap().unread);assert!(!rows.iter().find(|c|c.id==second).unwrap().unread);
+        let queued:Vec<String>=store.business_transaction(|db|{let mut q=db.prepare("SELECT conversation_id FROM chat_read_requests")?;let rows=q.query_map([],|r|r.get(0))?.collect::<Result<Vec<_>,_>>()?;Ok(rows)}).unwrap();assert_eq!(queued,vec![first]);
         assert_eq!(store.tasks(&ids[0]).unwrap(),before);
     }
 

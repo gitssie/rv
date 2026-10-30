@@ -74,38 +74,6 @@ fn schema(db: &rusqlite::Connection) -> Result<(), rv_core::StoreError> {
       WHERE kind='set_avatar' AND status IN ('pending','running');")?;
     Ok(())
 }
-pub fn enqueue(paths: &StorePaths, id: &AppId, image: &PreparedAvatar) -> Result<AppTask, String> {
-    let mut store = WorkspaceStore::open(paths).map_err(|e| e.to_string())?;
-    let app = store.load(id).map_err(|e| e.to_string())?;
-    if app.bundle_id != "lt.manodrabuziai.fr" {
-        return Err("此 App 不支持设置头像".into());
-    }
-    let image_id = uuid::Uuid::new_v4().to_string();
-    store.business_transaction(|db| {
-        schema(db)?;
-        tasks::admit_access_token(db,id.as_str(),None)?;
-        let active:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM tasks WHERE app_id=?1 AND kind='set_avatar' AND status IN ('pending','running'))",[id.as_str()],|r|r.get(0))?;
-        if active {return Err(rv_core::StoreError::Invalid("已有头像任务，请在任务列表查看结果".into()));}
-        db.execute("INSERT INTO vinted_avatar_uploads VALUES(?1,?2,?3)",params![image_id,id.as_str(),image.jpeg])?;
-        Ok(())
-    }).map_err(|e|e.to_string())?;
-    let mut spec = TaskSpec::new(
-        "set_avatar",
-        task_cron_at(chrono::Utc::now().timestamp() + 1).map_err(|e| e.to_string())?,
-    );
-    spec.payload = json!({"image_id":image_id});
-    let result = tasks::enqueue(paths, id, &spec);
-    if result.is_err() {
-        let _ = store.business_transaction(|db| {
-            db.execute(
-                "DELETE FROM vinted_avatar_uploads WHERE image_id=?1",
-                [image_id],
-            )?;
-            Ok(())
-        });
-    }
-    result
-}
 
 async fn response(request:reqwest::RequestBuilder,runner:&OfflineRunner,auth:&AppAuth)->Result<Value,String> {
     let mut reply=runner.send_authenticated(request,auth,false).await?;
@@ -214,7 +182,6 @@ None
         let request = |method, url: &str| {
             device_headers(route.client.request(method, url), &auth)
                 .bearer_auth(&auth.access_token)
-                .header("Accept", "application/json")
                 .header("Cache-Control", "no-cache")
         };
         let result =

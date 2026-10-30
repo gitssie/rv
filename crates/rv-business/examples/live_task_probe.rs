@@ -2,9 +2,8 @@
 //! Never prints tokens or response bodies. No phone App launch or restoration.
 use rv_core::{
     StorePaths,
-    workspace::{AppId, TaskSpec, WorkspaceStore, task_cron_at},
+    workspace::{AppId, WorkspaceStore},
 };
-use std::time::{SystemTime, UNIX_EPOCH};
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     let id = AppId::from_idfv(args.first().ok_or("IDFV required")?)?;
@@ -15,12 +14,78 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let mut store = WorkspaceStore::open(&paths)?;
     store.load(&id)?;
+    if matches!(kind.as_str(), "refresh-once" | "phone-refresh-once") {
+        // Explicit live probes receive private context through stdin, never argv/logs.
+        let input: serde_json::Value = serde_json::from_reader(std::io::stdin())?;
+        let headers: std::collections::BTreeMap<String, String> = serde_json::from_value(
+            if kind == "phone-refresh-once" { input["headers"].clone() } else { input.clone() }
+        )?;
+        let mut auth = store.request_auth(&id)?.ok_or("missing saved credentials")?;
+        let previous = auth.clone();
+        if kind == "phone-refresh-once" {
+            if input["idfv"].as_str() != Some(id.as_str()) {
+                return Err("live phone identity mismatch".into());
+            }
+            auth.access_token = input["access_token"].as_str().filter(|s| !s.is_empty())
+                .ok_or("missing live access token")?.into();
+            auth.refresh_token = Some(input["refresh_token"].as_str().filter(|s| !s.is_empty())
+                .ok_or("missing live refresh token")?.into());
+            auth.expires_at = None;
+            auth.extra.remove("access_token_rejected");
+            for key in ["expires_in", "expires_at", "refresh_token_expires_at",
+                "refresh_token_expires_in", "credentials_received_at"] {
+                auth.extra.remove(key);
+            }
+        }
+        for (key, value) in headers {
+            if ["Locale", "Accept-Language", "X-Anon-Id", "X-V-Udt", "X-Device-UUID",
+                "User-Agent", "Short-Bundle-Version", "X-ICloud-Identifier", "X-Device-Model",
+                "X-App-Version"].contains(&key.as_str()) {
+                auth.headers.insert(key, value);
+            }
+        }
+        if kind == "refresh-once" {
+            assert_eq!(auth.access_token, previous.access_token);
+            assert_eq!(auth.refresh_token, previous.refresh_token);
+            assert_eq!(auth.headers.get("X-Session-Id"), previous.headers.get("X-Session-Id"));
+        }
+        store.save_auth(&id, &auth)?;
+        let existing = store.tasks(&id)?;
+        let result = rv_business::OfflineRunner::new(None)?
+            .run_blocking(&paths, &id, rv_business::Operation::Refresh);
+        assert_eq!(store.tasks(&id)?.len(),existing.len(),"direct refresh must not create Tasks");
+        for task in existing {
+            assert_eq!(store.task(&task.id)?.enabled, task.enabled,
+                "probe must not change existing task switches");
+        }
+        println!("direct refresh outcome: {}", result.err().unwrap_or_else(|| "success".into()));
+        return Ok(());
+    }
     if kind == "sync-products" {
         let tasks = store.tasks(&id)?;
         let result = tokio::runtime::Builder::new_current_thread().enable_all().build()?
             .block_on(rv_business::shop_sync::synchronize(paths.clone(), id.clone(), rv_business::Operation::Products))?;
         assert_eq!(tasks, store.tasks(&id)?, "manual sync must not modify Tasks");
         println!("manual product sync PASS; http_status={:?}; Tasks unchanged", result["http_status"].as_u64());
+        return Ok(());
+    }
+    if kind == "sync-product" {
+        let product_id = args.get(2).ok_or("product ID required")?.clone();
+        let tasks = store.tasks(&id)?;
+        let result = tokio::runtime::Builder::new_current_thread().enable_all().build()?
+            .block_on(rv_business::shop_sync::refresh_product(paths.clone(), id.clone(), product_id))?;
+        assert_eq!(tasks, store.tasks(&id)?, "manual product refresh must not modify Tasks");
+        println!("single product refresh PASS; http_status={:?}; Tasks unchanged", result["http_status"].as_u64());
+        return Ok(());
+    }
+    if kind == "stop-invalid-refresh" {
+        for task in store.tasks(&id)? {
+            if task.kind == "refresh" && task.error_code.as_deref() == Some("invalid_grant")
+                && task.result.as_ref().is_some_and(|value| value["http_status"] == 400) {
+                store.set_task_enabled(&task.id, false)?;
+                println!("Stopped refresh task {}; invalid_grant result retained", task.id);
+            }
+        }
         return Ok(());
     }
     if kind == "auth-info" {
@@ -44,35 +109,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if store.proxy_binding(&id)?.is_none() {
         return Err("bound proxy required".into());
     }
-    let time = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
-    let task = if let Some(task) = store
-        .configured_tasks(&id)?
-        .into_iter()
-        .find(|t| t.kind == *kind)
-    {
-        store.run_task_now(&task.id)?
-    } else {
-        rv_business::tasks::enqueue(&paths, &id, &TaskSpec::new(kind, task_cron_at(time)?))?
+    let before=store.tasks(&id)?;
+    let operation=match kind.as_str() {
+        "refresh"=>rv_business::Operation::Refresh,
+        "session"=>rv_business::Operation::Session,
+        "products"=>rv_business::Operation::Products,
+        "orders"=>rv_business::Operation::Orders,
+        "chat_inbox"=>rv_business::Operation::Inbox,
+        "notification_stats"=>rv_business::Operation::NotificationStats,
+        _=>unreachable!(),
     };
-    let result = rv_business::OfflineRunner::new(None)?.run_task_blocking(&paths, &task);
-    let saved = store.task(&task.id)?;
-    let http = saved
-        .result
-        .as_ref()
-        .and_then(|v| v["http_status"].as_u64());
-    println!(
-        "kind={} status={} last_result={} http_status={:?}",
-        kind,
-        saved.status,
-        saved.last_run_status.as_deref().unwrap_or("none"),
-        http
-    );
-    if args.iter().any(|arg| arg == "--stop-after") {
-        store.set_task_enabled(&task.id, false)?;
-        println!("Probe task stopped; credentials retained");
+    let result=rv_business::OfflineRunner::new(None)?.run_blocking(&paths,&id,operation);
+    assert_eq!(store.tasks(&id)?.len(),before.len(),"direct requests must not create Tasks");
+    for task in before {
+        assert_eq!(store.task(&task.id)?.enabled,task.enabled,"probe must not change existing task switches");
     }
-    if let Err(message) = result {
-        return Err(message.into());
-    }
-    Ok(())
+    println!("direct {kind}: {}",result.as_ref().err().map(String::as_str).unwrap_or("success"));
+    result.map_err(Into::into)
 }

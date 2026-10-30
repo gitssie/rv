@@ -57,6 +57,7 @@ impl AddressBookApp {
     pub(super) fn render_notification_list(&self, cx: &mut Context<Self>) -> AnyElement {
         v_flex()
             .id("chat-notifications")
+            .p_2()
             .debug_selector(|| "chat-notifications".into())
             .flex_1()
             .min_h_0()
@@ -79,6 +80,7 @@ impl AddressBookApp {
                     app.as_str(),
                     remote
                 )))
+                .rounded(theme::radius(cx))
                 .selected(
                     self.chat
                         .selected_notification()
@@ -99,7 +101,7 @@ impl AddressBookApp {
                                         .min_w_0()
                                         .text_sm()
                                         .text_ellipsis()
-                                        .child(n.title.clone()),
+                                        .child(SharedString::from((&n.title).to_string())),
                                 )
                                 .when(n.unread == Some(true), |row| {
                                     row.child(Badge::new().dot().count(1))
@@ -110,10 +112,10 @@ impl AddressBookApp {
                                 .text_xs()
                                 .text_color(theme::muted(cx))
                                 .text_ellipsis()
-                                .child(n.body.clone()),
+                                .child(SharedString::from((&n.body).to_string())),
                         )
                         .when_some(n.created_at, |el, time| {
-                            el.child(crate::typography::caption(plugins::stamp(time), cx))
+                            el.child(div().text_xs().text_color(theme::muted(cx)).child(SharedString::from((plugins::stamp(time)).to_string())))
                         }),
                 )
                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -145,7 +147,7 @@ impl AddressBookApp {
             .debug_selector(|| "notification-detail".into())
             .flex_1()
             .min_w_0()
-            .h_full()
+            .size_full()
             .min_h_0()
             .child(
                 crate::ui::tool_actions()
@@ -166,8 +168,8 @@ impl AddressBookApp {
                     .overflow_y_scroll()
                     .p_3()
                     .gap_3()
-                    .child(crate::typography::label(n.title.clone(), cx))
-                    .child(crate::typography::caption(metadata, cx))
+                    .child(div().text_sm().child(SharedString::from((&n.title).to_string())))
+                    .child(div().text_xs().text_color(theme::muted(cx)).child(SharedString::from((metadata).to_string())))
                     .when_some(n.image_path.clone(), |el, path| {
                         el.child(
                             img(path)
@@ -176,18 +178,18 @@ impl AddressBookApp {
                                 .object_fit(ObjectFit::Contain),
                         )
                     })
-                    .child(div().text_sm().child(n.body.clone()))
+                    .child(div().text_sm().child(SharedString::from((&n.body).to_string())))
                     .when(!n.note.is_empty(), |el| {
-                        el.child(div().text_sm().child(n.note.clone()))
+                        el.child(div().text_sm().child(SharedString::from((&n.note).to_string())))
                     })
                     .when_some(n.item_id.as_ref(), |el, id| {
-                        el.child(crate::typography::caption(format!("商品：{id}"), cx))
+                        el.child(div().text_xs().text_color(theme::muted(cx)).child(SharedString::from((format!("商品：{id}")).to_string())))
                     })
                     .when_some(n.order_id.as_ref(), |el, id| {
-                        el.child(crate::typography::caption(format!("订单：{id}"), cx))
+                        el.child(div().text_xs().text_color(theme::muted(cx)).child(SharedString::from((format!("订单：{id}")).to_string())))
                     })
                     .when_some(n.link.as_ref(), |el, link| {
-                        el.child(crate::typography::caption(link.clone(), cx))
+                        el.child(div().text_xs().text_color(theme::muted(cx)).child(SharedString::from((link).to_string())))
                     }),
             )
             .into_any_element()

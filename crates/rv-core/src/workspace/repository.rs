@@ -100,15 +100,10 @@ impl WorkspaceStore {
             AppFilter::Recent => "a.archived=0 AND a.last_used_at IS NOT NULL",
             AppFilter::Archived => "a.archived=1",
         };
-        let order = match query.sort {
-            AppSort::Updated => "a.updated_at DESC",
-            AppSort::Title => "a.title COLLATE NOCASE",
-            AppSort::LastUsed => "a.last_used_at DESC",
-        };
         let mut stmt = self.db.prepare(&format!("SELECT {COLUMNS} FROM app_instances a WHERE {search} AND {filter}
             AND (?2 IS NULL OR EXISTS(SELECT 1 FROM json_each(a.tags) WHERE value=?2))
             AND (?3 IS NULL OR EXISTS(SELECT 1 FROM app_devices d WHERE d.app_id=a.id AND d.device_id=?3))
-            ORDER BY a.pinned DESC,a.position,{order},a.id"))?;
+            ORDER BY a.created_at ASC,a.id ASC"))?;
         // ?1 must exist even when the text is empty so numbered bindings stay stable.
         let mut rows = stmt.query(params![
             pattern,

@@ -4,7 +4,6 @@ use super::*;
 enum Action {
     Avatar(String),
     Business(Operation),
-    Chat(chat::Action),
     ChatWorkflow(chat::workflow::Workflow),
 }
 fn action(kind: &str, payload: &Value) -> Result<Action, String> {
@@ -32,15 +31,12 @@ fn action(kind: &str, payload: &Value) -> Result<Action, String> {
         }
         return Ok(Action::Business(operation));
     }
-    if matches!(kind, "chat_send" | "chat_threads" | "chat_read") && fields.is_empty() {
+    if matches!(kind, "chat_send" | "chat_threads" | "chat_read" | "chat_inbox" | "inbox") && fields.is_empty() {
         return Ok(Action::ChatWorkflow(match kind {
             "chat_send" => chat::workflow::Workflow::Send,
             "chat_read" => chat::workflow::Workflow::Read,
-            _ => chat::workflow::Workflow::Threads,
+            _ => chat::workflow::Workflow::Sync,
         }));
-    }
-    if matches!(kind, "inbox" | "chat_inbox") && fields.is_empty() {
-        return Ok(Action::Chat(chat::Action::Inbox));
     }
     Err("聊天任务为固定处理器，不接受单条消息或会话参数".into())
 }
@@ -76,12 +72,14 @@ pub(crate) fn admit_access_token(db: &rusqlite::Connection, app_id: &str, task_i
 }
 
 pub fn enqueue(paths: &StorePaths, id: &AppId, spec: &TaskSpec) -> Result<AppTask, String> {
+    if spec.kind=="set_avatar" {
+        return Err("设置头像请使用直接请求，不创建调度任务".into());
+    }
     let command = action(&spec.kind, &spec.payload)?;
     if spec.max_attempts > 1
         && matches!(
             command,
             Action::Avatar(_)
-                | Action::Chat(chat::Action::Send { .. } | chat::Action::MarkRead(_))
                 | Action::ChatWorkflow(
                     chat::workflow::Workflow::Send | chat::workflow::Workflow::Read
                 )
@@ -95,7 +93,7 @@ pub fn enqueue(paths: &StorePaths, id: &AppId, spec: &TaskSpec) -> Result<AppTas
         return Err("此 App 尚未接入业务任务".into());
     }
     let fixed = match spec.kind.as_str() {
-        "inbox" | "chat_inbox" => Some("inbox"),
+        "inbox" | "chat_inbox" => Some("chat_threads"),
         "chat_threads" => Some("chat_threads"),
         "chat_send" => Some("chat_send"),
         "chat_read" => Some("chat_read"),
@@ -199,7 +197,6 @@ impl OfflineRunner {
         let result = async {
             match action(&task.kind, &task.payload)? {
                 Action::Avatar(image) => self.avatar_task(paths, &id, task, &image).await,
-                Action::Chat(action) => self.chat_queued(paths, &id, action, task).await,
                 Action::ChatWorkflow(workflow) => {
                     self.chat_workflow(paths, &id, task, workflow).await
                 }
@@ -232,17 +229,45 @@ impl OfflineRunner {
     }
 }
 
+/// Collapse the former inbox/details schedules without interrupting an in-flight
+/// claim. Prefer the details schedule/ID; either enabled input enables the merge.
+fn merge_message_sync_tasks(store:&mut WorkspaceStore,id:&AppId,timestamp:i64)->Result<bool,String> {
+    store.business_transaction(|db| {
+        let mut stmt=db.prepare("SELECT id,enabled,status,cron_expression,task_key FROM tasks WHERE app_id=?1 AND (task_key IN ('inbox','chat_threads') OR kind IN ('inbox','chat_inbox')) ORDER BY (task_key='chat_threads') DESC,(task_key='inbox') DESC,created_at,id")?;
+        let rows=stmt.query_map([id.as_str()],|row|Ok((row.get::<_,String>(0)?,row.get::<_,bool>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?,row.get::<_,Option<String>>(4)?)))?.collect::<Result<Vec<_>,_>>()?;
+        let legacy=rows.iter().any(|row|row.4.as_deref()!=Some("chat_threads"));
+        if !legacy {return Ok(true);}
+        if rows.iter().any(|row|row.2=="running") {return Ok(false);}
+        let primary=&rows[0];
+        let enabled=rows.iter().any(|row|row.1);
+        let next=if enabled && !primary.1 {
+            rv_core::workspace::next_task_time(&primary.3,timestamp)?
+        } else {None};
+        db.execute("UPDATE tasks SET kind='chat_threads',task_key='chat_threads',enabled=?2,status=CASE WHEN ?2=1 AND enabled=0 THEN 'pending' ELSE status END,next_run_at=CASE WHEN ?2=1 AND enabled=0 THEN ?3 ELSE next_run_at END,updated_at=?4 WHERE id=?1",rusqlite::params![primary.0,enabled,next,timestamp])?;
+        for old in rows.iter().skip(1) {
+            db.execute("UPDATE tasks SET depends_on=CASE WHEN id=?2 THEN NULL ELSE ?2 END WHERE depends_on=?1",rusqlite::params![old.0,primary.0])?;
+            db.execute("DELETE FROM tasks WHERE id=?1",[&old.0])?;
+        }
+        Ok(true)
+    }).map_err(|error|error.to_string())
+}
+
 /// Provision a durable workflow once. All scheduling/state lives in tasks.
 /// Cancelling a task is respected; provisioning never re-enables it.
 pub fn initialize(paths: &StorePaths, id: &AppId) -> Result<(), String> {
     let timestamp = timestamp();
     let mut store = WorkspaceStore::open(paths).map_err(|e| e.to_string())?;
     let app = store.load(id).map_err(|e| e.to_string())?;
-    if app.archived
-        || app.bundle_id != "lt.manodrabuziai.fr"
-    {
-        return Ok(());
-    }
+    if app.bundle_id != "lt.manodrabuziai.fr" {return Ok(());}
+    // Profile data is refreshed explicitly through shop_sync, never scheduled.
+    // Remove legacy rows and release their dependants in the same transaction.
+    store.business_transaction(|db| {
+        db.execute("UPDATE tasks SET depends_on=NULL WHERE depends_on IN (SELECT id FROM tasks WHERE app_id=?1 AND (kind='session' OR task_key='profile'))",[id.as_str()])?;
+        db.execute("DELETE FROM tasks WHERE app_id=?1 AND (kind='session' OR task_key='profile')",[id.as_str()])?;
+        Ok(())
+    }).map_err(|e|e.to_string())?;
+    if !merge_message_sync_tasks(&mut store,id,timestamp)? {return Ok(());}
+    if app.archived {return Ok(());}
     // Import has already validated/extracted state. Never create an API workflow
     // for a catalogue-only entry without credentials.
     if store.auth(id).map_err(|e| e.to_string())?.is_none() {
@@ -256,25 +281,12 @@ pub fn initialize(paths: &StorePaths, id: &AppId) -> Result<(), String> {
             .map_err(|e| e.to_string())?.ok_or("会话保持计划没有下次执行时间")?;
         let mut keepalive_spec = TaskSpec::new("refresh", keepalive_cron);
         keepalive_spec.max_attempts = 3;
-        let keepalive = store
+        store
             .ensure_task(id, KEEPALIVE_KEY, &keepalive_spec, None, first)
             .map_err(|e| e.to_string())?;
-        let mut spec = TaskSpec::new(
-            "session",
-            rv_core::workspace::task_cron_at(timestamp + 10).map_err(|e| e.to_string())?,
-        );
-        spec.max_attempts = 3;
-        let profile = store
-            .ensure_task(id, "profile", &spec, None, timestamp + 10)
-            .map_err(|e| e.to_string())?;
-        store.business_transaction(|db| {
-            db.execute("UPDATE tasks SET depends_on=NULL WHERE id=?1 AND depends_on=?2",rusqlite::params![profile.id,keepalive.id])?;
-            Ok(())
-        }).map_err(|e|e.to_string())?;
         for (key, kind, cron) in [
             ("products", "products", "0 */15 * * * *"),
             ("orders", "orders", "0 */15 * * * *"),
-            ("inbox", "chat_inbox", "0 */5 * * * *"),
             ("chat_threads", "chat_threads", "0 */5 * * * *"),
             ("chat_send", "chat_send", "*/2 * * * * *"),
             ("chat_read", "chat_read", "*/5 * * * * *"),
@@ -288,7 +300,7 @@ pub fn initialize(paths: &StorePaths, id: &AppId) -> Result<(), String> {
                 3
             };
             let task = store
-                .ensure_task(id, key, &spec, Some(&profile.id), timestamp + 10)
+                .ensure_task(id, key, &spec, None, timestamp + 10)
                 .map_err(|e| e.to_string())?;
             let _ = task;
         }

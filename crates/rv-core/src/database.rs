@@ -27,7 +27,7 @@ fn open_inner(path: &Path) -> Result<Connection, StoreError> {
     db.busy_timeout(Duration::from_secs(5))?;
     db.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")?;
     let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    if version > 14 {
+    if version > 15 {
         return Err(StoreError::Invalid("数据库版本高于当前程序支持版本".into()));
     }
     if version == 0 {
@@ -71,6 +71,9 @@ fn open_inner(path: &Path) -> Result<Connection, StoreError> {
     }
     if version < 14 {
         db.execute_batch("BEGIN IMMEDIATE; CREATE TABLE IF NOT EXISTS app_token_sources(app_id TEXT PRIMARY KEY REFERENCES app_instances(id) ON DELETE CASCADE,device_id TEXT REFERENCES devices(id) ON DELETE SET NULL); PRAGMA user_version=14; COMMIT;")?;
+    }
+    if version < 15 {
+        db.execute_batch(include_str!("workspace/login_credentials.sql"))?;
     }
     Ok(db)
 }

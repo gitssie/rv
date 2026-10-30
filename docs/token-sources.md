@@ -1,9 +1,11 @@
 # Token sources
 
-The shop operation panel offers **Token: RV / phone**, with a phone-device choice.
+Token source is internal metadata, derived from the associated phone backup and
+explicit phone/RV handover. The shop panel does not display a source label or
+provide a device/source selector.
 First import of phone state assigns that phone as the token source and uses the
 imported access token directly. Later backup imports preserve the chosen source.
-Selecting a phone changes refresh responsibility; an existing non-rejected,
+Handover changes refresh responsibility; an existing non-rejected,
 unexpired token remains usable. A refresh icon next to the source can explicitly
 read live credentials even while the cached token is valid. There is no additional shared/phone
 business mode: any operation may use its current non-rejected access token.
@@ -43,10 +45,8 @@ source to a saved device. If that device is deleted, the source remains phone wi
 no available device rather than silently granting refresh responsibility to RV.
 Existing state handoff/archive workflows remain separate from HTTP admission.
 
-Selecting RV from a phone source performs explicit backup handover, rather than
-changing the source flag directly. Both UI entries reread that environments own
-latest phone state (also when inactive), adopt its full token pair and metadata,
-and commit RV source together with credentials. Failure preserves the old source
-and credentials. Catalogue refresh never performs this handover or replaces an
-existing accounts credentials. Enabled token waiters may resume; stopped tasks
-remain stopped and no immediate refresh is forced.
+Explicit phone-to-RV backup handover rereads that environments own latest phone
+state (also when inactive), adopts its full token pair and metadata, and commits
+RV source together with credentials. Failure preserves the old source and
+credentials. Catalogue refresh never performs this handover. Enabled token
+waiters may resume; stopped tasks remain stopped.

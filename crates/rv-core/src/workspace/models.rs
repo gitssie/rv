@@ -67,20 +67,12 @@ pub enum AppFilter {
     Recent,
     Archived,
 }
-#[derive(Debug, Clone, Copy, Default)]
-pub enum AppSort {
-    #[default]
-    Updated,
-    Title,
-    LastUsed,
-}
 #[derive(Default)]
 pub struct AppQuery<'a> {
     pub text: &'a str,
     pub tag: Option<&'a str>,
     pub device_id: Option<ConnectionId>,
     pub filter: AppFilter,
-    pub sort: AppSort,
 }
 #[derive(Debug, Default)]
 pub struct SyncResult {

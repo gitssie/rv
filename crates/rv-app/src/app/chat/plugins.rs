@@ -1,16 +1,17 @@
 //! Bundle rendering hooks compose upstream Message/Bubble surfaces and local resources only.
 use crate::{assets::FunctionIcon, theme};
 use gpui::{prelude::FluentBuilder as _, *};
-use gpui_component::{Icon, IconName, avatar::Avatar, h_flex, tooltip::Tooltip, v_flex};
+use gpui_component::{Icon, IconName, avatar::Avatar, h_flex};
 use rv_business::chat::{ChatImage, ContextItem, Conversation, Message};
 use rv_gpui_chat::{
     bubble::{Bubble, BubbleVariant},
     message::{Message as MessageView, MessageAlignment, MessageContent, MessageFooter},
 };
 use std::collections::HashMap;
+pub(super) use rv_gpui_chat::selectable_text::selectable_text;
 pub(super) trait Renderer {
-    fn message(&self, m: &Message, conversation: &Conversation, cx: &App) -> AnyElement {
-        message(m, conversation, cx)
+    fn message(&self, m: &Message, conversation: &Conversation, avatar:Avatar, cx: &App) -> AnyElement {
+        message(m, conversation, avatar, cx)
     }
     fn context(&self, item: &ContextItem, cx: &App) -> AnyElement {
         context(item, cx)
@@ -73,23 +74,16 @@ pub(super) fn avatar(c: &Conversation) -> Avatar {
     }
 }
 fn context(item: &ContextItem, cx: &App) -> AnyElement {
-    h_flex()
-        .gap_2()
-        .items_center()
-        .child(thumbnail(item.image.as_ref(), 42., ObjectFit::Cover, cx))
-        .child(
-            v_flex()
-                .gap_1()
-                .min_w_0()
-                .flex_1()
-                .child(div().text_sm().text_ellipsis().child(item.title.clone()))
-                .children(item.price.iter().map(|p| {
-                    div()
-                        .text_xs()
-                        .text_color(theme::muted(cx))
-                        .child(p.clone())
-                })),
-        )
+    let text=match &item.price {
+        Some(price)=>format!("{} · {}",item.title,price),
+        None=>item.title.clone(),
+    };
+    h_flex().id(SharedString::from(format!("chat-context-{}",item.remote_id)))
+        .gap_1().items_center().min_w_0()
+
+        .child(Icon::new(FunctionIcon::Products).text_color(theme::muted(cx)))
+        .child(div().text_xs().text_color(theme::muted(cx)).min_w_0().flex_1()
+            .child(SharedString::from((text).to_string())))
         .into_any_element()
 }
 pub(super) fn stamp(ts: i64) -> String {
@@ -101,18 +95,7 @@ pub(super) fn stamp(ts: i64) -> String {
         })
         .unwrap_or_default()
 }
-pub(super) fn status(status: &str) -> &str {
-    match status {
-        "pending" => "等待发送",
-        "sending" => "发送中",
-        "submitted" => "已提交，等待消息确认",
-        "failed" => "发送失败",
-        "unknown" => "结果未知，请核对",
-        "cancelled" => "已取消",
-        _ => "已发送",
-    }
-}
-fn message(m: &Message, conversation: &Conversation, cx: &App) -> AnyElement {
+fn message(m: &Message, _conversation: &Conversation, avatar:Avatar, cx: &App) -> AnyElement {
     let main = m
         .translation
         .as_ref()
@@ -125,7 +108,7 @@ fn message(m: &Message, conversation: &Conversation, cx: &App) -> AnyElement {
         } else {
             BubbleVariant::Secondary
         })
-        .child(div().whitespace_normal().child(main));
+        .child(selectable_text(SharedString::from(format!("chat-message-body-{}",m.id)),main));
     if let Some(translation) = &m.translation {
         content = content.child(
             h_flex()
@@ -138,7 +121,7 @@ fn message(m: &Message, conversation: &Conversation, cx: &App) -> AnyElement {
                     div()
                         .text_xs()
                         .whitespace_normal()
-                        .child(translation.translated.clone()),
+                        .child(selectable_text(SharedString::from(format!("chat-message-translation-{}",m.id)), &translation.translated)),
                 ),
         );
     }
@@ -146,7 +129,7 @@ fn message(m: &Message, conversation: &Conversation, cx: &App) -> AnyElement {
         content = content.child(thumbnail(Some(image), 150., ObjectFit::Contain, cx));
     }
     let footer = MessageFooter::new()
-        .child(crate::typography::caption(stamp(m.created_at), cx))
+        .child(div().text_xs().text_color(theme::muted(cx)).child(SharedString::from((stamp(m.created_at)).to_string())))
         .when(m.outgoing, |footer| {
             let icon: Icon = match m.status.as_str() {
                 "pending" | "submitted" => Icon::new(FunctionIcon::Recent),
@@ -155,11 +138,10 @@ fn message(m: &Message, conversation: &Conversation, cx: &App) -> AnyElement {
                 "cancelled" => Icon::new(IconName::Close),
                 _ => Icon::new(IconName::Check),
             };
-            let label = status(&m.status).to_string();
             footer.child(
                 div()
                     .id(SharedString::from(format!("message-status-{}", m.id)))
-                    .tooltip(move |window, cx| Tooltip::new(label.clone()).build(window, cx))
+
                     .child(icon)
                     .when(matches!(m.status.as_str(), "failed" | "unknown"), |el| {
                         el.text_color(theme::danger(cx))
@@ -173,7 +155,7 @@ fn message(m: &Message, conversation: &Conversation, cx: &App) -> AnyElement {
         } else {
             MessageAlignment::Start
         })
-        .when(!m.outgoing, |row| row.avatar(avatar(conversation)))
+        .when(!m.outgoing, |row| row.avatar(avatar))
         .content(MessageContent::new().bubble(content))
         .footer(footer)
         .into_any_element()

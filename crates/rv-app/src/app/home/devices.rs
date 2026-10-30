@@ -63,7 +63,8 @@ impl AddressBookApp {
                         Button::new("devices-all")
                             .ghost()
                             .icon(IconName::LayoutDashboard)
-                            .label("全部")
+                            .accessibility_label("全部")
+                            .child(div().text_xs().child("全部"))
                             .selected(!self.home.online_only)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.home.online_only = false;
@@ -74,7 +75,8 @@ impl AddressBookApp {
                         Button::new("devices-online")
                             .ghost()
                             .icon(IconName::CircleCheck)
-                            .label("已连接")
+                            .accessibility_label("已连接")
+                            .child(div().text_xs().child("已连接"))
                             .selected(self.home.online_only)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.home.online_only = true;

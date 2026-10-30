@@ -64,53 +64,70 @@ fn button(text: &str) -> Option<ButtonPoint> {
             })
         })
         .collect();
-    let combined = boxes
-        .iter()
-        .map(|b| b.text)
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_lowercase();
-    if !(combined.contains("delete") && combined.contains("photo"))
-        && !(combined.contains("删除") && (combined.contains("照片") || combined.contains("相片")))
-    {
-        return None;
+    // Button labels are localized. Match the Photos requester above a single
+    // side-by-side button row, then use the right button's relative position.
+    let mut candidates = Vec::new();
+    for left in &boxes {
+        for right in &boxes {
+            let (lx, ly) = (left.x + left.w / 2., left.y + left.h / 2.);
+            let (rx, ry) = (right.x + right.w / 2., right.y + right.h / 2.);
+            if left.x + left.w >= right.x || (ly - ry).abs() > left.h.max(right.h) / 2. {
+                continue;
+            }
+            let header: Vec<_> = boxes
+                .iter()
+                .filter(|b| b.y + b.h + 2. * left.h.max(right.h) < left.y.min(right.y))
+                .collect();
+            let text = header
+                .iter()
+                .map(|b| b.text)
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_lowercase();
+            let requester: String = text
+                .chars()
+                .filter(|c| !c.is_whitespace() && !matches!(c, '-' | '\u{ad}'))
+                .collect();
+            if requester.matches("trollvncserver").count() != 1
+                || !["photo", "foto", "照片", "相片", "写真", "사진", "фото"]
+                    .iter()
+                    .any(|word| text.contains(word))
+                || ![
+                    "delete", "supprim", "lösch", "elimin", "apag", "exclu", "删除", "刪除",
+                    "削除", "삭제", "удал",
+                ]
+                .iter()
+                .any(|word| text.contains(word))
+            {
+                continue;
+            }
+            let min_x = header.iter().map(|b| b.x).fold(f64::INFINITY, f64::min);
+            let max_x = header
+                .iter()
+                .map(|b| b.x + b.w)
+                .fold(f64::NEG_INFINITY, f64::max);
+            let center = (min_x + max_x) / 2.;
+            if lx < center && center < rx {
+                candidates.push(ButtonPoint { x: rx, y: ry });
+            }
+        }
     }
-    let owners: Vec<_> = boxes
-        .iter()
-        .filter(|b| b.text.to_lowercase().contains("trollvncserver"))
-        .collect();
-    let deletes: Vec<_> = boxes
-        .iter()
-        .filter(|b| b.text.eq_ignore_ascii_case("delete") || b.text == "删除")
-        .collect();
-    let denies: Vec<_> = boxes
-        .iter()
-        .filter(|b| {
-            matches!(
-                b.text.to_lowercase().replace('’', "'").as_str(),
-                "don't allow" | "不允许" | "不允許"
-            )
-        })
-        .collect();
-    if owners.len() != 1 || deletes.len() != 1 || denies.len() != 1 {
-        return None;
+    // Ambiguous geometry is left for manual confirmation, never guessed.
+    if candidates.len() == 1 {
+        candidates.pop()
+    } else {
+        None
     }
-    let (owner, delete, deny) = (owners[0], deletes[0], denies[0]);
-    let (dx, dy) = (delete.x + delete.w / 2., delete.y + delete.h / 2.);
-    let (nx, ny) = (deny.x + deny.w / 2., deny.y + deny.h / 2.);
-    if dx <= nx || (dy - ny).abs() > delete.h.max(deny.h) || owner.y + owner.h >= dy {
-        return None;
-    }
-    Some(ButtonPoint { x: dx, y: dy })
 }
 
 async fn recognize(
     client: &PhoneHttpClient,
+    languages: &str,
 ) -> Result<Option<(ButtonPoint, serde_json::Value)>, String> {
     let (status, response) = client
         .json(
             "/api/device/ocr",
-            &json!({"fields":["1","0,,0,,0,,0","","0.008","0","en-US,,zh-Hans","1",""]}),
+            &json!({"fields":["1","0,,0,,0,,0","","0.008","0",languages,"1",""]}),
         )
         .await?;
     if status != 200 {
@@ -130,6 +147,26 @@ async fn recognize(
     }
     Ok(Some((point, frame.clone())))
 }
+async fn recognition_languages(client: &PhoneHttpClient) -> Result<String, String> {
+    let (status, response) = client
+        .json("/api/device/ocr", &json!({"fields":["2","0"]}))
+        .await?;
+    if status != 200 {
+        return Err(format!("Photos OCR languages rejected: HTTP {status}"));
+    }
+    let supported = response["value"]
+        .as_str()
+        .ok_or("Invalid OCR language list")?;
+    let languages: Vec<_> = supported
+        .split(";;")
+        .filter(|language| !language.is_empty())
+        .collect();
+    if languages.is_empty() {
+        return Err("No supported Photos OCR languages".into());
+    }
+    Ok(languages.join(",,"))
+}
+
 async fn observe(
     client: PhoneHttpClient,
     task: &str,
@@ -139,8 +176,9 @@ async fn observe(
     if status != 200 || caps["device_tap"] != 1 {
         return Err("Phone does not support HTTP/2 Photos confirmation; confirm on the phone or update TrollVNC".into());
     }
+    let languages = recognition_languages(&client).await?;
     for _ in 0..40 {
-        if let Some((point, frame)) = recognize(&client).await? {
+        if let Some((point, frame)) = recognize(&client, &languages).await? {
             // RV owns the delete task and cancels this observer on its terminal
             // result. The phone receives only an independent generic tap. Never replay it.
             progress.send_replace("Confirming deletion on iPhone…");
@@ -161,7 +199,7 @@ async fn observe(
                 "Photos confirmation tap sent through ZXTouch HTTP/2"
             );
             tokio::time::sleep(Duration::from_millis(600)).await;
-            if recognize(&client).await?.is_some() {
+            if recognize(&client, &languages).await?.is_some() {
                 return Err("Photos prompt remains after HTTP/2 tap; no second tap sent".into());
             }
             progress.send_replace("Waiting for Photos deletion result…");
@@ -216,7 +254,6 @@ mod tests {
         for invalid in [
             PROMPT.replace("trollvncserver", "another-app"),
             PROMPT.replace("photo", "file"),
-            PROMPT.replace("Don't Allow", "Cancel"),
             PROMPT.replace("350,,500", "350,,250"),
             format!("{PROMPT};;Delete,,350,,500,,100,,30"),
             PROMPT.replace("100,,100,,400", "NaN,,100,,400"),
@@ -228,6 +265,93 @@ mod tests {
                 "允许trollvncserver删除此照片？,,100,,100,,400,,40;;不允许,,100,,500,,130,,30;;删除,,350,,500,,100,,30"
             ),
             Some(ButtonPoint { x: 400., y: 515. })
+        );
+    }
+
+    const FRENCH_PROMPT: &str = "Autoriser « trollvncser-,,30,,10,,190,,20;;ver.b0abb8ec.unsigned » à,,20,,30,,210,,20;;supprimer cette photo ?,,20,,50,,210,,20;;Refuser,,25,,350,,70,,20;;Supprimer,,145,,350,,90,,20";
+    #[test]
+    fn recognizes_localized_photos_deletion_with_split_requester() {
+        assert_eq!(
+            button(FRENCH_PROMPT),
+            Some(ButtonPoint { x: 190., y: 360. })
+        );
+        for (prompt, deny, delete) in [
+            (
+                "Allow trollvncserver to delete this photo?",
+                "Don’t Allow",
+                "Delete",
+            ),
+            ("允許 trollvncserver 刪除此照片？", "不允許", "刪除"),
+            (
+                "trollvncserver dieses Foto löschen?",
+                "Nicht erlauben",
+                "Löschen",
+            ),
+            (
+                "¿Permitir a trollvncserver eliminar esta foto?",
+                "No permitir",
+                "Eliminar",
+            ),
+            (
+                "Consentire a trollvncserver di eliminare questa foto?",
+                "Non consentire",
+                "Elimina",
+            ),
+            (
+                "Permitir que trollvncserver apague esta foto?",
+                "Não Permitir",
+                "Apagar",
+            ),
+        ] {
+            let text = format!(
+                "{prompt},,10,,10,,220,,50;;{deny},,10,,350,,90,,20;;{delete},,145,,350,,90,,20"
+            );
+            assert_eq!(
+                button(&text),
+                Some(ButtonPoint { x: 190., y: 360. }),
+                "{text}"
+            );
+        }
+        for text in [
+            FRENCH_PROMPT.replace("photo", "fichier"),
+            FRENCH_PROMPT.replace("trollvncser-", "other-"),
+            FRENCH_PROMPT.replace("145,,350", "145,,5"),
+            format!("{FRENCH_PROMPT};;Supprimer,,145,,350,,90,,20"),
+        ] {
+            assert_eq!(button(&text), None, "{text}");
+        }
+    }
+
+    #[test]
+    fn screenshot_geometry_is_relative_and_does_not_depend_on_button_labels() {
+        // Vision revision 2 output from the user's French screenshot.
+        let text = "Autoriser « trollvncser-,,33,,5,,157,,11;;ver.bOabb8ec.unsigned » à,,17,,23,,185,,13;;supprimer cette photo ?,,29,,41,,163,,15;;Refuser,,29,,260,,51,,14;;Supprimer,,131,,260,,73,,15";
+        assert_eq!(button(text), Some(ButtonPoint { x: 167.5, y: 267.5 }));
+        assert_eq!(
+            button(&text.replace("Refuser", "Non").replace("Supprimer", "Oui")),
+            button(text)
+        );
+        // Same dialog at twice the scale and a different screen offset.
+        let shifted = text
+            .split(";;")
+            .map(|line| {
+                let p: Vec<_> = line.split(",,").collect();
+                let v: Vec<f64> = p[1..].iter().map(|n| n.parse().unwrap()).collect();
+                format!(
+                    "{},,{},,{},,{},,{}",
+                    p[0],
+                    v[0] * 2. + 80.,
+                    v[1] * 2. + 120.,
+                    v[2] * 2.,
+                    v[3] * 2.
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(";;");
+        assert_eq!(button(&shifted), Some(ButtonPoint { x: 415., y: 655. }));
+        assert_eq!(
+            button(&text.replace("supprimer cette photo ?", "accéder à cette photo ?")),
+            None
         );
     }
 
@@ -255,9 +379,13 @@ mod tests {
                             calls.lock().unwrap().push((path.clone(), body.clone()));
                             let reply = match path.as_str() {
                                 "/api/control/authorize" => json!({"device_tap":1}),
-                                "/api/device/ocr" => json!({"value":PROMPT,"frame":{"width":1000,"height":1000,"orientation":0}}),
+                                "/api/device/ocr" if body["fields"][0] == "2" => json!({"value":"en-US;;fr-FR;;zh-Hans"}),
+                                "/api/device/ocr" => {
+                                    assert_eq!(body["fields"][5], "en-US,,fr-FR,,zh-Hans");
+                                    json!({"value":FRENCH_PROMPT,"frame":{"width":1000,"height":1000,"orientation":0}})
+                                },
                                 "/api/device/tap" => {
-                                    assert_eq!(body, json!({"x":400.,"y":515.,"frame":{"width":1000,"height":1000,"orientation":0}}));
+                                    assert_eq!(body, json!({"x":190.,"y":360.,"frame":{"width":1000,"height":1000,"orientation":0}}));
                                     json!({"ok":true})
                                 }
                                 _ => panic!("unexpected request: {path}"),
@@ -287,6 +415,7 @@ mod tests {
             paths,
             [
                 "/api/control/authorize",
+                "/api/device/ocr",
                 "/api/device/ocr",
                 "/api/device/tap",
                 "/api/device/ocr"

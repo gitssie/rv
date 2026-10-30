@@ -1,7 +1,11 @@
+mod product;
 use super::*;
 mod storage;
 pub struct Vinted;
 impl BusinessStrategy for Vinted {
+    fn product_refresh(&self, id: &str) -> Result<Box<dyn BusinessStrategy>, String> {
+        Ok(Box::new(product::ProductDetails::new(id)?))
+    }
     fn requires_proxy(&self) -> bool {
         true
     }

@@ -1668,6 +1668,9 @@ impl Render for SessionView {
             && self.focus.is_focused(window);
 
         v_flex()
+            .id("remote-session")
+            .role(Role::Group)
+            .aria_label("远程设备控制")
             .size_full()
             .bg(theme::desktop())
             .key_context("Session")

@@ -20,6 +20,8 @@ impl Render for AddressBookApp {
 
         v_flex()
             .id("address-book")
+            .role(Role::Group)
+            .aria_label("RV 主窗口")
             .relative()
             .size_full()
             .bg(theme::surface(cx))

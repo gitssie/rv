@@ -103,7 +103,8 @@ pub fn apply(pref: ThemePref, window: &mut Window, cx: &mut App) {
 fn configure(theme: &mut Theme) {
     theme.font_size = px(UI_REM_PX);
     theme.mono_font_size = px(12.);
-    // RV's only control color override. Keep legacy and resolved tokens aligned.
+    // Keep native controls and resolved tokens on the same RV palette.
+    theme.list.active_highlight = false;
     let palette = &mut theme.colors;
     palette.primary = rgb(0x3389f5).into();
     palette.primary_foreground = rgb(0xffffff).into();
@@ -114,7 +115,11 @@ fn configure(theme: &mut Theme) {
     palette.button_primary_foreground = palette.primary_foreground;
     palette.button_primary_hover = palette.primary_hover;
     palette.button_primary_active = palette.primary_active;
+    palette.list_active = palette.accent;
+    palette.list_active_border = palette.border;
     let tokens = &mut theme.tokens;
+    tokens.list_active.background = palette.list_active.into();
+    tokens.list_active_border = palette.list_active_border.into();
     tokens.primary = palette.primary.into();
     tokens.primary_foreground = palette.primary_foreground.into();
     tokens.primary_hover = palette.primary_hover.into();
@@ -147,6 +152,10 @@ mod tests {
             let radius = theme.radius;
             let family = theme.font_family.clone();
             configure(&mut theme);
+            assert!(!theme.list.active_highlight);
+            assert_eq!(theme.list_active, theme.accent);
+            assert_eq!(theme.tokens.list_active.background, gpui::Background::from(theme.list_active));
+            assert_eq!(Hsla::from(theme.tokens.list_active_border), theme.list_active_border);
             assert_eq!(theme.font_size, px(UI_REM_PX));
             assert_eq!(theme.mono_font_size, px(12.));
             assert_eq!(theme.background, background);

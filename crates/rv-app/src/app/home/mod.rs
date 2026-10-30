@@ -31,6 +31,7 @@ pub(super) struct CardContext {
     pub expiry: TokenExpirations,
     pub proxy_name: Option<String>,
     pub execution: AppExecution,
+    pub keepalive_enabled: bool,
 }
 pub(super) struct HomeState {
     pub apps: Vec<AppInstance>,
@@ -43,7 +44,6 @@ pub(super) struct HomeState {
     pub device_search: Entity<InputState>,
     pub online_only: bool,
     pub filter: AppFilter,
-    pub sort: AppSort,
     pub tag: Option<String>,
     pub loading: bool,
     pub error: Option<String>,
@@ -60,6 +60,7 @@ pub(super) struct HomeState {
     pub change_subscription: Option<gpui::Task<()>>,
     pub jobs: std::collections::HashSet<AppId>,
     pub token_updates: Option<Task<()>>,
+    pub product_syncs: std::collections::HashSet<(AppId, String)>,
     pub manual_syncs: std::collections::HashSet<(AppId,rv_business::Operation)>,
     pub backup_syncing: HashMap<AppId, (ConnectionId, EntityId)>,
     pub handoff_running: HashMap<AppId, EntityId>,
@@ -68,12 +69,14 @@ pub(super) struct HomeState {
     pub business: business_ui::BusinessView,
     pub task_config: task_config::TaskConfigView,
     pub component_dialog: Option<u8>,
+    pub login_username: Entity<InputState>,
+    pub login_password: Entity<InputState>,
     pub tags: Entity<InputState>,
     pub note: Entity<TextareaState>,
 }
 impl HomeState {
     pub fn new(paths: &StorePaths, window: &mut Window, cx: &mut Context<AddressBookApp>) -> Self {
-        let initial = read_home(paths, "", AppFilter::All, AppSort::Updated, None);
+        let initial = read_home(paths, "", AppFilter::All, None);
         let (apps, links, available_tags, error) = match initial {
             Ok((a, b, tags)) => (a, b, tags, None),
             Err(e) => (vec![], HashMap::new(), vec![], Some(e)),
@@ -91,12 +94,13 @@ impl HomeState {
                     .placeholder("搜索设备…")
                     .clean_on_escape()
             }),
+            login_username: cx.new(|cx| InputState::new(window, cx).placeholder("尚未同步用户名")),
+            login_password: cx.new(|cx| InputState::new(window, cx).placeholder("尚未保存密码")),
             tags: cx.new(|cx| InputState::new(window, cx).placeholder("多个标签，用逗号分隔")),
             note: cx.new(|cx| TextareaState::new(window, cx).rows(3).placeholder("备注")),
             icons: HashMap::new(),
             online_only: false,
             filter: AppFilter::All,
-            sort: AppSort::Updated,
             tag: None,
             loading: false,
             sequence: 0,
@@ -112,6 +116,7 @@ impl HomeState {
             change_subscription: None,
             jobs: Default::default(),
             token_updates: None,
+            product_syncs: Default::default(),
             manual_syncs: Default::default(),
             backup_syncing: Default::default(),
             handoff_running: Default::default(),
@@ -132,33 +137,17 @@ fn read_home(
     paths: &StorePaths,
     text: &str,
     filter: AppFilter,
-    sort: AppSort,
     tag: Option<&str>,
 ) -> Result<HomeData, String> {
     let store = WorkspaceStore::open(paths).map_err(|e| e.to_string())?;
-    let mut apps = store
+    let apps = store
         .list(&AppQuery {
             text,
             filter,
-            sort,
             tag,
             ..Default::default()
         })
         .map_err(|e| e.to_string())?;
-    if matches!(sort, AppSort::Title) {
-        let renderers = plugins::RenderRegistry::default();
-        apps.sort_by_cached_key(|app| {
-            (
-                std::cmp::Reverse(app.pinned),
-                app.position,
-                renderers
-                    .for_bundle(&app.bundle_id)
-                    .display_title(app)
-                    .to_lowercase(),
-                app.id.as_str().to_string(),
-            )
-        });
-    }
     let links = apps
         .iter()
         .map(|a| store.backups(&a.id).map(|v| (a.id.clone(), v)))
@@ -236,7 +225,6 @@ impl AddressBookApp {
         let cached_icons: std::collections::HashSet<_> = self.home.icons.keys().cloned().collect();
         let query = self.query(cx);
         let filter = self.home.filter;
-        let sort = self.home.sort;
         let tag = self.home.tag.clone();
         self.home.loading = true;
         cx.notify();
@@ -244,7 +232,7 @@ impl AddressBookApp {
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    let data = read_home(&paths, &query, filter, sort, tag.as_deref())?;
+                    let data = read_home(&paths, &query, filter, tag.as_deref())?;
                     let store = WorkspaceStore::open(&paths).map_err(|e| e.to_string())?;
                     let proxy_names: HashMap<_, _> = store
                         .proxies()
@@ -272,6 +260,8 @@ impl AddressBookApp {
                                 expiry,
                                 proxy_name,
                                 execution: store.execution(&app.id).map_err(|e| e.to_string())?,
+                                keepalive_enabled: store.configured_tasks(&app.id).map_err(|e| e.to_string())?
+                                    .iter().any(|task| task.kind == "refresh" && task.enabled),
                             },
                         );
                     }
@@ -342,13 +332,20 @@ impl AddressBookApp {
         .detach();
     }
     pub(super) fn open_app_card(&mut self, id: AppId, window: &mut Window, cx: &mut Context<Self>) {
-        let app = match WorkspaceStore::open(self.book.paths()).and_then(|s| s.load(&id)) {
-            Ok(app) => app,
+        let (app, login) = match WorkspaceStore::open(self.book.paths())
+            .and_then(|store| Ok((store.load(&id)?, store.login_credentials(&id)?))) {
+            Ok(data) => data,
             Err(error) => {
                 self.set_status(format!("读取失败：{error}"), cx);
                 return;
             }
         };
+        let username = login.as_ref().map(|login|login.username.clone())
+            .or_else(|| rv_business::shop::ShopProfile::from_app(&app).and_then(|shop|shop.login))
+            .unwrap_or_default();
+        let password = login.and_then(|login|login.password).unwrap_or_default();
+        self.home.login_username.update(cx, |state,cx| state.set_value(username,window,cx));
+        self.home.login_password.update(cx, |state,cx| state.set_value(password,window,cx));
         self.home
             .tags
             .update(cx, |s, cx| s.set_value(app.tags.join(", "), window, cx));
@@ -379,14 +376,6 @@ impl AddressBookApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.read_only {
-            match WorkspaceStore::open(self.book.paths())
-                .and_then(|store| store.record_use(&id, super::unix_now()))
-            {
-                Ok(()) => self.reload_home(cx),
-                Err(error) => self.set_status(format!("记录最近使用失败：{error}"), cx),
-            }
-        }
         self.open_app_card(id, window, cx);
         if self.home.editing.as_ref().is_some_and(|app| {
             !self
@@ -409,8 +398,15 @@ impl AddressBookApp {
         };
         app.tags = super::parse_labels(&self.home.tags.read(cx).value().replace('，', ","));
         app.note = self.home.note.read(cx).value().to_string();
+        let login = if rv_business::strategy(&app.bundle_id).is_some() {
+            let username = self.home.login_username.read(cx).value().to_string();
+            let password = self.home.login_password.read(cx).value().to_string();
+            if username.is_empty() && password.is_empty() { None } else {
+                Some(AppLoginCredentials { username, password: (!password.is_empty()).then_some(password) })
+            }
+        } else { None };
         match WorkspaceStore::open(self.book.paths())
-            .and_then(|mut s| s.save_with_proxy(&app, self.home.proxies.binding.as_deref()))
+            .and_then(|mut s| s.save_with_proxy_and_login(&app, self.home.proxies.binding.as_deref(), login.as_ref()))
         {
             Ok(_) => {
                 self.modal = Modal::None;
@@ -615,6 +611,25 @@ impl AddressBookApp {
                     Err(error)=>{
                         tracing::error!(app_id=%id.as_str(),operation=operation.key(),%error,"Manual shop sync failed");
                         this.set_error_status(format!("{}失败：{error}",operation.label()),cx);
+                    }
+                }
+                cx.notify();
+            });
+        }).detach();
+    }
+    pub(super) fn refresh_card_product(&mut self, id: AppId, product_id: String, cx: &mut Context<Self>) {
+        if self.read_only || !self.home.product_syncs.insert((id.clone(), product_id.clone())) { return; }
+        let paths = self.book.paths().clone();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = rv_business::shop_sync::refresh_product(paths, id.clone(), product_id.clone()).await;
+            let _ = this.update(cx, |this, cx| {
+                this.home.product_syncs.remove(&(id.clone(), product_id.clone()));
+                match result {
+                    Ok(_) => this.set_status("商品刷新完成", cx),
+                    Err(error) => {
+                        tracing::error!(app_id=%id.as_str(), %product_id, %error, "Manual product refresh failed");
+                        this.set_error_status(format!("商品刷新失败：{error}"), cx);
                     }
                 }
                 cx.notify();

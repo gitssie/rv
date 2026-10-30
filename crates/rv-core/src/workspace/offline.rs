@@ -303,7 +303,12 @@ impl WorkspaceStore {
         let mut data:Value=serde_json::from_str(&app.metadata)?;
         let object=data.as_object_mut().ok_or_else(||StoreError::Invalid("业务元数据格式错误".into()))?;
         object.extend(fields.iter().map(|(key,value)|(key.clone(),value.clone())));
-        app.metadata=data.to_string();self.save(&app).map(|_|())
+        app.metadata=data.to_string();
+        self.save(&app)?;
+        if let Some(username)=fields.get("login").and_then(Value::as_str).filter(|name|!name.is_empty()) {
+            self.sync_login_username(id,username)?;
+        }
+        Ok(())
     }
     /// Commit the task outcome, optional credential rotation and card projection together.
     pub fn complete_task(
@@ -345,19 +350,33 @@ impl WorkspaceStore {
         &mut self, id: &AppId, task: &str, result: &Value,
         expected: &AppAuth, updated: &AppAuth, projection: &Value,
     ) -> Result<bool, StoreError> {
+        self.complete_refresh(id,Some(task),result,expected,updated,projection)
+    }
+    /// Direct requests adopt the rotated pair atomically without scheduler rows.
+    pub fn complete_refresh_request(
+        &mut self,id:&AppId,expected:&AppAuth,updated:&AppAuth,
+    )->Result<bool,StoreError> {
+        self.complete_refresh(id,None,&serde_json::json!({}),expected,updated,&serde_json::json!({}))
+    }
+    fn complete_refresh(
+        &mut self,id:&AppId,task:Option<&str>,result:&Value,
+        expected:&AppAuth,updated:&AppAuth,projection:&Value,
+    )->Result<bool,StoreError> {
         self.db.execute_batch("BEGIN IMMEDIATE")?;
         let checkpoint=self.changes.checkpoint();
         let outcome=(|| {
-            let belongs:bool=self.db.query_row("SELECT EXISTS(SELECT 1 FROM tasks WHERE id=?1 AND app_id=?2 AND status='running')",params![task,id.as_str()],|r|r.get(0))?;
-            if !belongs { return Err(StoreError::Conflict); }
+            if let Some(task)=task {
+                let belongs:bool=self.db.query_row("SELECT EXISTS(SELECT 1 FROM tasks WHERE id=?1 AND app_id=?2 AND status='running')",params![task,id.as_str()],|r|r.get(0))?;
+                if !belongs { return Err(StoreError::Conflict); }
+            }
             let current=self.auth(id)?;
             let adopt=self.token_source(id)?==TokenSource::Rv && current.as_ref().is_some_and(|current|
                 current.access_token==expected.access_token && current.refresh_token==expected.refresh_token);
             if adopt {
                 self.save_auth(id,updated)?;
                 self.apply_business_projection(id,projection)?;
-                self.finish_task_with_policy(task,"completed",result,TaskFinishPolicy::default())?;
-            } else {
+                if let Some(task)=task {self.finish_task_with_policy(task,"completed",result,TaskFinishPolicy::default())?;}
+            } else if let Some(task)=task {
                 self.finish_task_with_policy(task,"failed",&serde_json::json!({"credentials_updated":false,"error":"Token 来源或凭据已改变，本次刷新结果未采用"}),TaskFinishPolicy::default())?;
             }
             Ok(adopt)
@@ -365,6 +384,30 @@ impl WorkspaceStore {
         match outcome {
             Ok(adopt)=>{self.db.execute_batch("COMMIT")?;self.publish_changes();Ok(adopt)}
             Err(error)=>{self.db.execute_batch("ROLLBACK")?;self.changes.restore(checkpoint);Err(error)}
+        }
+    }
+    /// Stop a rejected refresh only if it still refers to the current token pair.
+    pub fn complete_invalid_refresh_task(
+        &mut self, id: &AppId, task: &str, result: &Value, expected: &AppAuth,
+    ) -> Result<bool, StoreError> {
+        self.db.execute_batch("BEGIN IMMEDIATE")?;
+        let checkpoint = self.changes.checkpoint();
+        let outcome = (|| {
+            let running: bool = self.db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM tasks WHERE id=?1 AND app_id=?2 AND kind='refresh' AND status='running')",
+                params![task, id.as_str()], |row| row.get(0),
+            )?;
+            if !running { return Err(StoreError::Conflict); }
+            let current = self.auth(id)?;
+            let stop = self.token_source(id)? == TokenSource::Rv && current.as_ref().is_some_and(|auth|
+                auth.access_token == expected.access_token && auth.refresh_token == expected.refresh_token);
+            if stop { self.set_task_enabled(task, false)?; }
+            self.finish_task(task, "failed", result)?;
+            Ok(stop)
+        })();
+        match outcome {
+            Ok(stopped) => { self.db.execute_batch("COMMIT")?; self.publish_changes(); Ok(stopped) }
+            Err(error) => { self.db.execute_batch("ROLLBACK")?; self.changes.restore(checkpoint); Err(error) }
         }
     }
     pub fn complete_task_with_policy(

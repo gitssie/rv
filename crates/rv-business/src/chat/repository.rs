@@ -27,8 +27,56 @@ pub(super) fn schema(db: &Connection) -> Result<(), StoreError> {
         [],
         |r| r.get(0),
     )?;
-    if version != 2 {
+    if version == 2 {
+        migrate_portal_ids(db)?;
+        db.execute("UPDATE chat_schema SET version=3 WHERE singleton=1",[])?;
+    }
+    if version==2 || version==3 {
+        migrate_legacy_display(db)?;
+        db.execute("UPDATE chat_schema SET version=4 WHERE singleton=1",[])?;
+    }
+    if version != 2 && version != 3 && version != 4 {
         return Err(StoreError::Invalid("聊天数据版本不受支持".into()));
+    }
+    Ok(())
+}
+fn migrate_legacy_display(db:&Connection)->Result<(),StoreError> {
+    let mut query=db.prepare("SELECT data FROM chat_messages WHERE json_extract(data,'$.kind')='legacy_action'")?;
+    let rows=query.query_map([],|r|r.get::<_,String>(0))?.collect::<Result<Vec<_>,_>>()?;drop(query);
+    for data in rows {
+        let mut message:Message=serde_json::from_str(&data)?;
+        message.body=super::vinted::text(&message.payload);
+        db.execute("UPDATE chat_messages SET body=?2,data=?3 WHERE id=?1",params![message.id,message.body,serde_json::to_string(&message)?])?;
+    }
+    // Repair cached previews using actual messages already stored locally.
+    let mut query=db.prepare("SELECT c.id,m.body FROM chat_conversations c JOIN chat_messages m ON m.id=(SELECT id FROM chat_messages WHERE conversation_id=c.id AND created_at>=c.updated_at AND json_extract(data,'$.kind')!='legacy_action' AND body!='' ORDER BY created_at DESC,id DESC LIMIT 1)")?;
+    let rows=query.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?.collect::<Result<Vec<_>,_>>()?;drop(query);
+    for (id,body) in rows {
+        db.execute("UPDATE chat_conversations SET preview=?2,data=json_set(data,'$.preview',?2) WHERE id=?1",params![id,body])?;
+    }
+    Ok(())
+}
+// Older gateway wrapper IDs changed on every read. Only real portal entity IDs
+// are normalized here; ordinary messages are never merged by text or timestamp.
+fn migrate_portal_ids(db:&Connection)->Result<(),StoreError> {
+    let mut query=db.prepare("SELECT conversation_id,data FROM chat_messages ORDER BY created_at,id")?;
+    let rows=query.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?.collect::<Result<Vec<_>,_>>()?;
+    drop(query);
+    let mut groups=std::collections::BTreeMap::<(String,String),Vec<Message>>::new();
+    for (conversation,data) in rows {
+        let message:Message=serde_json::from_str(&data)?;
+        if message.payload["message_type"].as_str()!=Some("legacy_portal_message") || message.payload["data"]["entity"].get("id").is_none(){continue;}
+        let remote=super::vinted::message_id(&message.payload).map_err(StoreError::Invalid)?;
+        groups.entry((conversation,remote)).or_default().push(message);
+    }
+    for ((_,remote),mut messages) in groups {
+        let mut keep=messages.remove(0);
+        for other in messages {
+            if keep.translation.is_none() && keep.body==other.body {keep.translation=other.translation;}
+            db.execute("DELETE FROM chat_messages WHERE id=?1",[other.id])?;
+        }
+        keep.remote_id=Some(remote.clone());
+        db.execute("UPDATE chat_messages SET remote_id=?2,data=?3 WHERE id=?1",params![keep.id,remote,serde_json::to_string(&keep)?])?;
     }
     Ok(())
 }
@@ -132,6 +180,8 @@ pub(super) fn persist_conversations(
             data.preview = old.preview;
             data.unread = old.unread;
         }
+        let locally_read:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM chat_read_requests WHERE conversation_id=?1 AND requested_at>=?2)",params![data.id,data.updated_at],|r|r.get(0))?;
+        if locally_read {data.unread=false;}
         db.execute("INSERT INTO chat_conversations(id,app_id,remote_id,title,preview,updated_at,unread,allow_reply,detail_loaded,data) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) ON CONFLICT(app_id,remote_id) DO UPDATE SET title=excluded.title,preview=excluded.preview,updated_at=excluded.updated_at,unread=excluded.unread,allow_reply=excluded.allow_reply,detail_loaded=MAX(chat_conversations.detail_loaded,excluded.detail_loaded),data=excluded.data",params![data.id,app.as_str(),data.remote_id,data.title,data.preview,data.updated_at,data.unread,data.allow_reply.unwrap_or(false),detail,data.to_string()])?;
     }
     Ok(())
@@ -158,6 +208,15 @@ pub(super) fn persist_detail(
 ) -> Result<(), StoreError> {
     persist_conversations(db, app, std::slice::from_ref(&batch.conversation), true)?;
     let conversation = key(db, app, &batch.conversation.remote_id)?;
+    // legacy_action is a gateway display item without a stable entity ID.
+    // Replace stale wrappers only after all pages have been fetched successfully.
+    if batch.next.is_none() {
+        let current:std::collections::HashSet<_>=batch.messages.iter().filter(|m|m.kind=="legacy_action").filter_map(|m|m.remote_id.as_deref()).collect();
+        let mut query=db.prepare("SELECT id,remote_id FROM chat_messages WHERE conversation_id=?1 AND json_extract(data,'$.kind')='legacy_action'")?;
+        let old=query.query_map([&conversation],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?.collect::<Result<Vec<_>,_>>()?;
+        drop(query);
+        for (id,remote) in old {if !current.contains(remote.as_str()){db.execute("DELETE FROM chat_messages WHERE id=?1",[id])?;}}
+    }
     for m in &batch.messages {
         let remote = m
             .remote_id
@@ -170,6 +229,7 @@ pub(super) fn persist_detail(
                 |r| r.get::<_, String>(0),
             )
             .optional()?
+            .or(db.query_row("SELECT id FROM chat_outbox WHERE conversation_id=?1 AND remote_id=?2",params![conversation,remote],|r|r.get::<_,String>(0)).optional()?)
             .unwrap_or_else(|| Uuid::new_v4().to_string());
         let mut m = m.clone();
         m.id = id;
@@ -187,22 +247,8 @@ pub(super) fn persist_detail(
                 }
             }
         }
+        preserve_outbox_translation(db,&conversation,remote,&mut m)?;
         db.execute("INSERT INTO chat_messages VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(conversation_id,remote_id) DO UPDATE SET created_at=excluded.created_at,body=excluded.body,data=excluded.data",params![m.id,conversation,remote,m.created_at,m.body,serde_json::to_string(&m)?])?;
-        let original:Option<(String,Option<String>,Option<String>,Option<String>)>=db.query_row("SELECT body,prepared_body,source_language,target_language FROM chat_outbox WHERE conversation_id=?1 AND remote_id=?2",params![conversation,remote],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
-        if let Some((original, Some(translated), source, Some(target))) = original {
-            if original != translated {
-                m.translation = Some(super::translation::Translation {
-                    original,
-                    translated,
-                    source_language: source,
-                    target_language: target,
-                });
-                db.execute(
-                    "UPDATE chat_messages SET data=?2 WHERE id=?1",
-                    params![m.id, serde_json::to_string(&m)?],
-                )?;
-            }
-        }
         db.execute(
             "DELETE FROM chat_outbox WHERE conversation_id=?1 AND remote_id=?2",
             params![conversation, remote],
@@ -210,6 +256,15 @@ pub(super) fn persist_detail(
     }
     super::customers::persist(db, app, &conversation, &batch.participants)?;
     db.execute("INSERT INTO chat_detail_sync(conversation_id,inbox_updated_at,fetched_at) VALUES(?1,?2,?3) ON CONFLICT(conversation_id) DO UPDATE SET inbox_updated_at=excluded.inbox_updated_at,fetched_at=excluded.fetched_at",params![conversation,batch.conversation.updated_at,super::service::now()])?;
+    Ok(())
+}
+fn preserve_outbox_translation(db:&Connection,conversation:&str,remote:&str,message:&mut Message)->Result<(),StoreError> {
+    let original:Option<(String,Option<String>,Option<String>,Option<String>)>=db.query_row("SELECT body,prepared_body,source_language,target_language FROM chat_outbox WHERE conversation_id=?1 AND remote_id=?2",params![conversation,remote],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
+    if let Some((original,Some(translated),source,Some(target)))=original {
+        if original!=translated {
+            message.translation=Some(super::translation::Translation{original,translated,source_language:source,target_language:target});
+        }
+    }
     Ok(())
 }
 pub fn thread(paths: &StorePaths, conversation: &str) -> Result<Thread, String> {
@@ -293,6 +348,20 @@ pub(super) fn finish_send(
     )? != 1
     {
         return Err(StoreError::Conflict);
+    }
+    // A thread sync may commit before the send receipt arrives. Reconcile by
+    // the receipt ID in that order too, without matching message contents.
+    if status=="submitted" {
+        if let Some(remote)=remote {
+            let existing:Option<(String,String,String)>=db.query_row("SELECT m.id,m.data,m.conversation_id FROM chat_messages m JOIN chat_outbox q ON q.conversation_id=m.conversation_id WHERE q.id=?1 AND m.remote_id=?2",params![id,remote],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+            if let Some((previous,data,conversation))=existing {
+                let mut message:Message=serde_json::from_str(&data)?;
+                message.id=id.to_owned();
+                preserve_outbox_translation(db,&conversation,remote,&mut message)?;
+                db.execute("UPDATE chat_messages SET id=?2,data=?3 WHERE id=?1",params![previous,id,serde_json::to_string(&message)?])?;
+                db.execute("DELETE FROM chat_outbox WHERE id=?1",[id])?;
+            }
+        }
     }
     Ok(())
 }

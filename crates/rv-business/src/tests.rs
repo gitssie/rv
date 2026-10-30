@@ -232,10 +232,7 @@ async fn paged_http_sync_commits_all_pages_or_preserves_previous_inventory() {
         assert_eq!(outcome.is_err(), fail_second);
         let data = data::read_data(&paths, &id, Dataset::Products, "", 0).unwrap();
         assert_eq!(data.total, if fail_second { 1 } else { 3 });
-        assert_eq!(
-            store.tasks(&id).unwrap()[0].status,
-            if fail_second { "failed" } else { "completed" }
-        );
+        assert_eq!(store.tasks(&id).unwrap().len(),1,"direct sync must not create Tasks");
     }
 }
 #[test]
@@ -342,7 +339,7 @@ impl BusinessStrategy for FixtureStrategy {
     }
 }
 #[tokio::test]
-async fn task_completes_on_host_without_phone_and_result_survives_reopen() {
+async fn direct_request_completes_without_phone_and_result_survives_reopen_without_tasks() {
     let dir = tempfile::tempdir().unwrap();
     let paths = StorePaths::in_dir(dir.path().into());
     let mut book = AddressBook::load(paths.clone()).unwrap();
@@ -397,15 +394,7 @@ async fn task_completes_on_host_without_phone_and_result_survives_reopen() {
     server.await.unwrap();
     let reopened = WorkspaceStore::open(&paths).unwrap();
     let tasks = reopened.tasks(&id).unwrap();
-    assert_eq!(tasks[0].status, "completed");
-    assert!(
-        !tasks[0]
-            .result
-            .as_ref()
-            .unwrap()
-            .to_string()
-            .contains("must-not-be-saved")
-    );
+    assert!(tasks.is_empty(),"direct account reads must not create Tasks");
     let data: Value = serde_json::from_str(&reopened.load(&id).unwrap().metadata).unwrap();
     assert_eq!(data["session_status"], "有效");
     assert_eq!(data["login"], "fixture shop");
@@ -417,14 +406,80 @@ async fn task_completes_on_host_without_phone_and_result_survives_reopen() {
         "https://images.vinted.net/avatar.jpg"
     );
     assert!(!data.to_string().contains("private-email"));
-    assert!(
-        !tasks[0]
-            .result
-            .as_ref()
-            .unwrap()
-            .to_string()
-            .contains("private-email")
-    );
+    assert!(!data.to_string().contains("must-not-be-saved"));
+}
+
+#[tokio::test]
+async fn execute_now_bypasses_future_schedules_and_preserves_stopped_tasks() {
+    let (_dir,paths,mut store,id)=fixture();
+    for kind in ["products","chat_threads","chat_send","chat_read"] {
+        let task=store.ensure_task(&id,kind,&TaskSpec::new(kind,"0 0 * * * *"),None,chrono::Utc::now().timestamp()+86400).unwrap();
+        store.set_task_enabled(&task.id,false).unwrap();
+    }
+    let before=store.tasks(&id).unwrap();
+    // Empty consumers finish immediately, even with future, stopped schedules.
+    for kind in ["chat_send","chat_read"] {
+        tokio::time::timeout(Duration::from_secs(2),shop_sync::execute_now(paths.clone(),id.clone(),kind.into()))
+            .await.unwrap().unwrap();
+    }
+    // A real read enters request preflight now; it does not wait for the cron.
+    for kind in ["products","chat_threads"] {
+        let error=tokio::time::timeout(Duration::from_secs(2),shop_sync::execute_now(paths.clone(),id.clone(),kind.into()))
+            .await.unwrap().unwrap_err();
+        assert!(error.contains("关联代理"),"{error}");
+    }
+    assert_eq!(store.tasks(&id).unwrap(),before);
+}
+
+#[tokio::test]
+async fn direct_refresh_saves_rotated_pair_without_creating_or_restarting_tasks() {
+    struct DirectRefresh(String);
+    impl BusinessStrategy for DirectRefresh {
+        fn request(&self,operation:Operation,auth:&AppAuth)->Result<RequestPlan,String> {
+            let mut plan=vinted::Vinted.request(operation,auth)?;
+            plan.url=self.0.clone();Ok(plan)
+        }
+        fn project(&self,operation:Operation,status:u16,response:&Value)->Value {
+            vinted::Vinted.project(operation,status,response)
+        }
+    }
+    for success in [true,false] {
+        let (_dir,paths,mut store,id)=fixture();
+        let mut auth=store.auth(&id).unwrap().unwrap();
+        auth.refresh_token=Some("fixture-refresh".into());
+        store.save_auth(&id,&auth).unwrap();
+        store.reject_access_token(&id,&auth.access_token).unwrap();
+        let keepalive=store.ensure_task(&id,"keepalive",&TaskSpec::new("refresh","0 0 * * * *"),None,chrono::Utc::now().timestamp()+3600).unwrap();
+        store.set_task_enabled(&keepalive.id,false).unwrap();
+        let before=store.tasks(&id).unwrap();
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url=format!("http://{}",listener.local_addr().unwrap());
+        let server=tokio::spawn(async move {
+            let (mut socket,_)=listener.accept().await.unwrap();
+            let mut bytes=Vec::new();
+            loop {
+                let mut buf=[0;8192];let n=socket.read(&mut buf).await.unwrap();assert!(n>0);
+                bytes.extend_from_slice(&buf[..n]);
+                if String::from_utf8_lossy(&bytes).contains("refresh_token=fixture-refresh") {break;}
+            }
+            let request=String::from_utf8_lossy(&bytes);
+            assert!(request.starts_with("POST / "));
+            assert!(!request.to_ascii_lowercase().contains("authorization:"));
+            assert!(request.contains("grant_type=refresh_token&client_id=ios&scope=user"));
+            let (status,body)=if success {(200,json!({"access_token":"rotated-access","refresh_token":"rotated-refresh","expires_in":3600}))}
+                else {(400,json!({"error":"invalid_grant","error_description":"fixture invalid refresh"}))};
+            let body=body.to_string();
+            socket.write_all(format!("HTTP/1.1 {status} Fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+        });
+        let outcome=OfflineRunner::new(None).unwrap().run_with_strategy(&paths,&id,Operation::Refresh,&DirectRefresh(url)).await;
+        server.await.unwrap();
+        assert_eq!(outcome.is_ok(),success);
+        assert_eq!(store.tasks(&id).unwrap(),before);
+        let saved=store.auth(&id).unwrap().unwrap();
+        assert_eq!(saved.access_token,if success {"rotated-access"}else{"fixture"});
+        assert_eq!(saved.refresh_token.as_deref(),Some(if success {"rotated-refresh"}else{"fixture-refresh"}));
+        assert_eq!(saved.access_token_rejected(),!success);
+    }
 }
 #[test]
 fn compact_detail_reads_all_local_rows_and_preview_uses_newest_product_id() {
@@ -674,7 +729,7 @@ async fn manual_shop_sync_reuses_pagination_and_session_without_touching_tasks()
                 socket.write_all(format!("HTTP/1.1 {status} Fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
             }
         });
-        let result=OfflineRunner::new(None).unwrap().execute_business(&paths,&id,Operation::Products,&PagedFixture(endpoint),None,false).await;
+        let result=OfflineRunner::new(None).unwrap().execute_business(&paths,&id,Operation::Products,&PagedFixture(endpoint),None).await;
         server.await.unwrap();
         assert_eq!(result.is_err(),fail_second);
         assert_eq!(store.tasks(&id).unwrap(),before);
@@ -702,7 +757,7 @@ async fn manual_sync_can_continue_when_ownership_changes_but_token_is_unchanged(
         let body=json!({"code":0,"items":[{"id":2,"user_id":123,"title":"second"}],"pagination":{"current_page":2,"total_pages":2}}).to_string();
         second.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
     });
-    OfflineRunner::new(None).unwrap().execute_business(&paths,&id,Operation::Products,&PagedFixture(endpoint),None,false).await.unwrap();
+    OfflineRunner::new(None).unwrap().execute_business(&paths,&id,Operation::Products,&PagedFixture(endpoint),None).await.unwrap();
     server.await.unwrap();
     assert!(store.tasks(&id).unwrap().is_empty());
     assert_eq!(data::read_data(&paths,&id,Dataset::Products,"",0).unwrap().total,2);
@@ -719,11 +774,11 @@ async fn manual_401_marks_shared_token_invalid_without_creating_a_task() {
         socket.write_all(format!("HTTP/1.1 401 Unauthorized\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
     });
     let plugin=PagedFixture(endpoint);let runner=OfflineRunner::new(None).unwrap();
-    let error=runner.execute_business(&paths,&id,Operation::Products,&plugin,None,false).await.unwrap_err();
+    let error=runner.execute_business(&paths,&id,Operation::Products,&plugin,None).await.unwrap_err();
     assert!(error.contains("401"));server.await.unwrap();
     assert!(store.auth(&id).unwrap().unwrap().access_token_rejected());
     assert!(store.tasks(&id).unwrap().is_empty());
-    assert!(runner.execute_business(&paths,&id,Operation::Products,&plugin,None,false).await.unwrap_err().contains("访问令牌已失效"));
+    assert!(runner.execute_business(&paths,&id,Operation::Products,&plugin,None).await.unwrap_err().contains("访问令牌已失效"));
 }
 
 #[tokio::test]
@@ -745,4 +800,213 @@ async fn refresh_rechecks_rv_ownership_and_latest_token_pair_before_sending() {
         assert!(error.contains(if changed_source {"RV 不刷新"} else {"不使用旧 refresh token"}),"{error}");
         assert!(tokio::time::timeout(std::time::Duration::from_millis(30),listener.accept()).await.is_err(),"no refresh HTTP request may leave after ownership/credentials change");
     }
+}
+
+#[tokio::test]
+async fn wire_headers_contain_only_phone_context_and_http_fields() {
+    for with_phone_agent in [true, false] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let capture = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            loop {
+                let mut chunk = [0; 1024];
+                let n = stream.read(&mut chunk).await.unwrap();
+                assert!(n > 0);
+                bytes.extend_from_slice(&chunk[..n]);
+                if bytes.windows(4).any(|v| v == b"\r\n\r\n") { break; }
+            }
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}").await.unwrap();
+            String::from_utf8(bytes).unwrap()
+        });
+        let mut auth = AppAuth { access_token: "test-token".into(), ..Default::default() };
+        let agent = "vinted-ios Vinted/26.41.1 (lt.manodrabuziai.fr; build:30253; iOS 15.8.3) iPhone9,2";
+        if with_phone_agent { auth.headers.insert("User-Agent".into(), agent.into()); }
+        auth.headers.insert("X-Session-Id".into(), "fixture-session".into());
+        auth.headers.insert("Accept-Language".into(), "fr".into());
+        // These must not escape the allowlist, even if present in stored input.
+        auth.headers.insert("X-RV-Version".into(), "desktop".into());
+        auth.headers.insert("X-Operating-System".into(), "macOS".into());
+        let runner = OfflineRunner::new(None).unwrap();
+        runner.exchange(RequestPlan { method: reqwest::Method::GET, url: format!("http://{addr}/item"), body: None }, &auth, Operation::Products).await.unwrap();
+        let wire = capture.await.unwrap();
+        let headers: std::collections::BTreeMap<_, _> = wire.split("\r\n").skip(1)
+            .filter_map(|line| line.split_once(": "))
+            .map(|(k, v)| (k.to_ascii_lowercase(), v.to_owned())).collect();
+        let mut expected = std::collections::BTreeMap::from([
+            ("host".to_owned(), addr.to_string()),
+            ("accept".to_owned(), "*/*".to_owned()),
+            ("accept-encoding".to_owned(), "gzip, deflate, br".to_owned()),
+            ("authorization".to_owned(), "Bearer test-token".to_owned()),
+            ("x-session-id".to_owned(), "fixture-session".to_owned()),
+            ("accept-language".to_owned(), "fr".to_owned()),
+        ]);
+        if with_phone_agent { expected.insert("user-agent".into(), agent.into()); }
+        assert_eq!(headers, expected);
+    }
+}
+
+#[test]
+fn single_product_refresh_updates_only_requested_id_without_scheduler_tasks() {
+    let (_dir, paths, mut store, id) = fixture();
+    commit(&mut store, &id, Operation::Products, &json!({"code":0,"items":[
+        {"id":77,"user_id":123,"title":"Old","is_hidden":true},
+        {"id":88,"user_id":123,"title":"Keep"}
+    ]})).unwrap();
+    let before = store.tasks(&id).unwrap().len();
+    let plugin = vinted::Vinted.product_refresh("77").unwrap();
+    let plan = plugin.request(Operation::Products, &AppAuth::default()).unwrap();
+    assert_eq!(plan.method, reqwest::Method::GET);
+    assert_eq!(plan.url, "https://www.vinted.com/api/v2/items/77/details");
+    assert!(plan.body.is_none());
+    assert!(plugin.requires_proxy());
+    let mut combined = Value::Null;
+    assert!(!plugin.collect_page(Operation::Products, json!({"code":0,"item":{"id":77,"user":{"id":123},"title":"Updated","is_hidden":false,"access_token":"secret"}}), &mut combined, 1, None).unwrap());
+    let result = plugin.project(Operation::Products, 200, &combined);
+    store.commit_business_data(&id, &json!({}), |db| plugin.persist(db, &id, Operation::Products, &result)).unwrap();
+    let page = data::read_data(&paths, &id, Dataset::Products, "", 0).unwrap();
+    assert_eq!(page.total, 2);
+    let updated = page.rows.iter().find(|row| row.id == "77").unwrap();
+    assert_eq!(updated.title, "Updated");
+    assert_eq!(updated.payload["is_hidden"], false);
+    assert!(updated.payload.get("access_token").is_none());
+    assert_eq!(page.rows.iter().find(|row| row.id == "88").unwrap().title, "Keep");
+    assert_eq!(store.tasks(&id).unwrap().len(), before);
+    assert!(plugin.collect_page(Operation::Products, json!({"item":{"id":88}}), &mut Value::Null, 1, None).is_err());
+    assert!(plugin.collect_page(Operation::Products, json!({"code":99}), &mut Value::Null, 1, None).is_err());
+    assert!(vinted::Vinted.product_refresh("77/path").is_err());
+    let mut wrong_owner = Value::Null;
+    plugin.collect_page(Operation::Products, json!({"item":{"id":77,"user_id":999}}), &mut wrong_owner, 1, None).unwrap();
+    let result = plugin.project(Operation::Products, 200, &wrong_owner);
+    assert!(store.commit_business_data(&id, &json!({}), |db| plugin.persist(db, &id, Operation::Products, &result)).is_err());
+    assert_eq!(data::read_data(&paths, &id, Dataset::Products, "Updated", 0).unwrap().total, 1);
+}
+
+#[tokio::test]
+async fn refresh_invalid_grant_stops_schedule_but_transient_failure_keeps_it() {
+    for (http, code, should_stop) in [(400, "invalid_grant", true), (400, "invalid_scope", false), (503, "unavailable", false)] {
+        let (_dir, paths, mut store, id) = fixture();
+        let mut auth = store.auth(&id).unwrap().unwrap();
+        auth.refresh_token = Some("refresh-fixture".into());
+        store.save_auth(&id, &auth).unwrap();
+        store.set_token_source(&id, TokenSource::Rv).unwrap();
+        let scheduled = store.ensure_task(&id, "keepalive", &TaskSpec::new("refresh", "0 0 * * * *"), None, 0).unwrap();
+        let scheduled = store.run_task_now(&scheduled.id).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint: &'static str = Box::leak(format!("http://{}/refresh", listener.local_addr().unwrap()).into_boxed_str());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0; 8192];
+            stream.read(&mut buf).await.unwrap();
+            let body = json!({"error":code,"error_description":"server rejection"}).to_string();
+            stream.write_all(format!("HTTP/1.1 {http} Error\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+        });
+        let error = OfflineRunner::new(None).unwrap().run_admitted(&paths, &id, Operation::Refresh, &FixtureStrategy(endpoint), Some(&scheduled)).await.unwrap_err();
+        assert!(error.contains(code));
+        server.await.unwrap();
+        let saved = store.task(&scheduled.id).unwrap();
+        assert_eq!(saved.enabled, !should_stop);
+        assert_eq!(saved.next_run_at.is_none(), should_stop);
+        assert_eq!(saved.status, if should_stop {"failed"} else {"pending"});
+        assert_eq!(saved.error_code.as_deref(), Some(code));
+        assert_eq!(store.auth(&id).unwrap().unwrap().refresh_token, auth.refresh_token);
+    }
+}
+
+#[test]
+fn late_invalid_refresh_result_does_not_disable_new_credentials_schedule() {
+    let (_dir, _paths, mut store, id) = fixture();
+    store.set_token_source(&id, TokenSource::Rv).unwrap();
+    let original = store.auth(&id).unwrap().unwrap();
+    let task = store.ensure_task(&id, "keepalive", &TaskSpec::new("refresh", "0 0 * * * *"), None, 0).unwrap();
+    let task = store.run_task_now(&task.id).unwrap();
+    store.claim_task_when(&task, |_| Ok(())).unwrap();
+    let mut fresh = original.clone();
+    fresh.access_token = "fresh-phone-access".into();
+    fresh.refresh_token = Some("fresh-phone-refresh".into());
+    store.save_auth(&id, &fresh).unwrap();
+    let stopped = store.complete_invalid_refresh_task(&id, &task.id, &json!({"http_status":400,"error_code":"invalid_grant"}), &original).unwrap();
+    assert!(!stopped);
+    assert!(store.task(&task.id).unwrap().enabled);
+    assert!(store.task(&task.id).unwrap().next_run_at.is_some());
+    assert_eq!(store.auth(&id).unwrap().unwrap().access_token, fresh.access_token);
+}
+
+#[test]
+fn single_product_deleted_is_retained_until_details_confirm_existence() {
+    let (_dir, paths, mut store, id) = fixture();
+    let original=json!({"id":77,"user_id":123,"title":"Keep deleted bag","photo":{"url":"https://example.invalid/bag.jpg"},"price":{"amount":"360.00","currency_code":"EUR"},"is_hidden":false,"transaction_permitted":true});
+    commit(&mut store,&id,Operation::Products,&json!({"code":0,"items":[original.clone(),{"id":88,"user_id":123,"title":"Other"}]})).unwrap();
+    let before=store.tasks(&id).unwrap().len();
+    let plugin=vinted::Vinted.product_refresh("77").unwrap();
+    for (status,code) in [(401,104),(403,104),(500,104),(404,99)] {
+        let result=plugin.project(Operation::Products,status,&json!({"code":code,"message":"Error"}));
+        assert!(!plugin.is_success(Operation::Products,status,&result));
+        store.commit_business_data(&id,&json!({}),|db|plugin.persist(db,&id,Operation::Products,&result)).unwrap();
+        assert!(data::read_data(&paths,&id,Dataset::Products,"bag",0).unwrap().rows[0].payload.get("_rv_deleted").is_none());
+    }
+    let deleted=plugin.project(Operation::Products,404,&json!({"code":104,"message":"Contenu non trouvé"}));
+    assert!(plugin.is_success(Operation::Products,404,&deleted));
+    store.commit_business_data(&id,&json!({}),|db|plugin.persist(db,&id,Operation::Products,&deleted)).unwrap();
+    drop(store);
+    let mut store=WorkspaceStore::open(&paths).unwrap();
+    let page=data::read_data(&paths,&id,Dataset::Products,"",0).unwrap();
+    assert_eq!(page.total,2);
+    let row=page.rows.iter().find(|r|r.id=="77").unwrap();
+    for key in ["title","price","photo"] {assert_eq!(row.payload[key],original[key]);}
+    assert_eq!(row.payload["_rv_deleted"],true);
+    assert!(row.summary.contains("已删除"));
+    assert_eq!(crate::presentation::vinted(&row.payload,Dataset::Products).badges,["已删除"]);
+    assert!(page.rows.iter().find(|r|r.id=="88").unwrap().payload.get("_rv_deleted").is_none());
+    assert_eq!(store.tasks(&id).unwrap().len(),before);
+    // A list that omits the product retains it, and a stale list cannot clear its status.
+    for items in [json!([]),json!([original.clone()]),json!([{"id":77,"user_id":123,"title":"Stale title"}])] {
+        let result=vinted::Vinted.project(Operation::Products,200,&json!({"code":0,"items":items}));
+        store.commit_business_data(&id,&json!({}),|db|vinted::Vinted.persist(db,&id,Operation::Products,&result)).unwrap();
+        let saved=&data::read_data(&paths,&id,Dataset::Products,"bag",0).unwrap().rows[0].payload;
+        assert_eq!(saved["_rv_deleted"],true);
+        for key in ["title","price","photo"] {assert_eq!(saved[key],original[key]);}
+    }
+    let mut combined=Value::Null;
+    plugin.collect_page(Operation::Products,json!({"code":0,"item":original}),&mut combined,1,None).unwrap();
+    let result=plugin.project(Operation::Products,200,&combined);
+    store.commit_business_data(&id,&json!({}),|db|plugin.persist(db,&id,Operation::Products,&result)).unwrap();
+    let row=&data::read_data(&paths,&id,Dataset::Products,"bag",0).unwrap().rows[0];
+    assert_eq!(row.payload["_rv_deleted"],false);
+    assert!(row.payload.get("_rv_deleted_at").is_none());
+    assert_eq!(crate::presentation::vinted(&row.payload,Dataset::Products).badges,["激活","可交易"]);
+}
+
+#[tokio::test]
+async fn single_product_deleted_http_result_commits_as_success_without_tasks() {
+    struct LocalDetails { url:String, inner:Box<dyn BusinessStrategy> }
+    impl BusinessStrategy for LocalDetails {
+        fn request(&self,op:Operation,auth:&AppAuth)->Result<RequestPlan,String> {
+            let mut plan=self.inner.request(op,auth)?;plan.url=self.url.clone();Ok(plan)
+        }
+        fn project(&self,op:Operation,status:u16,response:&Value)->Value {self.inner.project(op,status,response)}
+        fn is_success(&self,op:Operation,status:u16,result:&Value)->bool {self.inner.is_success(op,status,result)}
+        fn persist(&self,db:&rusqlite::Connection,id:&AppId,op:Operation,result:&Value)->Result<(),rv_core::StoreError> {
+            self.inner.persist(db,id,op,result)
+        }
+    }
+    let (_dir,paths,mut store,id)=fixture();
+    commit(&mut store,&id,Operation::Products,&json!({"code":0,"items":[{"id":77,"user_id":123,"title":"Deleted bag"}]})).unwrap();
+    let before=store.tasks(&id).unwrap().len();
+    let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let strategy=LocalDetails{url:format!("http://{}/details",listener.local_addr().unwrap()),inner:vinted::Vinted.product_refresh("77").unwrap()};
+    let server=tokio::spawn(async move {
+        let (mut socket,_)=listener.accept().await.unwrap();
+        let mut bytes=[0;8192];socket.read(&mut bytes).await.unwrap();
+        let body=r#"{"code":104,"message":"Contenu non trouvé"}"#;
+        socket.write_all(format!("HTTP/1.1 404 Not Found\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+    });
+    OfflineRunner::new(None).unwrap().run_with_strategy(&paths,&id,Operation::Products,&strategy).await.unwrap();
+    server.await.unwrap();
+    assert_eq!(store.tasks(&id).unwrap().len(),before);
+    let page=data::read_data(&paths,&id,Dataset::Products,"bag",0).unwrap();
+    assert_eq!(page.total,1);
+    assert_eq!(page.rows[0].payload["_rv_deleted"],true);
+    assert_eq!(page.rows[0].title,"Deleted bag");
 }

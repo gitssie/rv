@@ -323,3 +323,45 @@ fn native_chat_window_reuses_handle_and_reopens_with_saved_draft(cx:&mut TestApp
         assert_eq!(app.chat.composer.read(cx).value().as_ref(),"保存的草稿");
     });
 }
+
+#[gpui::test]
+fn selecting_conversation_only_loads_sqlite(cx: &mut TestAppContext) {
+    let device=Connection::new("fixture","example.invalid",5900);
+    let (app,cx,_dir)=setup(cx,vec![device.clone()]);
+    cx.update(|_,cx|app.update(cx,|app,cx|{
+        app.home.task_worker.take();
+        super::test_support::seed(app.book.paths(),device.id);
+        app.reload_chat(cx);
+    }));
+    cx.run_until_parked();
+    cx.update(|window,cx|app.update(cx,|app,cx|{
+        app.select_chat("conversation-0".into(),window,cx);
+        assert!(app.chat.syncs.is_empty(),"selecting a conversation must not start HTTP sync");
+    }));
+    cx.run_until_parked();
+    app.read_with(cx,|app,_|assert_eq!(app.chat.thread.messages.len(),3));
+}
+
+#[gpui::test]
+fn displayed_conversation_queues_read_without_http(cx:&mut TestAppContext) {
+    let device=Connection::new("fixture","example.invalid",5900);
+    let (app,cx,_dir)=setup(cx,vec![device.clone()]);
+    let ids=cx.update(|_,cx|app.update(cx,|app,_|{
+        app.home.task_worker.take();
+        super::test_support::seed(app.book.paths(),device.id)
+    }));
+    cx.update(|window,cx|app.update(cx,|app,cx|app.open_chat_for(ids[0].clone(),window,cx)));
+    cx.run_until_parked();
+    let handle=app.read_with(cx,|app,_|app.chat.window.unwrap());
+    let mut chat_cx=gpui::VisualTestContext::from_window(handle.into(),cx);
+    let cx=&mut chat_cx;
+    cx.update(|window,cx|app.update(cx,|app,cx|app.select_chat("conversation-0".into(),window,cx)));
+    cx.run_until_parked();
+    app.read_with(cx,|app,_|{
+        assert!(app.chat.syncs.is_empty());
+        let mut store=rv_core::workspace::WorkspaceStore::open(app.book.paths()).unwrap();
+        let count:i64=store.business_transaction(|db|db.query_row("SELECT count(*) FROM chat_read_requests WHERE conversation_id='conversation-0'",[],|r|r.get(0)).map_err(Into::into)).unwrap();
+        assert_eq!(count,1);
+        assert!(!app.chat.selected().unwrap().unread,"cached read state updates immediately");
+    });
+}

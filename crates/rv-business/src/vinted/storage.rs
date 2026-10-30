@@ -47,6 +47,12 @@ fn external_id(value: &Value) -> Result<String, StoreError> {
 fn text<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
     value[key].as_str()
 }
+pub(super) fn mark_product_deleted(db:&Connection,id:&AppId,product:&str)->Result<(),StoreError> {
+    schema(db)?;scoped(db,id)?;
+    let changed=db.execute("UPDATE vinted_products SET payload=json_set(payload,'$._rv_deleted',json('true'),'$._rv_deleted_at',?3),fetched_at=?3 WHERE app_id=?1 AND product_id=?2",params![id.as_str(),product,now()])?;
+    if changed!=1 {return Err(StoreError::Invalid("本地商品记录不存在，未标记删除".into()));}
+    Ok(())
+}
 pub fn persist(
     db: &Connection,
     id: &AppId,
@@ -83,7 +89,9 @@ pub fn persist(
                 return Err(StoreError::Invalid("商品归属与店铺不匹配".into()));
             }
             let record_id = external_id(&row["id"])?;
-            db.execute("INSERT INTO vinted_products VALUES(?1,?2,?3,?4) ON CONFLICT(app_id,product_id) DO UPDATE SET payload=excluded.payload,fetched_at=excluded.fetched_at",params![id.as_str(),record_id,row.to_string(),timestamp])?;
+            // A stale list must not erase a deletion confirmed by item details.
+            // Only a successful details read explicitly clears the local marker.
+            db.execute("INSERT INTO vinted_products VALUES(?1,?2,?3,?4) ON CONFLICT(app_id,product_id) DO UPDATE SET payload=CASE WHEN json_extract(vinted_products.payload,'$._rv_deleted')=1 AND json_extract(excluded.payload,'$._rv_deleted') IS NOT 0 THEN vinted_products.payload ELSE excluded.payload END,fetched_at=excluded.fetched_at",params![id.as_str(),record_id,row.to_string(),timestamp])?;
         }
     } else {
         let rows = response["my_orders"]
@@ -157,7 +165,9 @@ pub fn read(
         let amount = text(&payload["price"], "amount").unwrap_or("—");
         let currency = text(&payload["price"], "currency_code").unwrap_or("");
         let state = if dataset == Dataset::Products {
-            if payload["is_hidden"] == true {
+            if payload["_rv_deleted"] == true {
+                "已删除"
+            } else if payload["is_hidden"] == true {
                 "隐藏"
             } else if payload["is_draft"] == true {
                 "草稿"
@@ -167,6 +177,12 @@ pub fn read(
                 "预留"
             } else if payload["is_processing"] == true {
                 "处理中"
+            } else if payload["transaction_permitted"] == true {
+                "可交易"
+            } else if payload["transaction_permitted"] == false {
+                "不可交易"
+            } else if payload["is_hidden"] == false {
+                "激活"
             } else {
                 "状态待确认"
             }

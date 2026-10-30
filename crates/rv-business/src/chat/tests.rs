@@ -573,3 +573,102 @@ async fn interactive_chat_error_preserves_server_reason_and_redacts_token() {
     assert!(error.contains("HTTP 400"));assert!(error.contains("invalid_scope"));assert!(error.contains("request rejected"));assert!(!error.contains("fixture-token"));
     assert!(store.tasks(&ids[0]).unwrap().is_empty());
 }
+
+#[test]
+fn repeated_legacy_system_detail_uses_stable_identity() {
+    let (_dir, paths, mut store, ids) = fixture();
+    let app=store.load(&ids[0]).unwrap();
+    for round in 0..3 {
+        let mut reply=detail();
+        reply["messages"]=json!([
+            {"conversation_id":REMOTE,"id":format!("portal-wrapper-{round}"),"message_type":"legacy_portal_message","sender_id":"0","created_at":"2026-10-13T10:01:00Z","data":{"created_time_ago":format!("{round} minutes"),"entity":{"id":73543542694u64,"body":"<p>Notice</p>"}}},
+            {"conversation_id":REMOTE,"id":format!("action-wrapper-{round}"),"message_type":"legacy_action","sender_id":"0","created_at":"2026-10-13T10:01:00Z","data":{"created_time_ago":format!("{round} minutes"),"event_group":"dsa_appeals","event_type":"appeal_action_link_available","display_group":40,"entity":{"subtitle":"Appeal","actions":[]}}}
+        ]);
+        let batch=vinted::VintedChat.parse_detail(&app,REMOTE,&reply).unwrap();
+        assert_eq!(batch.conversation.preview,"Notice");
+        assert_eq!(batch.messages[1].body,"Appeal");
+        store.business_transaction(|db|repository::persist_detail(db,&ids[0],&batch)).unwrap();
+    }
+    let c=conversations(&paths).unwrap().remove(0);
+    assert_eq!(c.preview,"Notice");
+    assert_eq!(thread(&paths,&c.id).unwrap().messages.len(),2);
+}
+
+#[test]
+fn send_receipt_and_thread_reconcile_in_either_order_by_id() {
+    for receipt_first in [true,false] {
+        let (_dir,paths,mut store,ids)=fixture();
+        let app=store.load(&ids[0]).unwrap();
+        let mut reply=detail();reply["messages"]=json!([]);
+        let empty=vinted::VintedChat.parse_detail(&app,REMOTE,&reply).unwrap();
+        let local=store.business_transaction(|db|{
+            repository::persist_detail(db,&ids[0],&empty)?;
+            repository::begin_send(db,&ids[0],REMOTE,"Same text")
+        }).unwrap();
+        reply["messages"]=json!([{"id":"changing-wrapper","conversation_id":REMOTE,"sender_id":"123","created_at":"2026-10-13T10:01:00Z","message_type":"reply_plain","data":{"id":"9001","content":"Same text"}}]);
+        let batch=vinted::VintedChat.parse_detail(&app,REMOTE,&reply).unwrap();
+        store.business_transaction(|db|{
+            db.execute("UPDATE chat_outbox SET prepared_body='Same text',body='相同文字',source_language='zh',target_language='en' WHERE id=?1",[&local])?;
+            if receipt_first {repository::finish_send(db,&local,"submitted",Some("reply:9001"))?;}
+            repository::persist_detail(db,&ids[0],&batch)?;
+            if !receipt_first {repository::finish_send(db,&local,"submitted",Some("reply:9001"))?;}
+            repository::persist_detail(db,&ids[0],&batch)?;
+            Ok(())
+        }).unwrap();
+        let c=conversations(&paths).unwrap().remove(0);
+        let t=thread(&paths,&c.id).unwrap();
+        assert!(t.pending.is_empty());assert_eq!(t.messages.len(),1);
+        assert_eq!(t.messages[0].id,local);
+        assert_eq!(t.messages[0].translation.as_ref().unwrap().original,"相同文字");
+        assert_eq!(t.messages[0].translation.as_ref().unwrap().translated,"Same text");
+        assert_eq!(t.messages[0].remote_id.as_deref(),Some("reply:9001"));
+        reply["messages"][0]["data"]["id"]=json!("9002");
+        let second=vinted::VintedChat.parse_detail(&app,REMOTE,&reply).unwrap();
+        store.business_transaction(|db|repository::persist_detail(db,&ids[0],&second)).unwrap();
+        assert_eq!(thread(&paths,&c.id).unwrap().messages.len(),2,"identical text with different platform IDs must remain distinct");
+    }
+}
+
+#[test]
+fn old_portal_wrappers_migrate_by_entity_id_preserving_local_identity() {
+    let (_dir,paths,mut store,ids)=fixture();
+    let app=store.load(&ids[0]).unwrap();
+    let mut reply=detail();
+    reply["messages"][0]["message_type"]=json!("legacy_portal_message");
+    reply["messages"][0]["data"]=json!({"entity":{"id":73543542694u64,"body":"Notice"}});
+    let batch=vinted::VintedChat.parse_detail(&app,REMOTE,&reply).unwrap();
+    store.business_transaction(|db|{
+        repository::persist_detail(db,&ids[0],&batch)?;
+        let c=repository::key(db,&ids[0],REMOTE)?;
+        db.execute("DELETE FROM chat_messages",[])?;
+        for n in 0..3 {
+            let mut m=batch.messages[0].clone();m.id=format!("local-{n}");m.remote_id=Some(format!("old-wrapper-{n}"));
+            db.execute("INSERT INTO chat_messages VALUES(?1,?2,?3,?4,?5,?6)",rusqlite::params![m.id,c,m.remote_id,m.created_at,m.body,serde_json::to_string(&m)?])?;
+        }
+        db.execute("UPDATE chat_schema SET version=2",[])?;
+        repository::schema(db)?;
+        repository::schema(db)?;
+        Ok(())
+    }).unwrap();
+    let c=conversations(&paths).unwrap().remove(0);
+    let t=thread(&paths,&c.id).unwrap();assert_eq!(t.messages.len(),1);
+    assert_eq!(t.messages[0].id,"local-0");
+    assert_eq!(t.messages[0].remote_id.as_deref(),Some("portal:73543542694"));
+}
+
+#[test]
+fn local_read_updates_sqlite_immediately_and_survives_old_inbox() {
+    let (_dir,paths,mut store,ids)=fixture();
+    let app=store.load(&ids[0]).unwrap();
+    let batch=vinted::VintedChat.parse_detail(&app,REMOTE,&detail()).unwrap();
+    store.business_transaction(|db|repository::persist_detail(db,&ids[0],&batch)).unwrap();
+    let c=conversations(&paths).unwrap().remove(0);
+    request_read(&paths,&ids[0],&c.id).unwrap();request_read(&paths,&ids[0],&c.id).unwrap();
+    assert!(!conversations(&paths).unwrap()[0].unread);
+    store.business_transaction(|db|repository::persist_conversations(db,&ids[0],std::slice::from_ref(&batch.conversation),false)).unwrap();
+    assert!(!conversations(&paths).unwrap()[0].unread);
+    let count:i64=store.business_transaction(|db|db.query_row("SELECT count(*) FROM chat_read_requests",[],|r|r.get(0)).map_err(Into::into)).unwrap();assert_eq!(count,1);
+    let mut newer=batch.conversation;newer.updated_at=super::service::now()+1;newer.unread=true;
+    store.business_transaction(|db|repository::persist_conversations(db,&ids[0],&[newer],false)).unwrap();
+    assert!(conversations(&paths).unwrap()[0].unread,"new messages can become unread");
+}

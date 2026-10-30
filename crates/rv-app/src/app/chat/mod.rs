@@ -29,7 +29,7 @@ pub(super) struct ChatState {
     pub thread_sequence: u64,
     data_sequences: [u64; 3],
     registry: plugins::Registry,
-    pub scroll: ListState,
+    pub scroll: Entity<rv_gpui_chat::message_scroller::MessageScrollerState>,
     pub remembered: std::collections::HashMap<AppId, String>,
     pub notifications_open: bool,
     pub notifications: Vec<rv_business::notifications::Notification>,
@@ -61,7 +61,7 @@ impl ChatState {
             thread_sequence: 0,
             data_sequences: [0; 3],
             registry: plugins::Registry::default(),
-            scroll: ListState::new(0, ListAlignment::Bottom, px(400.)),
+            scroll: cx.new(|cx| rv_gpui_chat::message_scroller::MessageScrollerState::new(0, cx)),
             remembered: Default::default(),
             notifications_open: false,
             notifications: vec![],
@@ -181,6 +181,7 @@ impl AddressBookApp {
                                 }) {
                                     this.chat.selected = None;
                                     this.chat.thread = Thread::default();
+                                    this.chat.scroll.update(cx, |scroll,cx| scroll.reset(0,cx));
                                     this.chat.thread_sequence += 1;
                                 }
                             }
@@ -207,9 +208,10 @@ impl AddressBookApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.chat.scroll.scroll_to_end();
+        self.chat.scroll.update(cx, |scroll,cx| scroll.scroll_to_end(cx));
         self.chat.selected = Some(id.clone());
         self.chat.thread = Thread::default();
+            self.chat.scroll.update(cx, |scroll,cx| scroll.reset(0,cx));
         let text = draft(self.book.paths(), &id).unwrap_or_default();
         self.chat
             .composer
@@ -217,14 +219,6 @@ impl AddressBookApp {
         self.reload_chat_thread(cx);
         if let Some(c) = self.chat.selected().cloned() {
             self.chat.remembered.insert(c.app_id.clone(), c.id.clone());
-            if self
-                .chat
-                .accounts
-                .iter()
-                .any(|a| a.id == c.app_id && a.can_send)
-            {
-                if !self.read_only {self.run_chat_sync(c.app_id.clone(),ChatSync::Thread(c.id.clone()),false,cx);}
-            }
         }
         cx.notify();
     }
@@ -253,18 +247,35 @@ impl AddressBookApp {
                 this.chat.thread_loading = false;
                 match result {
                     Ok(thread) => {
-                        if this.chat.thread.messages.is_empty() {
-                            this.chat.scroll.scroll_to_end();
-                        }
-                        let follow = this.chat.thread.messages.is_empty()
-                            || this.chat.scroll.is_scrolled_to_end().unwrap_or(true);
-                        this.chat
-                            .scroll
-                            .reset(thread.messages.len() + thread.pending.len());
-                        if follow {
-                            this.chat.scroll.scroll_to_end();
-                        }
+                        let old: Vec<_> = this.chat.thread.messages.iter().chain(&this.chat.thread.pending).collect();
+                        let new: Vec<_> = thread.messages.iter().chain(&thread.pending).collect();
+                        let prefix = old.iter().zip(&new).take_while(|(a,b)| a.id == b.id).count();
+                        let suffix = old[prefix..].iter().rev().zip(new[prefix..].iter().rev())
+                            .take_while(|(a,b)| a.id == b.id).count();
+                        let fresh = old.is_empty();
+                        this.chat.scroll.update(cx, |scroll,cx| {
+                            let follow = fresh || !scroll.is_scrolled_up();
+                            if prefix + suffix < old.len() || prefix + suffix < new.len() {
+                                scroll.splice(prefix..old.len()-suffix, new.len()-prefix-suffix, cx);
+                            }
+                            scroll.remeasure_items(0..new.len(),cx);
+                            if follow { scroll.scroll_to_end(cx); }
+                        });
+                        let read = !this.read_only && this.chat.window.is_some()
+                            && !this.chat.notifications_open && !thread.messages.is_empty();
                         this.chat.thread = thread;
+                        if let Some(c)=this.chat.selected().filter(|c|read && c.unread && this.chat.account.as_ref()==Some(&c.app_id)).cloned() {
+                            let paths=this.book.paths().clone();
+                            cx.spawn(async move |this,cx| {
+                                let result=cx.background_executor().spawn(async move {
+                                    rv_business::chat::request_read(&paths,&c.app_id,&c.id)
+                                }).await;
+                                let _=this.update(cx,|this,cx|match result {
+                                    Ok(())=>this.reload_chat_data([false,true,false],false,cx),
+                                    Err(error)=>this.chat_error(error,cx),
+                                });
+                            }).detach();
+                        }
                     }
                     Err(error) => this.chat_error(error, cx),
                 }
@@ -299,9 +310,6 @@ impl AddressBookApp {
     fn refresh_chat(&mut self,cx:&mut Context<Self>) {
         if let Some(id)=self.chat.account.clone() {
             self.run_chat_sync(id.clone(),ChatSync::Inbox,true,cx);
-            if let Some(c)=self.chat.selected().cloned().filter(|c|c.app_id==id) {
-                self.run_chat_sync(id,ChatSync::Thread(c.id),false,cx);
-            }
         }
     }
     fn send_chat(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
@@ -342,7 +350,7 @@ impl AddressBookApp {
             if self.chat.selected.as_ref() == Some(&id)
                 && self.chat.composer.read(cx).value().as_ref() == text
             {
-                self.chat.scroll.scroll_to_end();
+                self.chat.scroll.update(cx, |scroll,cx| scroll.scroll_to_end(cx));
                 self.chat
                     .composer
                     .update(cx, |state, cx| state.set_value("", window, cx));
@@ -363,6 +371,7 @@ impl AddressBookApp {
         {
             self.chat.selected = None;
             self.chat.thread = Thread::default();
+            self.chat.scroll.update(cx, |scroll,cx| scroll.reset(0,cx));
             self.chat.thread_sequence += 1;
         }
         if let Some(id) = self

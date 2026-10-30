@@ -42,7 +42,8 @@ pub(in crate::app) trait AppRenderer {
     fn datasets(&self) -> &'static [rv_business::data::Dataset] {
         &[]
     }
-    fn card_preview(&self, row: Option<&rv_business::data::BusinessRow>, cx: &App) -> AnyElement {
+    fn preview_refresh_id(&self, _: &rv_business::data::BusinessRow) -> Option<String> { None }
+    fn card_preview(&self, row: Option<&rv_business::data::BusinessRow>, _refresh: Option<AnyElement>, cx: &App) -> AnyElement {
         row.map(|row| self.business_row(row, cx))
             .unwrap_or_else(|| div().into_any_element())
     }
@@ -189,11 +190,12 @@ impl AppRenderer for VintedRenderer {
     }
 
     fn business_row(&self, row: &rv_business::data::BusinessRow, cx: &App) -> AnyElement {
-        vinted_product(row, 64., false, cx)
+        vinted_product(row, 64., false, None, cx)
     }
-    fn card_preview(&self, row: Option<&rv_business::data::BusinessRow>, cx: &App) -> AnyElement {
+    fn preview_refresh_id(&self, row: &rv_business::data::BusinessRow) -> Option<String> { Some(row.id.clone()) }
+    fn card_preview(&self, row: Option<&rv_business::data::BusinessRow>, refresh: Option<AnyElement>, cx: &App) -> AnyElement {
         if let Some(row) = row {
-            return vinted_product(row, 72., true, cx);
+            return vinted_product(row, 56., true, refresh, cx);
         }
         div().into_any_element()
     }
@@ -225,7 +227,7 @@ impl AppRenderer for VintedRenderer {
         vinted_status(app, expiry, cx)
     }
 }
-fn vinted_product(row: &rv_business::data::BusinessRow, size: f32, compact: bool, cx: &App) -> AnyElement {
+fn vinted_product(row: &rv_business::data::BusinessRow, size: f32, compact: bool, refresh: Option<AnyElement>, cx: &App) -> AnyElement {
     let photo:AnyElement=if let Some(path)=&row.visual.image_path {
         img(path.clone())
             .size(px(size))
@@ -252,11 +254,10 @@ fn vinted_product(row: &rv_business::data::BusinessRow, size: f32, compact: bool
                 .min_w_0()
                 .gap_1()
                 .child(
-                    div()
-                        .text_sm()
-                        .font_normal()
-                        .text_ellipsis()
-                        .child(row.title.clone()),
+                    h_flex().min_w_0().gap_1().child(
+                        div().flex_1().min_w_0().text_sm().font_normal()
+                            .text_ellipsis().child(row.title.clone())
+                    ).children(refresh),
                 )
                 .child(
                     h_flex()
@@ -276,6 +277,15 @@ fn vinted_product(row: &rv_business::data::BusinessRow, size: f32, compact: bool
                                 .child(icon.small());
                             if !compact {status=status.child(div().text_xs().child(label.clone()));}
                             status
+                        }))
+                        .children([
+                            ("views", IconName::Eye, row.visual.view_count, "浏览量"),
+                            ("favourites", IconName::Heart, row.visual.favourite_count, "喜欢量"),
+                        ].into_iter().filter_map(|(key,icon,count,label)| {
+                            count.map(|count| metric(
+                                format!("product-{key}-{}",row.id).into(),
+                                Icon::new(icon).small(),count.to_string(),label,cx,
+                            ))
                         })),
                 ),
         )
@@ -283,6 +293,8 @@ fn vinted_product(row: &rv_business::data::BusinessRow, size: f32, compact: bool
 }
 fn product_status(label:&str,cx:&App)->(Icon,Hsla) {
     let icon=match label {
+        "已删除"=>Icon::new(IconName::Delete),
+        "激活"=>Icon::new(IconName::Eye),
         "隐藏"=>Icon::new(IconName::EyeOff),
         "不可交易"=>Icon::new(IconName::CircleX),
         "延迟发布"=>Icon::new(FunctionIcon::Recent),
@@ -290,17 +302,18 @@ fn product_status(label:&str,cx:&App)->(Icon,Hsla) {
         "预留"=>Icon::new(IconName::Pause),
         "处理中"=>Icon::new(IconName::LoaderCircle),
         "已关闭"=>Icon::new(FunctionIcon::Archive),
-        "已完成"=>Icon::new(IconName::CircleCheck),
+        "可交易"|"已完成"=>Icon::new(IconName::CircleCheck),
         "待发货"=>Icon::new(FunctionIcon::Products),
         "卖出"=>Icon::new(IconName::ArrowUp),
         "买入"=>Icon::new(IconName::ArrowDown),
         _=>Icon::new(IconName::Info),
     };
     let color=match label {
+        "已删除"=>theme::danger(cx),
         "隐藏"=>theme::muted(cx),
         "不可交易"=>theme::warning(cx),
         "延迟发布"|"处理中"|"待发货"=>theme::warning(cx),
-        "预留"|"已完成"=>theme::success(cx),
+        "激活"|"可交易"|"预留"|"已完成"=>theme::success(cx),
         "已关闭"|"草稿"=>theme::muted(cx),
         _=>theme::accent(cx),
     };

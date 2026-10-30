@@ -1,9 +1,57 @@
 //! Native chat window reuses the existing controller and three-column view.
 use super::*;
-use gpui_component::{Root,TitleBar,TITLE_BAR_HEIGHT,v_flex};
+use gpui_component::{Root,TitleBar,TITLE_BAR_HEIGHT,v_flex,Sizable};
 use crate::theme;
+use crate::assets::FunctionIcon;
+use gpui_component::dock::{BasePanel, Panel, PanelEvent, PanelControl, DockArea, DockLayout, panel_handle};
+
+#[derive(Clone, Copy)]
+enum ChatPane { Stores, Conversations, Messages }
+struct ChatDockPanel {
+    owner: WeakEntity<AddressBookApp>,
+    pane: ChatPane,
+    focus: FocusHandle,
+    _updates: Subscription,
+}
+impl EventEmitter<PanelEvent> for ChatDockPanel {}
+impl Focusable for ChatDockPanel {
+    fn focus_handle(&self, _: &App)->FocusHandle { self.focus.clone() }
+}
+impl BasePanel for ChatDockPanel {
+    fn panel_name(&self)->&'static str { match self.pane { ChatPane::Stores=>"ChatStores",ChatPane::Conversations=>"ChatConversations",ChatPane::Messages=>"ChatMessages" } }
+    fn closable(&self,_:&App)->bool { false }
+}
+impl Panel for ChatDockPanel {
+    fn title(&mut self,_:&mut Window,_:&mut Context<Self>)->impl IntoElement {
+        div()
+    }
+    fn tab_name(&self,_:&App)->Option<SharedString> {
+        Some(match self.pane { ChatPane::Stores=>"店铺",ChatPane::Conversations=>"会话 / 通知",ChatPane::Messages=>"消息" }.into())
+    }
+    fn inner_padding(&self,_:&App)->bool { false }
+    fn zoom_control(&self,_:&App)->Option<PanelControl> { None }
+}
+impl Render for ChatDockPanel {
+    fn render(&mut self,_:&mut Window,cx:&mut Context<Self>)->impl IntoElement {
+        let pane=self.pane;
+        let content=self.owner.update(cx,|app,cx| match pane {
+            ChatPane::Stores=>app.render_chat_stores(cx),
+            ChatPane::Conversations=>app.render_chat_conversations(cx),
+            ChatPane::Messages=>app.render_chat_content(cx),
+        }).unwrap_or_else(|_|div().into_any_element());
+        let panel=v_flex().id(self.panel_name()).role(Role::Group)
+            .aria_label(match pane {ChatPane::Stores=>"店铺列表",ChatPane::Conversations=>"会话与通知",ChatPane::Messages=>"消息内容"})
+            .track_focus(&self.focus).size_full().min_w_0().min_h_0().overflow_hidden();
+        let panel=match pane {
+            ChatPane::Stores=>panel.p_2(),
+            ChatPane::Conversations|ChatPane::Messages=>panel,
+        };
+        panel.child(content)
+    }
+}
 
 struct ChatWindow {
+    dock: Entity<DockArea>,
     owner:Entity<AddressBookApp>,
     _updates:Subscription,
     _appearance:Subscription,
@@ -26,25 +74,38 @@ impl ChatWindow {
             });
         })).detach();
         let focus=cx.focus_handle();focus.focus(window,cx);
-        Self{owner,_updates:updates,_appearance:appearance,controls:Default::default(),focus}
+        // Native undecorated DockArea keeps split resizing without redundant panel title bars.
+        let dock=cx.new(|cx|DockArea::new("chat-dock",None,window,cx));
+        let panels=[ChatPane::Stores,ChatPane::Conversations,ChatPane::Messages].map(|pane| {
+            cx.new(|cx| ChatDockPanel {
+                owner:owner.downgrade(),pane,focus:cx.focus_handle(),
+                _updates:cx.observe(&owner,|_,_,cx|cx.notify()),
+            })
+        });
+        dock.update(cx,|area,cx| {
+            let mut layout=DockLayout::h_split();
+            for (panel,width) in panels.into_iter().zip([Some(px(190.)),Some(px(260.)),None]) {
+                layout=layout.child(DockLayout::tabs().panel_view(panel_handle(panel),cx),width);
+            }
+            area.set_center(layout,window,cx);
+        });
+        Self{dock,owner,_updates:updates,_appearance:appearance,controls:Default::default(),focus}
     }
 }
 impl Render for ChatWindow {
     fn render(&mut self,window:&mut Window,cx:&mut Context<Self>)->impl IntoElement {
         self.controls.sync(window,theme::is_dark(cx));
-        let height=f32::from((window.viewport_size().height-TITLE_BAR_HEIGHT).max(px(100.)));
-        let body=self.owner.update(cx,|app,cx| {
+        self.owner.update(cx,|app,cx| {
             app.notify_status(window,cx);
             app.apply_chat_input_result(window,cx);
-            app.render_chat(height,cx)
         });
-        v_flex().id("chat-window").debug_selector(||"chat-window".into())
+        v_flex().id("chat-window").role(Role::Group).aria_label("消息窗口").debug_selector(||"chat-window".into())
             .size_full().relative().bg(theme::surface(cx)).text_sm()
             .key_context("ChatWindow").track_focus(&self.focus)
             .on_action(|_:&crate::actions::ChatClose,window,_|window.remove_window())
             .on_action(|_:&crate::actions::QuitApp,_,cx|cx.quit())
-            .child(TitleBar::new().child("消息"))
-            .child(body)
+            .child(TitleBar::new().child(gpui_component::Icon::new(FunctionIcon::Chat).small()))
+            .child(div().flex_1().min_h_0().w_full().child(self.dock.clone()))
             .children(Root::render_dialog_layer(window,cx))
             .children(Root::render_notification_layer(window,cx))
     }

@@ -3591,6 +3591,8 @@ impl Render for FileTransferView {
         let fullscreen = window.is_fullscreen();
         v_flex()
             .id("file-transfer-drop-target")
+            .role(Role::Group)
+            .aria_label("文件传输")
             .debug_selector(|| "file-transfer-drop-target".into())
             .size_full()
             .relative()

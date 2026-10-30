@@ -2,12 +2,13 @@ use super::*;
 use crate::{assets::FunctionIcon, theme};
 use gpui::prelude::FluentBuilder;
 use gpui_component::{
-    Disableable, Icon, IconName, Selectable, StyledExt,
+    Disableable, Icon, IconName, Selectable, Sizable, StyledExt,
     button::{Button, ButtonVariants},
     h_flex,
     input::Input,
     menu::{DropdownMenu, PopupMenuItem},
     tooltip::Tooltip,
+    popover::Popover,
     v_flex,
 };
 
@@ -105,6 +106,7 @@ impl AddressBookApp {
     }
     fn render_app_filters(&self, cx: &mut Context<Self>) -> AnyElement {
         let tags = self.home.available_tags.clone();
+        let tag_label=self.home.tag.clone().unwrap_or("标签".into());
         h_flex()
             .flex_wrap()
             .gap_1()
@@ -128,7 +130,8 @@ impl AddressBookApp {
                             AppFilter::Recent => FunctionIcon::Recent,
                             AppFilter::Archived => FunctionIcon::Archive,
                         })
-                        .label(name)
+                        .accessibility_label(name)
+                        .child(div().text_xs().child(name))
                         .selected(
                             std::mem::discriminant(&self.home.filter)
                                 == std::mem::discriminant(&filter),
@@ -143,7 +146,8 @@ impl AddressBookApp {
                 Button::new("app-tags")
                     .ghost()
                     .icon(FunctionIcon::Tags)
-                    .label(self.home.tag.clone().unwrap_or("标签".into()))
+                    .accessibility_label(tag_label.clone())
+                    .child(div().text_xs().child(tag_label))
                     .dropdown_menu({
                         let book = cx.entity();
                         move |menu, _, _| {
@@ -183,37 +187,6 @@ impl AddressBookApp {
                         format!("{} 项", self.home.apps.len())
                     }),
             )
-            .child(
-                Button::new("app-sort")
-                    .ghost()
-                    .icon(IconName::SortDescending)
-                    .label(match self.home.sort {
-                        AppSort::Updated => "最近更新",
-                        AppSort::Title => "名称",
-                        AppSort::LastUsed => "最近使用",
-                    })
-                    .dropdown_menu({
-                        let owner = cx.entity();
-                        move |mut menu, _, _| {
-                            for (label, sort) in [
-                                ("最近更新", AppSort::Updated),
-                                ("名称", AppSort::Title),
-                                ("最近使用", AppSort::LastUsed),
-                            ] {
-                                let owner = owner.clone();
-                                menu = menu.item(PopupMenuItem::new(label).on_click(
-                                    move |_, _, cx| {
-                                        owner.update(cx, |this, cx| {
-                                            this.home.sort = sort;
-                                            this.reload_home(cx);
-                                        });
-                                    },
-                                ));
-                            }
-                            menu
-                        }
-                    }),
-            )
             .into_any_element()
     }
     fn render_app_card(
@@ -230,6 +203,19 @@ impl AddressBookApp {
             .unwrap_or_default();
         let renderer = self.home.plugins.for_bundle(&app.bundle_id);
         let (name, _symbol, _accent, _action) = renderer.identity(app);
+        let preview = self.home.previews.get(&app.id);
+        let refresh = preview.and_then(|row| renderer.preview_refresh_id(row)).map(|product_id| {
+            let id = app.id.clone();
+            let busy = self.home.product_syncs.contains(&(id.clone(), product_id.clone()));
+            Button::new(SharedString::from(format!("card-product-refresh-{}", id.as_str())))
+                .ghost().small().icon(FunctionIcon::Refresh)
+                .accessibility_label("刷新此商品")
+                .loading(busy).disabled(self.read_only || busy)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.refresh_card_product(id.clone(), product_id.clone(), cx);
+                })).into_any_element()
+        });
         let edit = app.id.clone();
         let favorite = app.id.clone();
         let menu_id = app.id.clone();
@@ -308,11 +294,26 @@ impl AddressBookApp {
                             .child(renderer.display_title(app)),
                     )
                     .child(
-                        div()
+                        h_flex()
+                            .min_w_0()
+                            .gap_2()
+                            .items_center()
                             .text_xs()
                             .text_color(theme::muted(cx))
-                            .text_ellipsis()
-                            .child(name),
+                            .child(div().flex_shrink_0().max_w_full().text_ellipsis().child(name))
+                            .when_some(app.tags.first(), |row, tag| {
+                                row.child(
+                                    div()
+                                        .id(format!("app-card-tags-{}", app.id.as_str()))
+                                        .debug_selector({
+                                            let id = app.id.clone();
+                                            move || format!("app-card-tags-{}", id.as_str())
+                                        })
+                                        .min_w_0()
+                                        .text_ellipsis()
+                                        .child(tag.clone()),
+                                )
+                            }),
                     ),
             )
             .child(
@@ -359,24 +360,7 @@ impl AddressBookApp {
                 .p_3()
                 .gap_2()
                 .child(header)
-                .when(!app.tags.is_empty(), |body| {
-                    body.child(
-                        h_flex()
-                            .id(format!("app-card-tags-{}", app.id.as_str()))
-                            .debug_selector({
-                                let id = app.id.clone();
-                                move || format!("app-card-tags-{}", id.as_str())
-                            })
-                            .gap_1()
-                            .items_center()
-                            .flex_wrap()
-                            .child(Icon::new(FunctionIcon::Tags).text_color(theme::muted(cx)))
-                            .children(app.tags.iter().map(|tag| {
-                                gpui_component::tag::Tag::secondary().child(tag.clone())
-                            })),
-                    )
-                })
-                .child(renderer.card_preview(self.home.previews.get(&app.id), cx))
+                .child(renderer.card_preview(preview, refresh, cx))
                 .child(
                     h_flex()
                         .gap_2()
@@ -425,7 +409,7 @@ impl AddressBookApp {
                 });
         let footer = h_flex()
             .px_3()
-            .py_2()
+            .py_0p5()
             .gap_2()
             .border_t_1()
             .border_color(theme::line(cx))
@@ -448,19 +432,19 @@ impl AddressBookApp {
                     .child(sources.first().cloned().unwrap_or_default()),
             )
             .when(!links.is_empty(), |footer| {
+                let owner=cx.entity();
                 footer.child(
-                    Button::new(SharedString::from(format!(
-                        "app-backup-info-{}",
-                        app.id.as_str()
-                    )))
-                    .ghost()
-                    .icon(IconName::Info)
-                    .tooltip("手机备份详情")
-                    .accessibility_label("手机备份详情")
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        cx.stop_propagation();
-                        this.show_backup_info(backup_details.clone(), window, cx);
-                    })),
+                    Popover::new(SharedString::from(format!("backup-info-popover-{}",app.id.as_str())))
+                        .trigger(Button::new(SharedString::from(format!("app-backup-info-{}",app.id.as_str())))
+                            .debug_selector({let id=app.id.clone(); move ||format!("app-backup-info-{}",id.as_str())})
+                            .ghost().small().icon(IconName::Info).accessibility_label("手机备份详情"))
+                        .content(move |_,window,cx| owner.update(cx,|this,cx| {
+                            v_flex().id("backup-info-scroll")
+                                .w(px((f32::from(window.viewport_size().width)-48.).min(440.)))
+                                .max_h(px((f32::from(window.viewport_size().height)-64.).max(100.)))
+                                .overflow_y_scroll()
+                                .child(this.render_backup_info(&backup_details,cx))
+                        })),
                 )
             });
         v_flex()

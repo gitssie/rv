@@ -349,7 +349,7 @@ fn opening_version_nine_reinitializes_empty_task_schema_and_preserves_apps() {
         .db
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 14);
+    assert_eq!(version, 15);
 }
 #[test]
 fn incompatible_nonempty_task_schema_is_not_deleted() {

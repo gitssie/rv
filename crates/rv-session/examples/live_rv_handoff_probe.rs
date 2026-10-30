@@ -16,7 +16,7 @@ async fn event(session:&SessionHandle,deadline:Instant)->Result<SessionEvent,Err
 async fn main()->Result<(),Error>{
     let args:Vec<_>=std::env::args().skip(1).collect();
     let action=args.first().ok_or("action required")?;
-    if !matches!(action.as_str(),"inspect"|"phone-token"|"takeover"|"handoff"){return Err("unsupported action".into());}
+    if !matches!(action.as_str(),"inspect"|"inspect-state"|"phone-token"|"takeover"|"handoff"){return Err("unsupported action".into());}
     let id=AppId::from_idfv(args.get(1).ok_or("IDFV required")?)?;
     let paths=StorePaths::default_dir()?;
     let book=AddressBook::load(paths.clone())?;
@@ -29,6 +29,32 @@ async fn main()->Result<(),Error>{
         println!("7Plus authenticated through production HTTP/2 controller");
         let mut store=WorkspaceStore::open(&paths)?;
         store.load(&id)?;
+        if action=="inspect-state" {
+            let local=store.auth(&id)?.ok_or("missing local credentials")?;
+            let saved=store.app_state(&id)?.ok_or("missing imported state")?;
+            let ctx=local.request_context().ok_or("missing device context")?;
+            let original=ShadowAppState::decode(&id,BUNDLE,saved.manifest().to_vec(),saved.archive().to_vec(),AppDeviceInfo{model:ctx.model,os_version:ctx.os_version})?;
+            let imported=original.request_auth()?;
+            println!("Current credentials match imported archive: access={}, refresh={}",local.access_token==imported.access_token,local.refresh_token==imported.refresh_token);
+            let manifest=plist::Value::from_reader(std::io::Cursor::new(saved.manifest()))?;
+            if let Some(fields)=manifest.as_dictionary(){
+                for key in ["date","createdAt","updatedAt","timestamp"] {
+                    if let Some(value)=fields.get(key){println!("manifest {key}={value:?}");}
+                }
+            }
+            session.app(AppCommand::ReadProfile{app_id:id.clone(),bundle:BUNDLE.into(),backup:format!("snapshot:{}",id.as_str())});
+            let deadline=Instant::now()+Duration::from_secs(60);
+            loop {match event(&session,deadline).await? {
+                SessionEvent::Apps(AppEvent::Profile(profile))=>{
+                    let phone=profile.state.request_auth()?;
+                    println!("Current phone backup matches imported archive: archive={}, access={}, refresh={}",state_sha256(profile.state.archive())==state_sha256(original.archive()),phone.access_token==imported.access_token,phone.refresh_token==imported.refresh_token);
+                    println!("Imported access expiry={:?}; current phone backup access expiry={:?}",imported.token_expirations().access,phone.token_expirations().access);
+                    break;
+                },
+                SessionEvent::Apps(AppEvent::Failed{message,..})=>return Err(message.into()),_=>{}
+            }}
+            return Ok::<_,Error>(());
+        }
         if action=="phone-token"{
             let bus=workspace_bus(&paths)?;let results=bus.subscribe::<PhoneTokenResult>();
             store.set_token_source(&id,TokenSource::Phone(Some(device.id)))?;

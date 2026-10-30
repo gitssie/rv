@@ -144,6 +144,13 @@ impl WorkspaceStore {
         self.publish_changes();
         Ok(state)
     }
+    /// State replacement is only offered when credentials are missing, expired,
+    /// or explicitly rejected. An unknown expiry is not evidence of invalidity.
+    pub fn state_repair_needed(&self,id:&AppId)->Result<bool,StoreError> {
+        Ok(self.auth(id)?.is_none_or(|auth|auth.access_token.is_empty()
+            || auth.access_token_rejected()
+            || auth.token_expirations().access.is_some_and(|expiry|expiry<=models::now())))
+    }
     pub fn validate_rv_takeover(
         &self,
         id: &AppId,
@@ -156,6 +163,13 @@ impl WorkspaceStore {
         }
         match self.token_source(id)? {
             TokenSource::Phone(Some(source)) if source == device => {}
+            // Explicit state repair may adopt a linked phone backup while RV
+            // already owns refresh. Ordinary imports still preserve RV tokens.
+            TokenSource::Rv if execution.mode == ExecutionMode::Rv => {
+                if !self.state_repair_needed(id)? {
+                    return Err(StoreError::Invalid("访问令牌仍可用，不能用手机备份覆盖 RV 状态".into()));
+                }
+            }
             TokenSource::Rv if execution.mode == ExecutionMode::Phone && execution.device_id == Some(device) => {}
             _ => return Err(StoreError::Invalid("请选择提供账号凭据的手机备份".into())),
         }

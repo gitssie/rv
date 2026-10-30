@@ -19,7 +19,7 @@ fn domain(table: &str) -> Option<ChangeDomain> {
         | "app_proxy_bindings"
         | "socks_proxies"
         | "proxy_engine_settings" => Apps,
-        "app_auth" | "app_states" | "app_request_sessions" | "app_token_sources" => Credentials,
+        "app_auth" | "app_states" | "app_request_sessions" | "app_token_sources" | "app_login_credentials" => Credentials,
         "app_execution" => Execution,
         "chat_conversations" => Conversations,
         "chat_messages" | "chat_outbox" | "chat_outbox_images" => Messages,

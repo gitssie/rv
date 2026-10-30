@@ -16,7 +16,12 @@ fn id(v: &Value) -> Result<String, String> {
 }
 // The gateway regenerates wrapper UUIDs for bridged replies on each read.
 // The reply entity ID is stable and is also returned by the send endpoint.
-fn message_id(v: &Value) -> Result<String, String> {
+pub(super) fn message_id(v: &Value) -> Result<String, String> {
+    if v["message_type"].as_str() == Some("legacy_portal_message") {
+        if let Some(entity_id)=v["data"]["entity"].get("id") {
+            return id(entity_id).map(|id|format!("portal:{id}"));
+        }
+    }
     let stable = match v["message_type"].as_str() {
         Some("legacy_reply") => v["data"]["entity"].get("id"),
         Some("reply_plain") => v["data"].get("id"),
@@ -38,7 +43,7 @@ fn time(v: &Value) -> i64 {
         })
         .unwrap_or(0)
 }
-fn text(v: &Value) -> String {
+pub(super) fn text(v: &Value) -> String {
     if v["data"]["is_message_content_hidden"].as_bool() == Some(true)
         || v["data"]["entity"]["is_hidden"].as_bool() == Some(true)
     {
@@ -51,11 +56,11 @@ fn text(v: &Value) -> String {
         "legacy_portal_message" | "legacy_reply" => {
             super::notice::plain_text(v["data"]["entity"]["body"].as_str().unwrap_or(""))
         }
-        "legacy_action" => v["data"]["content"]
+        "legacy_action" => super::notice::plain_text(v["data"]["content"]
             .as_str()
-            .or_else(|| v["data"]["entity"]["body"].as_str())
-            .unwrap_or("系统事件")
-            .to_owned(),
+            .or_else(||v["data"]["entity"]["body"].as_str())
+            .or_else(||v["data"]["entity"]["subtitle"].as_str())
+            .unwrap_or("系统事件")),
         _ => v["data"]["content"]
             .as_str()
             .unwrap_or("此消息类型暂不支持展示")
@@ -152,6 +157,7 @@ fn conversation(app: &AppInstance, v: &Value) -> Result<Conversation, String> {
         .as_array()
         .into_iter()
         .flatten()
+        .filter(|m|m["message_type"].as_str()!=Some("legacy_action"))
         .max_by_key(|m| time(&m["created_at"]))
         .unwrap_or(last);
     let preview = text(latest);

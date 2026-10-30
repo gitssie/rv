@@ -1,4 +1,5 @@
 use super::*;
+use gpui::prelude::FluentBuilder;
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::{
     Disableable,
@@ -20,6 +21,12 @@ impl AddressBookApp {
             .gap_3()
             .child(
                 Form::vertical()
+                    .when(self.home.editing.as_ref().is_some_and(|app| rv_business::strategy(&app.bundle_id).is_some()), |form| {
+                        form.child(Field::new().label("登录用户名")
+                            .child(Input::new(&self.home.login_username).disabled(true)))
+                            .child(Field::new().label("登录密码（本地记录）")
+                                .child(Input::new(&self.home.login_password).disabled(self.read_only)))
+                    })
                     .child(
                         Field::new()
                             .label("标签")

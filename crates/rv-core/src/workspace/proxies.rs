@@ -148,11 +148,29 @@ impl WorkspaceStore {
         app: &super::AppInstance,
         proxy: Option<&str>,
     ) -> Result<super::AppInstance, StoreError> {
+        self.save_with_proxy_and_login(app, proxy, None)
+    }
+    /// Save the editor's app settings and known login credentials atomically.
+    pub fn save_with_proxy_and_login(
+        &mut self,
+        app: &super::AppInstance,
+        proxy: Option<&str>,
+        login: Option<&super::AppLoginCredentials>,
+    ) -> Result<super::AppInstance, StoreError> {
         self.db.execute_batch("SAVEPOINT edit_app_proxy")?;
         let checkpoint = self.changes.checkpoint();
         let result = (|| {
             let saved = self.save(app)?;
             self.bind_proxy(&app.id, proxy)?;
+            if let Some(login) = login {
+                let mut login = login.clone();
+                // The editor displays a read-only username. A background profile
+                // sync may have renamed it since the editor was opened.
+                if let Some(current) = self.login_credentials(&app.id)? {
+                    login.username = current.username;
+                }
+                super::login_credentials::write_login_credentials(&self.db, &app.id, &login)?;
+            }
             Ok(saved)
         })();
         match result {

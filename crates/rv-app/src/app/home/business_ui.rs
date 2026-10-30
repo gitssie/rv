@@ -159,7 +159,7 @@ impl AddressBookApp {
             read.into_any_element()
         };
         toolbar
-            .child(self.render_token_source(cx))
+            .child(self.render_phone_token_button(cx))
             .child(self.render_set_avatar_button(cx))
             .child(read)
             .child(self.render_phone_handoff_button(cx))
@@ -226,6 +226,26 @@ impl AddressBookApp {
         };
         if has(&[Apps, Credentials, Execution, Products]) {
             self.reload_home(cx);
+        }
+        // Task changes only update the cached indicator, without reloading the card grid.
+        if has(&[Tasks]) {
+            match WorkspaceStore::open(self.book.paths()) {
+                Ok(store) => {
+                    for (id, context) in &mut self.home.card_context {
+                        if !changes.iter().any(|change| change.domain == Tasks
+                            && change.app_id.as_deref().is_none_or(|app| app == id.as_str())) {
+                            continue;
+                        }
+                        match store.configured_tasks(id) {
+                            Ok(tasks) => context.keepalive_enabled = tasks.iter()
+                                .any(|task| task.kind == "refresh" && task.enabled),
+                            Err(error) => tracing::warn!(%error, "Could not update keepalive indicator"),
+                        }
+                    }
+                    cx.notify();
+                }
+                Err(error) => tracing::warn!(%error, "Could not load keepalive indicators"),
+            }
         }
         if shop_changed(&[Apps, Credentials, Execution]) {
             if let Some(id) = &editing {
@@ -375,21 +395,27 @@ impl AddressBookApp {
             .children(plugin.datasets().iter().map(|&tab| {
                 let count = view.counts[if tab == Dataset::Products { 0 } else { 1 }];
                 Tab::new()
+                    .min_w_20()
                     .prefix(Icon::new(if tab == Dataset::Products {
                         FunctionIcon::Products
                     } else {
                         FunctionIcon::Orders
                     }))
-                    .label(tab.label())
+                    .child(div().text_xs().child(tab.label()))
                     .aria_label(tab.label())
                     .when(count > 0, |tab| {
-                        tab.suffix(Badge::new().count(count).color(theme::accent(cx)))
+                        tab.suffix(h_flex().w_8().h_6().pt_2().items_center().flex_shrink_0().child(
+                            Badge::new().count(count).color(theme::accent(cx))
+                                .child(div().w_4().h_4()),
+                        ))
                     })
             }))
             .child(
                 Tab::new()
+                    .min_w_20()
                     .prefix(Icon::new(gpui_component::IconName::Settings2))
-                    .label("任务配置"),
+                    .aria_label("任务配置")
+                    .child(div().text_xs().child("任务配置")),
             );
         let toolbar = h_flex()
             .gap_2()

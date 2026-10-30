@@ -49,8 +49,14 @@ pub fn request_sync(
 }
 pub fn request_read(paths: &StorePaths, app: &AppId, conversation: &str) -> Result<(), String> {
     let mut store = WorkspaceStore::open(paths).map_err(|e| e.to_string())?;
-    writable(&mut store, app).map_err(|e| e.to_string())?;
-    store.business_transaction(|db|{super::repository::schema(db)?;db.execute("INSERT INTO chat_read_requests(conversation_id,requested_at) SELECT id,?3 FROM chat_conversations WHERE id=?1 AND app_id=?2 AND unread=1 ON CONFLICT(conversation_id) DO UPDATE SET requested_at=excluded.requested_at",params![conversation,app.as_str(),super::service::now()])?;Ok(())}).map_err(|e|e.to_string())
+    // Reading cached messages records intent even while the token is unavailable.
+    // The existing read task performs HTTP and waits for credentials as needed.
+    store.business_transaction(|db|{
+        super::repository::schema(db)?;
+        db.execute("INSERT INTO chat_read_requests(conversation_id,requested_at) SELECT id,?3 FROM chat_conversations WHERE id=?1 AND app_id=?2 AND unread=1 ON CONFLICT(conversation_id) DO UPDATE SET requested_at=excluded.requested_at",params![conversation,app.as_str(),super::service::now()])?;
+        db.execute("UPDATE chat_conversations SET unread=0,data=json_set(data,'$.unread',json('false')) WHERE id=?1 AND app_id=?2 AND EXISTS(SELECT 1 FROM chat_read_requests WHERE conversation_id=?1)",params![conversation,app.as_str()])?;
+        Ok(())
+    }).map_err(|e|e.to_string())
 }
 pub fn cancel_queued(paths: &StorePaths, conversation: &str, id: &str) -> Result<(), String> {
     let mut store = WorkspaceStore::open(paths).map_err(|e| e.to_string())?;

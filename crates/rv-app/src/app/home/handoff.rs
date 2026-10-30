@@ -1,8 +1,9 @@
-//! Explicit RV → phone backup handoff. This never restores or launches the phone app.
+//! Explicit bidirectional backup handoff. This never restores or launches the phone app.
 use super::*;
 use crate::{assets::FunctionIcon, theme};
+use gpui::prelude::FluentBuilder;
 use gpui_component::{
-    Disableable, Icon,
+    Disableable, Icon, WindowExt,
     button::{Button, ButtonVariants},
     menu::{DropdownMenu, PopupMenuItem},
     tooltip::Tooltip,
@@ -18,6 +19,8 @@ impl AddressBookApp {
     }
     pub(in crate::app) fn render_execution_indicator(&self, id: &AppId, cx: &App) -> AnyElement {
         let mode = self.execution_mode(id);
+        let keepalive_enabled = self.home.card_context.get(id)
+            .is_some_and(|context| context.keepalive_enabled);
         let (icon, tooltip) = match mode {
             ExecutionMode::Rv => (FunctionIcon::Monitor, "RV 接管"),
             ExecutionMode::ToPhone => (
@@ -35,10 +38,10 @@ impl AddressBookApp {
                 id.as_str()
             )))
             .tooltip(move |window, cx| Tooltip::new(tooltip).build(window, cx))
-            .child(Icon::new(icon).text_color(if mode == ExecutionMode::Rv {
-                theme::muted(cx)
-            } else {
+            .child(Icon::new(icon).text_color(if mode != ExecutionMode::Rv || keepalive_enabled {
                 theme::accent(cx)
+            } else {
+                theme::muted(cx)
             }))
             .into_any_element()
     }
@@ -48,6 +51,11 @@ impl AddressBookApp {
         };
         let id = app.id.clone();
         let mode = self.execution_mode(&id);
+        let phone_sourced = WorkspaceStore::open(self.book.paths())
+            .and_then(|store| store.token_source(&id))
+            .is_ok_and(|source| matches!(source,rv_core::workspace::TokenSource::Phone(_)));
+        let to_rv = mode != ExecutionMode::ToPhone && (phone_sourced || mode == ExecutionMode::Phone);
+        let bundle = app.bundle_id.clone();
         let links = self.home.links.get(&id).cloned().unwrap_or_default();
         let active = self.home.handoff_running.contains_key(&id);
         let online: std::collections::HashSet<_> = links
@@ -57,32 +65,28 @@ impl AddressBookApp {
                     .controls
                     .get(&link.device_id)
                     .is_some_and(|control| control.view.read(cx).can_handoff_backup())
+                    && (!to_rv || self.rv_takeover_available(&bundle,&link.backup_id,Some(link.device_id)))
             })
             .map(|link| link.device_id)
             .collect();
-        let button = Button::new("shop-handoff-phone")
-            .debug_selector(|| "shop-handoff-phone".into())
+        let selector=if to_rv {"shop-handoff-rv"}else{"shop-handoff-phone"};
+        let button = Button::new(selector)
+            .debug_selector(move || selector.into())
             .ghost()
-            .icon(FunctionIcon::Smartphone)
-            .tooltip(match mode {
-                ExecutionMode::Rv => "交给手机：停止 RV 任务并回写账号备份",
-                ExecutionMode::ToPhone => "重试交接：回写并校验手机备份",
-                ExecutionMode::Phone => "已由手机接管",
-            })
-            .accessibility_label("交给手机")
+            .icon(if to_rv {FunctionIcon::Monitor}else{FunctionIcon::Smartphone})
+            .tooltip(if to_rv {"交给 RV：读取关联手机最新备份并接管刷新"}
+                else if mode==ExecutionMode::ToPhone {"重试交接：回写并校验手机备份"}
+                else {"状态修复或交给手机"})
+            .accessibility_label(if to_rv {"交给 RV"}else{"状态修复或交给手机"})
             .loading(active)
-            .disabled(
-                self.read_only
-                    || active
-                    || mode == ExecutionMode::Phone
-                    || online.is_empty()
-                    || self.home.backup_syncing.contains_key(&id),
-            );
+            .disabled(self.read_only || active || online.is_empty()
+                || self.home.backup_syncing.contains_key(&id));
         if let [link] = links.as_slice() {
             let link = link.clone();
             return button
                 .on_click(cx.listener(move |this, _, window, cx| {
-                    this.confirm_phone_handoff(id.clone(), link.clone(), window, cx)
+                    if to_rv {this.confirm_shop_rv_takeover(id.clone(),link.clone(),window,cx);}
+                    else {this.choose_phone_handoff(id.clone(), link.clone(), window, cx);}
                 }))
                 .into_any_element();
         }
@@ -99,7 +103,8 @@ impl AddressBookApp {
                             .disabled(!online.contains(&link.device_id))
                             .on_click(move |_, window, cx| {
                                 owner.update(cx, |this, cx| {
-                                    this.confirm_phone_handoff(id.clone(), link.clone(), window, cx)
+                                    if to_rv {this.confirm_shop_rv_takeover(id.clone(),link.clone(),window,cx);}
+                                    else {this.choose_phone_handoff(id.clone(), link.clone(), window, cx);}
                                 });
                             }),
                     );
@@ -107,6 +112,93 @@ impl AddressBookApp {
                 menu
             })
             .into_any_element()
+    }
+    fn choose_phone_handoff(&mut self,id:AppId,link:BackupLink,window:&mut Window,cx:&mut Context<Self>) {
+        if self.read_only || self.home.handoff_running.contains_key(&id)
+            || self.home.backup_syncing.contains_key(&id) {return;}
+        if self.execution_mode(&id)==ExecutionMode::ToPhone {
+            self.confirm_phone_handoff(id,link,window,cx);return;
+        }
+        let paths=self.book.paths().clone();
+        let owner=cx.entity();
+        let device=self.takeover_phone_name(link.device_id);
+        window.open_dialog(cx,move|dialog,_,cx| {
+            let can_repair=WorkspaceStore::open(&paths).is_ok_and(|store| {
+                store.execution(&id).is_ok_and(|execution|
+                    store.validate_rv_takeover(&id,link.device_id,&execution.operation_id).is_ok())
+            });
+            let repair_owner=owner.clone();let repair_id=id.clone();let repair_link=link.clone();
+            let phone_owner=owner.clone();let phone_id=id.clone();let phone_link=link.clone();
+            dialog.title("状态与交接").child(
+                gpui_component::v_flex().gap_3()
+                    .child(crate::typography::caption(format!("{} · {}",device,link.title),cx))
+                    .when(can_repair,|content|content
+                    .child(Button::new("shop-repair-state").outline().w_full()
+                        .icon(FunctionIcon::Refresh).label("修复状态")
+                        .debug_selector(||"shop-repair-state".into())
+                        .on_click(move|_,window,cx| {
+                            window.close_dialog(cx);
+                            repair_owner.update(cx,|this,cx|this.confirm_shop_state_repair(repair_id.clone(),repair_link.clone(),window,cx));
+                        }))
+                    .child(crate::typography::caption("从手机最新备份修复 RV 状态，继续由 RV 接管。",cx)))
+                    .child(Button::new("shop-transfer-to-phone").outline().w_full()
+                        .icon(FunctionIcon::Smartphone).label("交给手机")
+                        .debug_selector(||"shop-transfer-to-phone".into())
+                        .on_click(move|_,window,cx| {
+                            window.close_dialog(cx);
+                            phone_owner.update(cx,|this,cx|this.confirm_phone_handoff(phone_id.clone(),phone_link.clone(),window,cx));
+                        }))
+                    .child(crate::typography::caption("将 RV 当前状态写回手机备份，停止 RV 调度。",cx))
+            )
+        });
+    }
+    fn confirm_shop_rv_takeover(&mut self,id:AppId,link:BackupLink,window:&mut Window,cx:&mut Context<Self>) {
+        let owner=cx.entity();
+        crate::ui::confirm_execution_handoff(
+            crate::ui::ExecutionHandoffPrompt {
+                title:"交给 RV",description:crate::ui::RV_HANDOFF_DESCRIPTION,icon:FunctionIcon::Monitor,
+                device:self.takeover_phone_name(link.device_id),backup:link.title.clone(),
+                acknowledgement:Some("已在 Shadow 保存最新备份，并切换到其他环境"),
+            },window,cx,move|_,cx|owner.update(cx,|this,cx|this.start_shop_rv_takeover(id.clone(),link.clone(),cx)),
+        );
+    }
+    pub(super) fn confirm_shop_state_repair(&mut self,id:AppId,link:BackupLink,window:&mut Window,cx:&mut Context<Self>) {
+        if self.read_only || self.home.handoff_running.contains_key(&id)
+            || self.home.backup_syncing.contains_key(&id) {return;}
+        if !WorkspaceStore::open(self.book.paths()).and_then(|store|store.state_repair_needed(&id)).unwrap_or(false) {
+            self.set_error_status("访问令牌仍可用，无需修复状态",cx);return;
+        }
+        let owner=cx.entity();
+        crate::ui::confirm_execution_handoff(
+            crate::ui::ExecutionHandoffPrompt {
+                title:"修复状态",
+                description:"请先在 Shadow 保存该环境的最新备份，并切换到其他环境。目标仍为 active 时不能交接。此操作以所选备份的 state 和完整令牌对修复 RV，继续由 RV 接管；不会自动备份或切换手机，已停止的任务保持停止。",
+                icon:FunctionIcon::Refresh,
+                device:self.takeover_phone_name(link.device_id),backup:link.title.clone(),
+                acknowledgement:Some("已在 Shadow 保存最新备份，并切换到其他环境"),
+            },window,cx,move|_,cx|owner.update(cx,|this,cx|this.start_shop_rv_takeover(id.clone(),link.clone(),cx)),
+        );
+    }
+    fn start_shop_rv_takeover(&mut self,id:AppId,link:BackupLink,cx:&mut Context<Self>) {
+        let Some(view)=self.home.controls.get(&link.device_id).map(|control|control.view.clone()) else {
+            self.set_error_status("请先连接关联手机",cx);return;
+        };
+        if !view.read(cx).can_handoff_backup() {
+            self.set_error_status("请先连接可写手机并完成当前操作",cx);return;
+        }
+        let bundle=match WorkspaceStore::open(self.book.paths()).and_then(|store|store.load(&id)) {
+            Ok(app)=>app.bundle_id,
+            Err(error)=>{self.set_error_status(error.to_string(),cx);return;},
+        };
+        let owner=view.entity_id();
+        match self.prepare_rv_takeover(&id,&bundle,&link.backup_id,link.device_id,owner,cx) {
+            Ok(command)=>{
+                if !view.update(cx,|view,cx|view.handoff_backup(command,cx)) {
+                    self.rv_takeover_finished(&id,owner,false,cx);
+                }
+            }
+            Err(error)=>self.set_error_status(error,cx),
+        }
     }
     fn confirm_phone_handoff(
         &mut self,
@@ -127,6 +219,7 @@ impl AddressBookApp {
         crate::ui::confirm_execution_handoff(
             crate::ui::ExecutionHandoffPrompt {
                 title: "交给手机",
+                description: crate::ui::PHONE_HANDOFF_DESCRIPTION,
                 icon: FunctionIcon::Smartphone,
                 device,
                 backup: link.title.clone(),

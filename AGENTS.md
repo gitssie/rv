@@ -95,7 +95,7 @@
 ## 任务与业务 UI 边界（2026-10-27）
 
 - 所有 Vinted 接口拉取、落库与图片下载归业务 tasks 执行器；页面只提交任务指令、读取 SQLite 和本地图片缓存，不按打开页面触发拉取。
-- state 导入时确认凭据；缺失则报告导入错误，不创建接口任务。凭据齐全后创建阶段任务，基础资料默认一次性 cron，成功后不再自动获取；其余任务等待成功，并允许按店铺修改 cron／启动／停止；未关联代理时 tasks 等待，用户编辑虚拟 App 关联代理后继续。
+- state 导入时确认凭据；缺失则报告导入错误，不创建接口任务。凭据齐全后创建周期任务；基础资料仅由用户手动刷新，不创建 session/profile 任务，其他任务不依赖基础资料，并允许按店铺修改 cron／启动／停止；未关联代理时 tasks 等待，用户编辑虚拟 App 关联代理后继续。
 - 店铺数据 UI 和业务表不承载任务执行状态、进度、上次同步信息；店铺独立「任务配置」Tab 仅配置 cron 与启停，执行日志仍在设置任务列表；空业务数据展示空状态。任务的时间、结果、错误只保存在 tasks，通过设置中的任务列表管理。
 - 删除旧业务定时开关和独立内存调度，不做旧功能／旧数据迁移兼容。不增加执行明细表。详见 docs/tasks.md。
 
@@ -124,7 +124,7 @@
 
 - 「交给手机」仅回写所选手机相同 Bundle／IDFV 的备份 `state.tar.zst` 与匹配 manifest，用户明确不改 Shadow、不恢复 live Keychain／偏好、不启动 App、不触碰 data.tar.zst。先持久化 app_execution.mode=to_phone 并取消全部调度／禁用任务，等待已运行任务提交最终凭据后导出；顺序 state→manifest，再读回逐字／SHA／大小校验，通过才持久化 phone。失败或断线保持 to_phone，可显式重试同一冻结版本，不自动恢复 RV 任务。新任务／领取／立即执行／启用均校验执行归属，初始化不重开手机接管任务。
 - 卡片与店铺共用 Monitor／Clock／Smartphone 接管图标，说明放 Tooltip；Phone 模式只表示备份已校验且 RV 停止，不声称手机 live 环境已使用新令牌。按钮使用默认 AlertDialog 确认和来源选择，取消不改变模式。
-- 手机备份菜单的「交给 RV…」仅允许当前 Phone 归属设备；确认框要求用户勾选已保存最新备份并停止手机 App，不把用户确认当作程序自动检测。重新读取完整 state，明确采用手机凭据，导入与模式切回 RV 原子保存；失败仍为 Phone。全部任务保持停止、cron 保留，用户手动启动。普通备份同步继续保留 RV 已更新凭据。详见 docs/phone-handoff.md。
+- 「交给 RV／修复状态」要求用户先在 Shadow 保存所选环境最新备份并切换到其他环境；实际读取前后通过 TrollVNC4.0-16目录的 current_idfv 检查，目标仍 active 或无法确认时不交接。目录身份查询不得依赖 access token，不要求旧 current_backup_id；旧 save／switch 已移除，不得据历史协议或历史文档重新接入自动备份。完整 state 与令牌对、刷新归属原子采用，用户停止的任务不启用，普通同步继续保护 RV 凭据。旧手机服务缺少独立身份字段时明确要求更新，不使用 token 接口代替身份查询。详见 docs/phone-handoff.md。
 
 - Dialog 归属同步必须在 `WindowRoot::render` 构建 `Root::render_dialog_layer` 之前完成，不放在其子 `AddressBookApp::render` 中。WindowRoot 观察 AddressBook 更新以刷新弹层，避免关闭后旧 builder 根据 Modal::None 生成默认空 Dialog 并缓存。回归要检查关闭首帧实际渲染层消失，不能只检查 has_active_dialog=false 或靠第二次 draw 掩盖。
 
@@ -185,3 +185,29 @@
 - 明确手机→RV 交接（备份行 Monitor 与 Token 来源菜单 RV 共用）必须重新读取所选备份自己的最新完整 state，非 active 不取当前 live token、不恢复手机环境。此次交付的 access/refresh token、scope、到期及请求上下文覆盖 RV 旧凭据，与 TokenSource::Rv 同事务提交；失败保持原来源和凭据。刷新备份列表只更新目录关联，普通 state 同步继续保留 RV 当前凭据。交接不重启用户停止的任务，不强制立即刷新；启用中的 Token 等待任务按新凭据唤醒。此条覆盖上文旧交给 RV 仅按 Phone 模式开放及全部任务强制停止的规则。
 
 - 手机交接成功时 app_execution.phone 与 TokenSource::Phone 同一事务提交，不能保留 RV 刷新责任；RV 采用手机备份最外层使用 BEGIN IMMEDIATE，嵌套事务使用 SAVEPOINT，避免自动读取手机 token 时先读后写升级失败。2026-10-30 已用现有 schema14 数据库和7Plus完成 token 轮换、双向交接、非 active 采用、Shadow恢复与手机登录、再交回RV刷新 HTTP200；桌面 GUI 未重构建。最终手机 Vinted 已停、目标 TokenSourceRv，历史备份不可当最新有效凭据重放。
+
+- Token 来源为内部元数据，不在店铺展示来源标签或来源/设备选择菜单。沿用账号备份关联手机与现有双向交接入口决定刷新责任；手动获取凭据直接使用已关联手机，不重新选择设备。
+
+- 聊天窗口分栏采用 GPUI Component DockArea / DockLayout，按窗口持有原生 Dock 实体，不再手写固定三栏。消息列表采用官方 MessageScroller/State 兼容移植，随实际消息 ID 区间 splice，不能每次全量替换导致上翻掉锚。仅消息正文使用 selectable TextView，店铺/会话标题、预览、时间和商品摘要使用普通文字与正常鼠标光标；正文，保留字面多行及标点，不能直接按 HTML/Markdown 解释客户消息。来源及兼容改动记录在 rv-gpui-chat/SOURCE.md。
+
+- 店铺卡片主体详情使用原生 Dialog；信息(i)备份资料继续使用锚定该图标的原生 Popover/Popup，仅读取本地SQLite，不触发手机同步。
+
+- 聊天 Dock 标题不显示说明性文字或图标，店铺和会话/通知列表统一保留内边距，TabBar 与刷新所在行贴中栏顶边、不加顶部留白；会话与通知只通过原生 TabBar 区分。DockArea 使用原生无装饰外观，不保留空标题栏；TabBar 只显示会话/通知图标、不加 Tooltip，列表只保留刷新按钮并与 TabBar 同行，不另占工具行；消息头的名称/国家与商品摘要压为紧凑两行，商品摘要使用图标+文字。
+
+- 聊天店铺、会话和通知 ListItem 使用主题圆角；原生列表选中背景使用主题 accent，关闭蓝色 active_highlight 边框。消息窗口 TitleBar 显示聊天图标。
+
+- 消息窗口不显示任何 Tooltip（含消息滚动器、刷新、语言、状态和附件按钮）。
+
+- 聊天导航（窗口、店铺、会话、Tab）只读 SQLite；HTTP 同步只由定时调度或显式刷新发起，中栏刷新仅 Inbox，右栏刷新仅 Thread。消息按平台实体 ID upsert，禁止按文本合并普通消息；发送回执与同步无论先后均按平台 ID 对账并沿用 outbox 本地 ID。
+
+- 实际打开且显示的会话从 SQLite 加载成功后登记 chat_read_requests，复用现有标记已读定时任务；不在导航时发 HTTP，立即把本地会话标为已读，未读总数仍从接口读取，不重启用户停止的任务；移除消息头“标记已读”菜单。系统事件与通知均使用 App 头像并显示实际正文，不使用“系统事件”占位文案。
+
+会话阅读意图与本地 unread=false 在同一 SQLite 事务提交；界面立即去掉未读状态。待提交期间旧 Inbox 不覆盖本地已读状态，新消息仍可显示未读；店铺未读总数保持使用接口返回值。
+
+- 店铺基础资料无定时任务，沿用手动 shop_sync::Session 刷新；初始化原子移除历史 session/profile 任务及其依赖引用，不改变其它任务启停与 cron。
+
+- 手机交接仅回写 state 与 manifest，不回写 data。以手机当前 manifest 为底更新 stateArchiveInfo，保留当前 archiveInfo/roots；不与 RV 历史 archiveInfo 比较。上传沿用手机当前 data SHA 检查传输期间的版本变化。
+
+- 店铺详情接管按钮支持双向：RV 管理显示手机图标，Phone 来源/归属显示电脑图标；交回 RV 经原生确认框读取关联手机所选备份的最新完整 state，复用 TakeoverBackup，不直接切来源或消费旧本地 refresh token。
+
+- RV 自有可聚焦容器在 track_focus 之外必须提供稳定 id、语义 role 和 aria_label；窗口/面板根容器使用 Group，不能只加 id 或通过屏蔽 a11y 日志掩盖缺失节点。原生 Dialog/Popover/Menu 继续使用组件自带角色。

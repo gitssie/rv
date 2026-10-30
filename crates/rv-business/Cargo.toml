@@ -23,7 +23,7 @@ fs2 = "0.4"
 image = { workspace = true, features = ["webp", "gif"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 tokio.workspace = true
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "stream", "json", "socks", "multipart"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "stream", "json", "socks", "multipart", "gzip", "brotli", "deflate"] }
 
 [dev-dependencies]
 tempfile = "3"

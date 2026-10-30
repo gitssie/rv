@@ -1,4 +1,5 @@
-//! Bundle-owned projection: unknown and false values never create positive badges.
+//! Bundle-owned projection: explicit visibility and tradeability remain independent;
+//! absent fields never imply a state.
 use crate::data::Dataset;
 use serde_json::Value;
 use std::path::PathBuf;
@@ -6,14 +7,22 @@ use std::path::PathBuf;
 pub struct RowVisual {
     pub price: String,
     pub badges: Vec<String>,
+    pub view_count: Option<u64>,
+    pub favourite_count: Option<u64>,
     pub image_url: Option<String>,
     pub image_path: Option<PathBuf>,
 }
 pub(crate) fn vinted(value: &Value, dataset: Dataset) -> RowVisual {
     let mut badges = Vec::new();
-    if dataset == Dataset::Products {
+    if dataset==Dataset::Products && value["_rv_deleted"]==true {
+        badges.push("已删除".into());
+    } else if dataset == Dataset::Products {
+        match value["is_hidden"].as_bool() {
+            Some(true) => badges.push("隐藏".into()),
+            Some(false) => badges.push("激活".into()),
+            None => {}
+        }
         for (field, label) in [
-            ("is_hidden", "隐藏"),
             ("is_draft", "草稿"),
             ("is_reserved", "预留"),
             ("is_processing", "处理中"),
@@ -24,8 +33,10 @@ pub(crate) fn vinted(value: &Value, dataset: Dataset) -> RowVisual {
             }
         }
         // These are explicit derived predicates, never defaults for missing fields.
-        if value["transaction_permitted"].as_bool() == Some(false) {
-            badges.push("不可交易".into());
+        match value["transaction_permitted"].as_bool() {
+            Some(false) => badges.push("不可交易".into()),
+            Some(true) => badges.push("可交易".into()),
+            None => {}
         }
         if value["item_alert_type"].as_str() == Some("delayed_publication") {
             badges.push("延迟发布".into());
@@ -65,6 +76,8 @@ pub(crate) fn vinted(value: &Value, dataset: Dataset) -> RowVisual {
             value["price"]["currency_code"].as_str().unwrap_or("")
         ),
         badges,
+        view_count: (dataset == Dataset::Products).then(|| value["view_count"].as_u64()).flatten(),
+        favourite_count: (dataset == Dataset::Products).then(|| value["favourite_count"].as_u64()).flatten(),
         image_url,
         image_path: None,
     }
@@ -72,6 +85,23 @@ pub(crate) fn vinted(value: &Value, dataset: Dataset) -> RowVisual {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn product_counts_preserve_zero_and_missing_fields() {
+        let row=vinted(&serde_json::json!({"view_count":0,"favourite_count":12}),Dataset::Products);
+        assert_eq!(row.view_count,Some(0));
+        assert_eq!(row.favourite_count,Some(12));
+        let missing=vinted(&serde_json::json!({"favourite_count":0}),Dataset::Products);
+        assert_eq!(missing.view_count,None);
+        assert_eq!(missing.favourite_count,Some(0));
+        for value in [serde_json::json!({}),serde_json::json!({"view_count":null,"favourite_count":null}),serde_json::json!({"view_count":-1,"favourite_count":"4"})] {
+            let row=vinted(&value,Dataset::Products);
+            assert_eq!(row.view_count,None);
+            assert_eq!(row.favourite_count,None);
+        }
+        let order=vinted(&serde_json::json!({"view_count":2,"favourite_count":3}),Dataset::Orders);
+        assert_eq!(order.view_count,None);
+        assert_eq!(order.favourite_count,None);
+    }
     #[test]
     fn only_explicit_states_coexist() {
         let row = vinted(
@@ -86,15 +116,11 @@ mod tests {
         );
     }
     #[test]
-    fn blocked_and_delayed_require_evidence() {
+    fn transaction_and_delayed_states_require_evidence() {
         assert_eq!(vinted(&serde_json::json!({"transaction_permitted":false,"item_alert_type":"delayed_publication"}), Dataset::Products).badges, ["不可交易","延迟发布"]);
-        assert!(
-            vinted(
-                &serde_json::json!({"transaction_permitted":true}),
-                Dataset::Products
-            )
-            .badges
-            .is_empty()
-        );
+        assert_eq!(vinted(&serde_json::json!({"transaction_permitted":true}), Dataset::Products).badges,["可交易"]);
+        assert!(vinted(&serde_json::json!({"transaction_permitted":null}), Dataset::Products).badges.is_empty());
+        assert_eq!(vinted(&serde_json::json!({"is_hidden":false,"transaction_permitted":true}), Dataset::Products).badges,["激活","可交易"]);
+        assert_eq!(vinted(&serde_json::json!({"is_hidden":false,"transaction_permitted":false}), Dataset::Products).badges,["激活","不可交易"]);
     }
 }

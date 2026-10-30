@@ -183,7 +183,7 @@ fn parameters_are_validated_and_writes_cannot_enable_retries() {
     spec.payload = json!({});
     assert!(enqueue(&paths, &id, &spec).is_err());
     let task = enqueue(&paths, &id, &TaskSpec::new("inbox", "0 0 0 * * * *")).unwrap();
-    assert_eq!(task.kind, "chat_inbox");
+    assert_eq!(task.kind, "chat_threads");
 }
 #[tokio::test]
 async fn preflight_failure_becomes_visible_without_starting_another_task() {
@@ -212,28 +212,20 @@ fn workflow_provisions_once_and_waits_for_the_apps_proxy_without_spending_attemp
     initialize(&paths, &id).unwrap();
     let mut store = WorkspaceStore::open(&paths).unwrap();
     let tasks = store.tasks(&id).unwrap();
-    assert_eq!(tasks.len(), 10);
-    let profile = tasks
-        .iter()
-        .find(|t| t.task_key.as_deref() == Some("profile"))
-        .unwrap();
-    assert!((before + 10..=timestamp() + 10).contains(&profile.next_run_at.unwrap()));
-    assert!(
-        tasks
-            .iter()
-            .filter(|t| t.id != profile.id && t.task_key.as_deref() != Some(KEEPALIVE_KEY))
-            .all(|t| t.depends_on.as_deref() == Some(profile.id.as_str()))
-    );
+    assert_eq!(tasks.len(), 8);
+    assert!(tasks.iter().all(|t|t.kind!="session" && t.task_key.as_deref()!=Some("profile")));
+    assert!(tasks.iter().all(|t|t.depends_on.is_none()));
+    let product=tasks.iter().find(|t|t.kind=="products").unwrap();
+    assert!((before+10..=timestamp()+10).contains(&product.next_run_at.unwrap()));
     let keepalive = tasks
         .iter()
         .find(|task| task.task_key.as_deref() == Some(KEEPALIVE_KEY))
         .unwrap();
-    assert!(profile.depends_on.is_none());
     assert!(due(&paths, before + 20).unwrap().is_empty());
     let blocked = store.task(&keepalive.id).unwrap();
     let refresh_due=keepalive.next_run_at.unwrap()<=before+20;
     assert_eq!(blocked.error_code.as_deref(),if refresh_due {Some("proxy")} else {None});
-    assert_eq!(store.task(&profile.id).unwrap().error_code.as_deref(),Some("proxy"));
+    assert_eq!(store.task(&product.id).unwrap().error_code.as_deref(),Some("proxy"));
     assert_eq!(blocked.attempt_count, 0);
     assert_eq!(blocked.status, "pending");
     let proxy = rv_core::workspace::SocksProxy {
@@ -251,16 +243,16 @@ fn workflow_provisions_once_and_waits_for_the_apps_proxy_without_spending_attemp
     store.save_proxy(&proxy).unwrap();
     store.bind_proxy(&id, Some(&proxy.id)).unwrap();
     let ready = due(&paths, before + 20).unwrap();
-    assert_eq!(ready.len(), if refresh_due {2} else {1});
+    assert_eq!(ready.len(), if refresh_due {8} else {7});
     assert_eq!(ready.iter().any(|task|task.id==keepalive.id),refresh_due);
-    assert!(ready.iter().any(|task|task.id==profile.id));
+    assert!(ready.iter().any(|task|task.id==product.id));
     assert!(ready.iter().all(|task|task.error_code.is_none()));
     let product = tasks.iter().find(|t| t.kind == "products").unwrap();
     store.cancel_task(&product.id).unwrap();
     drop(store);
     initialize(&paths, &id).unwrap();
     let store = WorkspaceStore::open(&paths).unwrap();
-    assert_eq!(store.tasks(&id).unwrap().len(), 10);
+    assert_eq!(store.tasks(&id).unwrap().len(), 8);
     assert_eq!(store.task(&product.id).unwrap().status, "cancelled");
 }
 #[test]
@@ -285,7 +277,7 @@ fn manual_request_wakes_the_existing_periodic_task_instead_of_creating_another()
     .unwrap();
     assert_eq!(manual.id, task.id);
     assert_eq!(manual.cron_expression, task.cron_expression);
-    assert_eq!(store.tasks(&id).unwrap().len(), 10);
+    assert_eq!(store.tasks(&id).unwrap().len(), 8);
 }
 
 #[test]
@@ -355,23 +347,18 @@ fn catalogue_without_credentials_does_not_create_api_tasks() {
         )
         .unwrap();
     initialize(&paths, &id).unwrap();
-    assert_eq!(store.tasks(&id).unwrap().len(), 10);
+    assert_eq!(store.tasks(&id).unwrap().len(), 8);
 }
 
 #[test]
-fn profile_is_one_shot_and_custom_schedules_and_stops_survive_reinitialization() {
+fn profiles_are_manual_and_custom_schedules_and_stops_survive_reinitialization() {
     let (paths, id, _dir) = fixture();
     initialize(&paths, &id).unwrap();
     let mut store = WorkspaceStore::open(&paths).unwrap();
     let initial = store.configured_tasks(&id).unwrap();
-    assert_eq!(initial.len(), 10);
+    assert_eq!(initial.len(), 8);
     assert!(initial.iter().all(|t| t.kind != "images"));
-    let profile = initial.iter().find(|t| t.kind == "session").unwrap();
-    assert_eq!(
-        rv_core::workspace::next_task_time(&profile.cron_expression, profile.next_run_at.unwrap())
-            .unwrap(),
-        None
-    );
+    assert!(initial.iter().all(|t|t.kind!="session"));
     let keeper = initial
         .iter()
         .find(|task| task.task_key.as_deref() == Some(KEEPALIVE_KEY))
@@ -381,20 +368,12 @@ fn profile_is_one_shot_and_custom_schedules_and_stops_survive_reinitialization()
     store
         .finish_task(&keeper.id, "completed", &json!({}))
         .unwrap();
-    let ready = store.run_task_now(&profile.id).unwrap();
-    let running = store.claim_task_when(&ready, |_| Ok(())).unwrap();
-    store
-        .finish_task(&running, "completed", &json!({}))
-        .unwrap();
     let product = initial.iter().find(|t| t.kind == "products").unwrap();
     store.set_task_enabled(&product.id, false).unwrap();
     store
         .reschedule_task(&product.id, "0 */20 * * * *")
         .unwrap();
     initialize(&paths, &id).unwrap();
-    let profile = store.task(&profile.id).unwrap();
-    assert_eq!(profile.status, "completed");
-    assert_eq!(profile.next_run_at, None);
     let product = store.task(&product.id).unwrap();
     assert!(!product.enabled);
     assert_eq!(product.cron_expression, "0 */20 * * * *");
@@ -521,7 +500,7 @@ fn stopped_keepalive_allows_other_tasks_and_preserves_individual_switches_and_cr
     store
         .reschedule_task(&product.id, "0 */20 * * * *")
         .unwrap();
-    let stale = store.run_task_now(&product.id).unwrap();
+    store.run_task_now(&product.id).unwrap();
     let order = tasks.iter().find(|task| task.kind == "orders").unwrap();
     set_task_enabled(&paths, &order.id, false).unwrap();
     set_task_enabled(&paths, &keeper.id, false).unwrap();
@@ -531,15 +510,9 @@ fn stopped_keepalive_allows_other_tasks_and_preserves_individual_switches_and_cr
     assert!(set_task_enabled(&paths, &product.id, true).is_ok());
     assert!(run_task_now(&paths, &product.id).is_ok());
     assert!(enqueue(&paths, &id, &TaskSpec::new("products", "* * * * * *")).is_ok());
-    assert!(
-        store
-            .claim_task_when(&stale, |db| admit_access_token(
-                db,
-                id.as_str(),
-                Some(&stale.id)
-            ))
-            .is_err()
-    );
+    let candidate=store.task(&product.id).unwrap();
+    let running=store.claim_task_when(&candidate,|db|admit_access_token(db,id.as_str(),Some(&candidate.id))).unwrap();
+    store.finish_task(&running,"completed",&json!({})).unwrap();
     store.business_transaction(|db|admit_access_token(db,id.as_str(),Some(&product.id))).unwrap();
     initialize(&paths, &id).unwrap();
     assert!(!store.task(&keeper.id).unwrap().enabled);
@@ -708,10 +681,8 @@ fn rejected_token_waits_without_stopping_tasks_and_new_token_resumes_due_work() 
     let mut store=WorkspaceStore::open(&paths).unwrap();
     let tasks=store.configured_tasks(&id).unwrap();
     let keeper=tasks.iter().find(|t|t.kind=="refresh").unwrap();
-    let profile=tasks.iter().find(|t|t.kind=="session").unwrap();
     let product=tasks.iter().find(|t|t.kind=="products").unwrap();
     set_task_enabled(&paths,&keeper.id,false).unwrap();
-    store.business_transaction(|db| {db.execute("UPDATE tasks SET last_run_status='completed',status='completed',next_run_at=NULL WHERE id=?1",[&profile.id])?;Ok(())}).unwrap();
     let proxy=rv_core::workspace::SocksProxy{id:uuid::Uuid::new_v4().to_string(),name:"fixture".into(),host:"127.0.0.1".into(),port:12345,protocol:Default::default(),front_proxy_id:None,username:String::new(),password:String::new(),mode:rv_core::workspace::ProxyMode::Shared,ip:Default::default()};
     store.save_proxy(&proxy).unwrap();store.bind_proxy(&id,Some(&proxy.id)).unwrap();
     run_task_now(&paths,&product.id).unwrap();
@@ -724,4 +695,63 @@ fn rejected_token_waits_without_stopping_tasks_and_new_token_resumes_due_work() 
     let ready=due(&paths,timestamp()).unwrap();
     assert!(ready.iter().any(|t|t.id==product.id && t.error_code.is_none()));
     assert!(!store.task(&keeper.id).unwrap().enabled);
+}
+
+#[test]
+fn legacy_profile_tasks_are_removed_and_dependants_keep_their_settings() {
+    let (paths,id,_dir)=fixture();
+    let mut store=WorkspaceStore::open(&paths).unwrap();
+    let old=store.ensure_task(&id,"profile",&TaskSpec::new("session","0 * * * * *"),None,timestamp()).unwrap();
+    let product=store.ensure_task(&id,"products",&TaskSpec::new("products","0 */20 * * * *"),Some(&old.id),timestamp()).unwrap();
+    store.set_task_enabled(&product.id,false).unwrap();
+    initialize(&paths,&id).unwrap();initialize(&paths,&id).unwrap();
+    let tasks=store.configured_tasks(&id).unwrap();assert_eq!(tasks.len(),8);
+    assert!(tasks.iter().all(|t|t.kind!="session"));
+    let current=store.task(&product.id).unwrap();
+    assert!(current.depends_on.is_none());assert!(!current.enabled);
+    assert_eq!(current.cron_expression,"0 */20 * * * *");
+}
+
+#[test]
+fn message_sync_merges_legacy_tasks_preserving_plan_and_enabled_intent() {
+    for (details_enabled,inbox_enabled) in [(false,false),(true,false),(false,true),(true,true)] {
+        let (paths,id,_dir)=fixture();
+        initialize(&paths,&id).unwrap();
+        let mut store=WorkspaceStore::open(&paths).unwrap();
+        let primary=store.configured_tasks(&id).unwrap().into_iter().find(|task|task.kind=="chat_threads").unwrap();
+        store.reschedule_task(&primary.id,"0 */7 * * * *").unwrap();
+        store.set_task_enabled(&primary.id,details_enabled).unwrap();
+        let old=store.ensure_task(&id,"inbox",&TaskSpec::new("chat_inbox","0 */5 * * * *"),None,timestamp()+300).unwrap();
+        store.set_task_enabled(&old.id,inbox_enabled).unwrap();
+        let other_before:Vec<_>=store.configured_tasks(&id).unwrap().into_iter().filter(|task|task.id!=primary.id&&task.id!=old.id).collect();
+        initialize(&paths,&id).unwrap();
+        let saved=store.task(&primary.id).unwrap();
+        assert_eq!(saved.kind,"chat_threads");
+        assert_eq!(saved.cron_expression,"0 */7 * * * *");
+        assert_eq!(saved.enabled,details_enabled||inbox_enabled);
+        assert_eq!(saved.next_run_at.is_some(),details_enabled||inbox_enabled);
+        assert!(store.task(&old.id).is_err());
+        assert_eq!(store.configured_tasks(&id).unwrap().len(),8);
+        assert_eq!(store.configured_tasks(&id).unwrap().into_iter().filter(|task|task.id!=primary.id).collect::<Vec<_>>(),other_before);
+        initialize(&paths,&id).unwrap();
+        assert_eq!(store.task(&primary.id).unwrap(),saved);
+    }
+}
+
+#[test]
+fn message_sync_migration_waits_for_running_legacy_and_promotes_lone_inbox() {
+    let (paths,id,_dir)=fixture();
+    let mut store=WorkspaceStore::open(&paths).unwrap();
+    let old=store.ensure_task(&id,"inbox",&TaskSpec::new("chat_inbox","0 */5 * * * *"),None,timestamp()).unwrap();
+    let old=store.run_task_now(&old.id).unwrap();
+    let running=store.claim_task_when(&old,|_|Ok(())).unwrap();
+    initialize(&paths,&id).unwrap();
+    assert_eq!(store.task(&old.id).unwrap().status,"running");
+    assert_eq!(store.configured_tasks(&id).unwrap().len(),1);
+    store.finish_task(&running,"completed",&json!({})).unwrap();
+    initialize(&paths,&id).unwrap();
+    let promoted=store.task(&old.id).unwrap();
+    assert_eq!(promoted.kind,"chat_threads");
+    assert_eq!(promoted.task_key.as_deref(),Some("chat_threads"));
+    assert_eq!(store.configured_tasks(&id).unwrap().len(),8);
 }

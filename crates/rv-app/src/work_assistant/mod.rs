@@ -330,6 +330,8 @@ impl Render for WorkAssistant {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
             .id("work-assistant")
+            .role(Role::Group)
+            .aria_label("工作助手")
             .debug_selector(|| "work-assistant".into())
             .size_full()
             .bg(theme::card(cx))

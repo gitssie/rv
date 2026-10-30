@@ -3,18 +3,20 @@ use super::*;
 use crate::assets::FunctionIcon;
 use gpui::prelude::FluentBuilder as _;
 use gpui_component::{
-    Disableable, Icon, IconName, StyledExt,
+    Disableable, Icon, IconName, Sizable, StyledExt,
     button::{Button, ButtonVariants},
     form::{Field, Form},
     h_flex,
     input::{Input, InputState},
     v_flex,
+    tooltip::Tooltip,
 };
 
 pub(in crate::app) struct TaskConfigView {
     pub rows: Vec<AppTask>,
     pub editing: Option<String>,
     pub cron: Entity<InputState>,
+    pub running: std::collections::HashSet<String>,
 }
 impl TaskConfigView {
     pub fn new(window: &mut Window, cx: &mut Context<AddressBookApp>) -> Self {
@@ -22,6 +24,7 @@ impl TaskConfigView {
             rows: vec![],
             editing: None,
             cron: cx.new(|cx| InputState::new(window, cx).placeholder("秒 分 时 日 月 星期 [年]")),
+            running: Default::default(),
         }
     }
 }
@@ -31,7 +34,7 @@ fn label(kind: &str) -> &'static str {
         "refresh" => "会话保持",
         "products" => "商品同步",
         "orders" => "订单同步",
-        "chat_inbox" => "会话同步",
+        "chat_inbox" => "消息同步",
         "chat_threads" => "消息同步",
         "chat_send" => "消息发送",
         "chat_read" => "已读回执",
@@ -67,7 +70,7 @@ impl AddressBookApp {
                     "session" => 1,
                     "products" => 2,
                     "orders" => 3,
-                    "chat_inbox" => 4,
+                    "chat_threads" => 4,
                     "notification_stats" => 5,
                     "notifications" => 6,
                     _ => 6,
@@ -114,6 +117,30 @@ impl AddressBookApp {
         }
         self.reload_shop_tasks(cx);
     }
+    fn execute_shop_task_now(&mut self,task:AppTask,cx:&mut Context<Self>) {
+        if self.read_only || task.status=="running" || self.home.task_config.running.contains(&task.id) {return;}
+        let id=match AppId::from_idfv(&task.app_id) {
+            Ok(id)=>id,Err(error)=>{self.set_error_status(error.to_string(),cx);return;},
+        };
+        let paths=self.book.paths().clone();let name=label(&task.kind);
+        self.home.task_config.running.insert(task.id.clone());cx.notify();
+        cx.spawn(async move|this,cx| {
+            let result=rv_business::shop_sync::execute_now(paths,id.clone(),task.kind).await;
+            let _=this.update(cx,|this,cx| {
+                this.home.task_config.running.remove(&task.id);
+                match result {
+                    Ok(())=>this.set_status(format!("{name}已执行"),cx),
+                    Err(error)=>{
+                        tracing::error!(app_id=%id.as_str(),task_id=%task.id,%error,"Immediate shop operation failed");
+                        this.set_error_status(error,cx);
+                    },
+                }
+                this.reload_shop_tasks(cx);this.reload_home(cx);
+                if this.home.editing.as_ref().is_some_and(|app|app.id==id) {this.reload_business_data(cx);}
+                cx.notify();
+            });
+        }).detach();
+    }
     pub(super) fn open_task_execution_list(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.open_settings(window, cx);
         self.settings.page = Some(crate::app::settings::SettingsPage::Tasks);
@@ -126,7 +153,7 @@ impl AddressBookApp {
         let phone_refresh = self.home.editing.as_ref().is_some_and(|app|
             WorkspaceStore::open(self.book.paths()).and_then(|s|s.token_source(&app.id)).ok()
                 .is_some_and(|source|matches!(source,rv_core::workspace::TokenSource::Phone(_))));
-        let mut form = Form::horizontal();
+        let mut form = Form::horizontal().small();
         for task in &view.rows {
             let id = task.id.clone();
             let editing = view.editing.as_deref() == Some(id.as_str());
@@ -137,10 +164,11 @@ impl AddressBookApp {
                         div()
                             .flex_1()
                             .min_w_0()
-                            .child(Input::new(&view.cron).disabled(self.read_only)),
+                            .child(Input::new(&view.cron).small().disabled(self.read_only)),
                     )
                     .child(
                         Button::new(SharedString::from(format!("shop-task-save-{id}")))
+                    .small()
                             .primary()
                             .icon(IconName::Check)
                             .tooltip("保存计划")
@@ -153,6 +181,7 @@ impl AddressBookApp {
                     )
                     .child(
                         Button::new(SharedString::from(format!("shop-task-cancel-{id}")))
+                    .small()
                             .ghost()
                             .icon(IconName::Close)
                             .tooltip("取消编辑")
@@ -168,7 +197,7 @@ impl AddressBookApp {
                         div()
                             .flex_1()
                             .min_w_0()
-                            .text_sm()
+                            .text_xs()
                             .font_normal()
                             .text_color(crate::theme::muted(cx))
                             .truncate()
@@ -176,9 +205,10 @@ impl AddressBookApp {
                     )
                     .child(
                         Button::new(SharedString::from(format!("shop-task-edit-{id}")))
+                    .small()
                             .ghost()
-                            .icon(FunctionIcon::Edit)
-                            .tooltip("修改计划")
+                            .icon(IconName::Settings2)
+                            .tooltip("修改执行计划")
                             .accessibility_label("修改计划")
                             .disabled(self.read_only)
                             .on_click({
@@ -189,56 +219,57 @@ impl AddressBookApp {
                             }),
                     );
             }
-            if task.error_code.as_deref()==Some("access_token") && task.enabled {
-                controls=controls.child(crate::typography::caption("等待 Token",cx));
-            } else if task.kind=="refresh" && phone_refresh {
-                controls=controls.child(crate::typography::caption("手机负责刷新",cx));
-            } else if task.status=="running" {
-                controls=controls.child(crate::typography::caption("执行中",cx));
-            }
+            let next=task.next_run_at.and_then(|time|chrono::DateTime::from_timestamp(time,0))
+                .map(|time|time.with_timezone(&chrono::Local).format("%m-%d %H:%M:%S").to_string())
+                .unwrap_or_else(||"—".into());
+            let detail=if task.error_code.as_deref()==Some("access_token") && task.enabled {
+                "等待 Token".to_string()
+            } else if task.kind=="refresh" && phone_refresh {"手机负责刷新".into()}
+            else if task.status=="running" {"执行中".into()}
+            else if task.next_run_at.is_some() {format!("下次执行：{next}")}
+            else {"未安排下次执行".into()};
+            controls=controls.child(h_flex()
+                .id(SharedString::from(format!("shop-task-next-{id}")))
+                .w_32().flex_shrink_0().gap_1().items_center()
+                .text_xs().text_color(crate::theme::muted(cx))
+                .tooltip(move|window,cx|Tooltip::new(detail.clone()).build(window,cx))
+                .child(Icon::new(FunctionIcon::Recent).small())
+                .child(next));
             let active = task.enabled
                 && (task.next_run_at.is_some()
                     || task.status == "running"
                     || (task.kind == "refresh" && task.status == "unknown"));
-            let retry = task.status != "running"
-                && (matches!(task.status.as_str(), "failed" | "unknown")
-                    || task
-                        .last_run_status
-                        .as_deref()
-                        .is_some_and(|s| matches!(s, "failed" | "unknown")));
+            let busy=view.running.contains(&task.id);
+            controls=controls.child(
+                Button::new(SharedString::from(format!("shop-task-now-{id}")))
+                    .small().ghost().icon(FunctionIcon::Refresh)
+                    .loading_icon(IconName::LoaderCircle)
+                    .tooltip("立即执行一次，不改变定时计划").accessibility_label("立即执行")
+                    .debug_selector({let id=id.clone();move||format!("shop-task-now-{id}")})
+                    .loading(busy).disabled(self.read_only || task.status=="running"
+                        || (task.kind=="refresh" && phone_refresh))
+                    .on_click({let task=task.clone();cx.listener(move|this,_,_,cx|
+                        this.execute_shop_task_now(task.clone(),cx))}),
+            );
             controls = controls.child(
                 Button::new(SharedString::from(format!("shop-task-toggle-{id}")))
-                    .label(if retry {
-                        "重试"
-                    } else if active {
-                        "停止"
-                    } else {
-                        "启动"
-                    })
+                    .small().ghost()
+                    .icon(if active {Icon::new(IconName::Pause)}else{Icon::new(FunctionIcon::Play)})
+                    .accessibility_label(if active {"停止定时调度"}else{"启动定时调度"})
                     .disabled(
                         self.read_only
                             || (task.kind=="refresh" && phone_refresh)
-                            || (retry && task.status == "running"),
+                            || busy,
                     )
                     .tooltip(if task.kind=="refresh" && phone_refresh {
                         "Token 来源为手机，由手机 App 刷新"
-                    } else if retry {
-                        "立即重试任务"
                     } else if active {
                         "停止任务"
                     } else {
-                        "启动并立即执行"
+                        "启动定时调度"
                     })
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        if retry {
-                            match rv_business::tasks::run_task_now(this.book.paths(), &id) {
-                                Ok(task) => this.set_status(format!("{}已提交，等待执行",label(&task.kind)),cx),
-                                Err(error) => this.set_error_status(this.task_error_message("重试任务",Some(&id),&error),cx),
-                            }
-                            this.reload_shop_tasks(cx);
-                        } else {
-                            this.toggle_shop_task(&id, !active, cx);
-                        }
+                        this.toggle_shop_task(&id, !active, cx);
                     })),
             );
             form = form.child(

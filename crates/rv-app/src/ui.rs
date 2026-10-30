@@ -2,7 +2,7 @@
 use crate::{theme, typography};
 use gpui::*;
 use gpui_component::{
-    Disableable, Sizable as _, ThemeStyled, WindowExt,
+    Disableable, Sizable as _, StyledExt as _, ThemeStyled, WindowExt,
     button::{Button, ButtonVariants},
     dialog::Dialog,
     h_flex,
@@ -158,8 +158,12 @@ pub(crate) fn confirm_backup_sync(
     });
 }
 
+pub(crate) const RV_HANDOFF_DESCRIPTION: &str = "请先在 Shadow 保存该环境的最新备份，并切换到其他环境。目标仍为 active 时不能交给 RV。RV 只读取所选备份的 state 和令牌，不会自动备份或切换手机环境；已停止的任务保持停止。";
+pub(crate) const PHONE_HANDOFF_DESCRIPTION: &str = "RV 将停止该店铺的调度，通过 ZXTouch 自动关闭手机 App 并确认进程退出，等待在途任务结束后，把最新状态写回手机备份。当前 active 备份也可交接；回写不会自动应用到当前环境，请先在 Shadow 应用最新状态，再打开 App。";
+
 pub(crate) struct ExecutionHandoffPrompt {
     pub title: &'static str,
+    pub description: &'static str,
     pub icon: crate::assets::FunctionIcon,
     pub device: String,
     pub backup: String,
@@ -186,7 +190,9 @@ pub(crate) fn confirm_execution_handoff(
         let confirm = on_confirm.clone();
         let checked = accepted.clone();
         let mut content = v_flex()
-            .gap_2()
+            .gap_3()
+            .text_sm()
+            .font_normal()
             .child(
                 h_flex()
                     .gap_2()
@@ -203,10 +209,14 @@ pub(crate) fn confirm_execution_handoff(
                     .items_center()
                     .child(Icon::new(IconName::File).text_color(theme::muted(cx)))
                     .child(typography::caption(prompt.backup.clone(), cx)),
-            );
+            )
+            .child(div().text_xs().font_normal().text_color(theme::muted(cx))
+                .whitespace_normal().line_height(relative(1.5)).child(prompt.description));
         if let Some(label) = prompt.acknowledgement {
             content = content.child(
                 Checkbox::new("handoff-acknowledgement")
+                    .small()
+                    .font_normal()
                     .debug_selector(|| "handoff-acknowledgement".into())
                     .label(label)
                     .checked(accepted.get())
@@ -214,17 +224,6 @@ pub(crate) fn confirm_execution_handoff(
                         checked.set(*value);
                         window.refresh();
                     }),
-            );
-        } else {
-            content = content.child(
-                h_flex()
-                    .gap_2()
-                    .items_center()
-                    .text_color(theme::warning(cx))
-                    .child(Icon::new(IconName::Pause))
-                    .child(
-                        typography::label("RV 全部任务将停止", cx).text_color(theme::warning(cx)),
-                    ),
             );
         }
         alert
