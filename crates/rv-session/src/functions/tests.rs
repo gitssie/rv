@@ -1521,3 +1521,20 @@ async fn managed_manual_change_preserves_ready_and_does_not_switch_other_media_a
     drop(commands);
     actor.await.unwrap();
 }
+
+#[test]
+fn app_state_stable_errors_preserve_legacy_codes_and_known_partial_failures() {
+    assert!(uncertain_result(32, &json!({"error":{"code":5,"error_code":"operation_failed","outcome_unknown":true}})));
+    assert!(uncertain_result(32, &json!({"error":{"code":5,"error_code":"outcome_unknown"}})));
+    assert!(!uncertain_result(32, &json!({"error":{"code":5,"error_code":"restore_failed","state_may_be_partial":true}})));
+    assert!(!uncertain_result(31, &json!({"error":{"code":5,"error_code":"outcome_unknown"}})));
+    let failure=json!({"error":{"code":5,"error_code":"snapshot_busy","message":"Snapshot is busy"}});
+    assert_eq!(service_error_code(&failure), Some("snapshot_busy"));
+    assert_eq!(service_error(&failure), "原生请求失败：Snapshot is busy");
+    assert_eq!(service_error_message(&json!({"error":"legacy raw error"})), "legacy raw error");
+    assert_eq!(service_error_message(&json!({"error":{"reason":"legacy_reason"}})), "legacy_reason");
+    assert_eq!(service_error_code(&json!({"error":{"error_code":"bad/code","code":"legacy_code"}})), Some("legacy_code"));
+    assert_eq!(service_error_message(&json!({"error":{"message":"bad\nlog", "error_code":"snapshot_busy"}})), "snapshot_busy");
+    assert_eq!(service_error_message(&json!({"error":{"message":"x".repeat(1025), "error_code":"snapshot_busy"}})), "snapshot_busy");
+    assert_eq!(service_error_message(&json!({"error":{"error_code":"bad/code"}})), "unknown");
+}

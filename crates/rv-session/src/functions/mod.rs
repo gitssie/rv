@@ -424,6 +424,8 @@ pub fn email_binding_prepared(record: &Value) -> bool {
 pub fn uncertain_result(task: u8, record: &Value) -> bool {
     let error = &record["error"];
     record["result"]["outcome"] == "unknown"
+        || (task == 32 && (error["outcome_unknown"] == true
+            || matches!(service_error_code(record), Some("outcome_unknown" | "missing_result"))))
         || matches!(
             error["code"].as_str(),
             Some("outcome_unknown" | "missing_result")
@@ -438,13 +440,25 @@ pub fn uncertain_result(task: u8, record: &Value) -> bool {
         || (task != 32 && (error["state_may_be_partial"] == true
             || error["archive_may_be_partial"] == true))
 }
-fn service_error(response: &Value) -> String {
-    let code = response["error"]["code"]
-        .as_str()
-        .filter(|s| s.len() <= 64 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'))
-        .unwrap_or("unknown");
-    format!("原生请求失败：{code}")
+pub(crate) fn service_error_code(response: &Value) -> Option<&str> {
+    [response["error"]["error_code"].as_str(), response["error_code"].as_str(), response["error"]["code"].as_str()]
+        .into_iter().flatten()
+        .find(|s| !s.is_empty() && s.len() <= 64 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'))
 }
+pub(crate) fn service_error_message(response: &Value) -> String {
+    response["error"]["message"].as_str()
+        .or_else(|| response["message"].as_str())
+        .or_else(|| response["error"]["reason"].as_str())
+        .or_else(|| response["error"].as_str())
+        .filter(|s| !s.trim().is_empty() && s.len() <= 1024 && !s.chars().any(char::is_control))
+        .map(str::to_owned)
+        .or_else(|| service_error_code(response).map(str::to_owned))
+        .unwrap_or_else(|| "unknown".into())
+}
+fn service_error(response: &Value) -> String {
+    format!("原生请求失败：{}", service_error_message(response))
+}
+
 fn accepted_code(response: &Value, id: &str) -> Result<(), String> {
     if response.get("error").is_some() {
         return Err(service_error(response));

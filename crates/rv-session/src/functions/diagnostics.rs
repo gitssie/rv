@@ -1,5 +1,5 @@
 //! Console diagnostics contain operation metadata, never request/result payloads.
-use super::{FunctionEvent, uncertain_result};
+use super::{FunctionEvent, uncertain_result, service_error_code};
 use serde_json::{Value, json};
 
 #[derive(Default)]
@@ -17,6 +17,8 @@ fn details(record: &Value) -> Value {
         "error_domain": record["error"]["domain"].as_str(),
         "error_code": record["error"]["code"].as_i64().map(Value::from)
             .or_else(|| record["error"]["code"].as_str().map(Value::from)),
+        "service_error_code": service_error_code(record),
+        "outcome_unknown": record["error"]["outcome_unknown"].as_bool(),
         "reason": record["error"]["reason"].as_str(),
         "message": record["error"]["message"].as_str(),
         "source_domain": record["error"]["source_domain"].as_str(),
@@ -126,12 +128,13 @@ mod tests {
     fn error_diagnostics_keep_correlation_and_cause_without_payloads() {
         let record = json!({"operation_id":"op-1","method":"delete","status":"completed",
             "progress":{"phase":"delete","stage":"files","secret":"hidden-progress"},
-            "error":{"domain":"TVAppStateServices","code":2,"reason":"store_busy","posix_code":13,
+            "error":{"domain":"TVAppStateServices","code":2,"error_code":"snapshot_busy","reason":"store_busy","posix_code":13,
                 "archive_may_be_partial":true,"message":"Cannot remove selected archive","token":"hidden-token"},
             "params":{"password":"hidden-password"},"result":{"access_token":"hidden-result"}});
         let safe = details(&record);
         assert_eq!(safe["operation_id"], "op-1");
         assert_eq!(safe["error_code"], 2);
+        assert_eq!(safe["service_error_code"], "snapshot_busy");
         assert_eq!(safe["message"], "Cannot remove selected archive");
         assert_eq!(safe["posix_code"], 13);
         assert_eq!(safe["archive_may_be_partial"], true);

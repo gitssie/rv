@@ -218,3 +218,16 @@ async fn inactive_identity_is_accepted_but_missing_identity_is_not_guessed() {
         server.abort();
     }
 }
+
+#[test]
+fn phone_handoff_error_details_preserve_unknown_and_legacy_errors() {
+    let message=phone_service_failure("回写",409,&json!({"error":"legacy upload failed","error_code":"snapshot_conflict"}));
+    assert!(message.contains("HTTP 409") && message.contains("legacy upload failed"));
+    let message=phone_service_failure("回写",500,&json!({"error":"Import interrupted","error_code":"outcome_unknown","outcome_unknown":true}));
+    assert!(message.contains("结果未知") && message.contains("勿自动重试"));
+    assert!(!message.contains("可重试交接"));
+    let known=phone_service_failure("回写",422,&json!({"error":{"message":"Invalid snapshot","error_code":"invalid_archive","state_may_be_partial":true}}));
+    assert!(known.contains("Invalid snapshot") && !known.contains("结果未知"));
+    let unsafe_message=phone_service_failure("读取",503,&json!({"error":{"message":"injected\nlog","error_code":"helper_unavailable"}}));
+    assert!(unsafe_message.contains("helper_unavailable") && !unsafe_message.contains('\n'));
+}

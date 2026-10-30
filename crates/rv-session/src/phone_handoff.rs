@@ -29,22 +29,28 @@ impl HandoffOperation {
     }
 }
 
+fn phone_service_failure(label: &str, status: u16, response: &serde_json::Value) -> String {
+    let detail=crate::functions::service_error_message(response);
+    let unknown=crate::functions::uncertain_result(32,response) || response["outcome_unknown"]==true;
+    let suffix=if unknown { "，原操作结果未知，请先查询确认，勿自动重试" } else { "" };
+    format!("{label}失败（HTTP {status}）：{detail}{suffix}")
+}
+
 async fn app_state_result(client:&PhoneHttpClient,bundle:&str,method:&str)->Result<serde_json::Value,String> {
     let (label,timeout)=match method {"stop"=>("关闭手机 App",15),"list"=>("读取手机备份目录",30),_=>return Err("不支持的手机交接操作".into())};
     tokio::time::timeout(std::time::Duration::from_secs(timeout),async {
         let (status,mut record)=client.json(&format!("/api/app-state/{method}"),&json!({"bundle_id":bundle})).await?;
-        if status!=200 {return Err(format!("{label}请求失败（HTTP {status}）"));}
+        if status!=200 {return Err(phone_service_failure(label,status,&record));}
         let operation=record["operation_id"].as_str().filter(|id|!id.is_empty())
             .ok_or_else(||format!("{label}未返回操作标识"))?.to_string();
         loop {
             if record["operation_id"].as_str()!=Some(operation.as_str()) || record["method"]!=method {
                 return Err(format!("{label}回执不匹配"));
             }
-            if let Some(error)=record.get("error").filter(|error|!error.is_null()) {
-                let message=error["message"].as_str().or_else(||error["reason"].as_str())
-                    .or_else(||error["code"].as_str()).unwrap_or("手机操作未成功");
+            if record.get("error").is_some_and(|error|!error.is_null()) {
+                let message=phone_service_failure(label,status,&record);
                 tracing::error!(method,operation_id=%operation,error=%message,"Phone handoff operation failed");
-                return Err(format!("{label}失败：{message}"));
+                return Err(message);
             }
             match record["status"].as_str() {
                 Some("completed")=>return record.get("result").filter(|value|value.is_object()).cloned()
@@ -54,7 +60,7 @@ async fn app_state_result(client:&PhoneHttpClient,bundle:&str,method:&str)->Resu
             }
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             let (status,next)=client.json("/api/app-state/result",&json!({"operation_id":operation})).await?;
-            if status!=200 {return Err(format!("{label}结果查询失败（HTTP {status}）"));}
+            if status!=200 {return Err(phone_service_failure(label,status,&next));}
             record=next;
         }
     }).await.unwrap_or_else(|_|Err(format!("{label}超时，未确认完成")))
@@ -111,9 +117,7 @@ async fn upload(
             || response["complete"].as_bool() != Some(offset == bytes.len())
         {
             tracing::error!(http_status = status, part, "Phone backup write rejected");
-            return Err(format!(
-                "备份 {part} 回写未确认（HTTP {status}），RV 任务保持停止，可重试交接"
-            ));
+            return Err(phone_service_failure(&format!("备份 {part} 回写未确认"), status, &response));
         }
     }
     Ok(())
