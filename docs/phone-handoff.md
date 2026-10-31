@@ -61,4 +61,4 @@ RV 当前 access token 有效时隐藏「修复状态」；只有缺失、过期
 
 如果远端归还成功但确认或本地提交丢失，用户显式重试时先查询 ownership；已经归手机则只用 requester=phone 读回并比对待交接 state，匹配后完成本地提交，不重新上传或申请归属。不匹配则保留本地待交接状态并报错。
 
-普通资料导入保持手机操作语义（requester=phone），不会隐式申请 RV 控制权；RV 接管使用独立读取入口。公共 `write_shadow_backup` 是完整回写并归还操作，调用方须已经取得 RV 归属。
+普通资料同步先查询手机当前 ownership，等待结果后使用对应的 requester=phone|rv 下载 manifest 和 state，全程不申请或归还控制权。列表的旧备份缺少 owner 时显示手机图标；Shadow 会将旧 manifest 归属按 phone 返回。两部分使用同一 requester 和 manifest 的 state SHA，途中归属或备份内容改变则停止并提示重新同步，不切换 requester 重试。本地保存仍保护 RV 当前凭据，Token Source 则在同一事务中按该备份 ownership 更新：phone 对应所选来源手机，rv 对应 RV；旧 manifest 缺少 owner 按 phone。不额外启用已停止任务；RV 接管继续使用独立读取入口。公共 `write_shadow_backup` 是完整回写并归还操作，调用方须已经取得 RV 归属。

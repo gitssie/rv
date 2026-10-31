@@ -525,6 +525,7 @@ impl AddressBookApp {
         &mut self,
         id: &AppId,
         owner: EntityId,
+        message: &str,
         cx: &mut Context<Self>,
     ) {
         if self
@@ -536,7 +537,7 @@ impl AddressBookApp {
             return;
         }
         self.home.backup_syncing.remove(id);
-        self.set_status("账号备份同步失败，请查看日志", cx);
+        self.set_status(format!("账号备份同步失败：{message}"), cx);
     }
     pub(crate) fn backup_sync_disconnected(&mut self, owner: EntityId, cx: &mut Context<Self>) {
         let interrupted: Vec<_> = self

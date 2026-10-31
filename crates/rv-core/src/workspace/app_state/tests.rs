@@ -1016,5 +1016,71 @@ fn first_phone_state_import_uses_its_token_and_phone_source_without_requesting_a
     assert!(reads.try_recv().is_err(),"import does not force a new live-token read");
     store.set_token_source(&id,super::super::TokenSource::Rv).unwrap();
     store.import_app_state(&id,Some(device),&state).unwrap();
-    assert_eq!(store.token_source(&id).unwrap(),super::super::TokenSource::Rv,"later backups do not reset the chosen source");
+    assert_eq!(store.token_source(&id).unwrap(),super::super::TokenSource::Phone(Some(device)),"legacy phone ownership determines refresh responsibility on every import");
+}
+
+#[test]
+fn phone_backup_ownership_projects_token_source_without_replacing_current_credentials() {
+    use super::super::TokenSource;
+    for owner in ["phone", "rv"] {
+        let (dir, mut store, id, device) = store_fixture();
+        let mut state = fixture_state();
+        let mut manifest = parse(&state.manifest).unwrap();
+        manifest.as_dictionary_mut().unwrap().insert("owner".into(), string(owner));
+        state.manifest = encode(&manifest).unwrap();
+        let mut current = state.request_auth().unwrap();
+        current.access_token = "current-access".into();
+        current.refresh_token = Some("current-refresh".into());
+        store.save_auth(&id, &current).unwrap();
+        store.set_token_source(&id, if owner == "rv" {TokenSource::Phone(Some(device))} else {TokenSource::Rv}).unwrap();
+        let task = store.enqueue_task(&id, &TaskSpec::new("refresh", "0 0 * * * *")).unwrap();
+        store.set_task_enabled(&task.id, false).unwrap();
+        store.import_app_state(&id, Some(device), &state).unwrap();
+        let expected = if owner == "rv" {TokenSource::Rv} else {TokenSource::Phone(Some(device))};
+        assert_eq!(store.token_source(&id).unwrap(), expected);
+        let auth = store.auth(&id).unwrap().unwrap();
+        assert_eq!(auth.access_token, "current-access");
+        assert_eq!(auth.refresh_token.as_deref(), Some("current-refresh"));
+        assert!(!store.task(&task.id).unwrap().enabled);
+        drop(store);
+        let reopened = WorkspaceStore::open(&StorePaths::in_dir(dir.path().into())).unwrap();
+        assert_eq!(reopened.token_source(&id).unwrap(), expected);
+    }
+}
+#[test]
+fn invalid_owner_sync_preserves_source_credentials_and_saved_state() {
+    use super::super::TokenSource;
+    let (_dir, mut store, id, device) = store_fixture();
+    let mut state = fixture_state();
+    store.import_app_state(&id, Some(device), &state).unwrap();
+    store.set_token_source(&id, TokenSource::Rv).unwrap();
+    let before = store.app_state_info(&id).unwrap().unwrap();
+    let before_manifest = store.app_state(&id).unwrap().unwrap().manifest;
+    let mut manifest = parse(&state.manifest).unwrap();
+    manifest.as_dictionary_mut().unwrap().insert("owner".into(), string("unknown"));
+    state.manifest = encode(&manifest).unwrap();
+    assert!(store.import_app_state(&id, Some(device), &state).is_err());
+    assert_eq!(store.token_source(&id).unwrap(), TokenSource::Rv);
+    assert_eq!(store.app_state_info(&id).unwrap().unwrap().archive_sha256, before.archive_sha256);
+    assert_eq!(store.app_state(&id).unwrap().unwrap().manifest, before_manifest);
+    assert_eq!(store.auth(&id).unwrap().unwrap().access_token, state.request_auth().unwrap().access_token);
+}
+
+#[test]
+fn failed_state_save_rolls_back_the_ownership_projection() {
+    use super::super::TokenSource;
+    let (_dir, mut store, id, device) = store_fixture();
+    let mut state = fixture_state();
+    store.import_app_state(&id, Some(device), &state).unwrap();
+    let original = store.app_state(&id).unwrap().unwrap();
+    let mut manifest = parse(&state.manifest).unwrap();
+    manifest.as_dictionary_mut().unwrap().insert("owner".into(), string("rv"));
+    state.manifest = encode(&manifest).unwrap();
+    store.db.execute_batch("CREATE TEMP TRIGGER reject_state_sync BEFORE UPDATE ON app_states BEGIN SELECT RAISE(ABORT,'fixture state write failure'); END;").unwrap();
+    assert!(store.import_app_state(&id, Some(device), &state).is_err());
+    assert_eq!(store.token_source(&id).unwrap(), TokenSource::Phone(Some(device)));
+    let saved = store.app_state(&id).unwrap().unwrap();
+    assert_eq!(saved.manifest(), original.manifest());
+    assert_eq!(saved.archive(), original.archive());
+    assert_eq!(store.auth(&id).unwrap().unwrap().access_token, original.request_auth().unwrap().access_token);
 }

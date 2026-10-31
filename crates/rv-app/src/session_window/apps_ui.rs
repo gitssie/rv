@@ -339,7 +339,7 @@ impl SessionView {
                             cx,
                         )
                     });
-                    self.backup_profile_result(saved, cx);
+                    self.backup_profile_result(saved, None, cx);
                 }
             }
             AppEvent::DeviceInfo(info) => {
@@ -511,9 +511,9 @@ impl SessionView {
                     tracing::error!(app_id=app_id.as_str(),bundle_id=%bundle,error=%message,"Shadow state import failed");
                     let owner = cx.entity().entity_id();
                     if let Some(book) = self.address_book.as_ref().and_then(WeakEntity::upgrade) {
-                        book.update(cx, |book, cx| book.backup_sync_failed(app_id, owner, cx));
+                        book.update(cx, |book, cx| book.backup_sync_failed(app_id, owner, &message, cx));
                     }
-                    self.backup_profile_result(false, cx);
+                    self.backup_profile_result(false, Some(&message), cx);
                 }
                 if let AppCommand::Karing(request) = &command {
                     self.karing_failure(request.id, message, cx);

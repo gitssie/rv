@@ -112,17 +112,24 @@ impl WorkspaceStore {
         {
             return Err(invalid("state 与所选 App 不匹配"));
         }
+        let backup_owner = match manifest.as_dictionary().and_then(|fields| fields.get("owner")) {
+            None => "phone",
+            Some(Plist::String(owner)) if owner == "phone" || owner == "rv" => owner.as_str(),
+            _ => return Err(invalid("备份归属无效，未更新 Token 来源")),
+        };
         let mut state = state.clone();
         let mut auth = state.request_auth()?;
         self.db.execute_batch("SAVEPOINT import_app_state")?;
         let checkpoint = self.changes.checkpoint();
         let outcome = (|| {
             let existing_auth = self.auth(id)?;
-            // A token first imported from a phone belongs to that phone. Later
-            // backup imports preserve the user's chosen source and live token.
-            if existing_auth.is_none() {
-                if let Some(device) = source {
-                    self.db.execute("INSERT OR IGNORE INTO app_token_sources(app_id,device_id) VALUES(?1,?2)",params![id.as_str(),device.to_string()])?;
+            // Phone backup ownership is the source of refresh responsibility.
+            // Local-only imports have no observed phone owner to reconcile.
+            if let Some(device) = source {
+                if backup_owner == "rv" {
+                    self.db.execute("DELETE FROM app_token_sources WHERE app_id=?1", [id.as_str()])?;
+                } else {
+                    self.db.execute("INSERT INTO app_token_sources(app_id,device_id) VALUES(?1,?2) ON CONFLICT(app_id) DO UPDATE SET device_id=excluded.device_id",params![id.as_str(),device.to_string()])?;
                 }
             }
             if let Some(existing) = existing_auth.filter(|_| preserve_host_credentials) {

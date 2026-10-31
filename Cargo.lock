@@ -6214,6 +6214,7 @@ dependencies = [
  "rv-core",
  "serde",
  "serde_json",
+ "tar",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
@@ -6225,6 +6226,7 @@ dependencies = [
  "vnc-rs",
  "webpki-roots 0.26.11",
  "zeroize",
+ "zstd",
  "zxtouch",
 ]
 

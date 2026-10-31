@@ -142,7 +142,7 @@ pub(crate) fn confirm_backup_sync(
         alert
             .title("从手机同步账号备份？")
             .description(format!(
-                "将从“{source}”读取账号备份，更新 RV 中保存的 state 和设备请求参数。\n手机备份中的令牌与 RV 不同时，保留 RV 当前的 Access Token 和 Refresh Token。此操作不会将 RV 状态写回手机。"
+                "将从“{source}”读取账号备份，更新 RV 中保存的 state 和设备请求参数。\n手机备份中的令牌与 RV 不同时，保留 RV 当前的 Access Token 和 Refresh Token。令牌刷新将按备份归属交由手机或 RV 负责。此操作不会将 RV 状态写回手机。"
             ))
             .confirm()
             .button_props(

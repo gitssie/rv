@@ -1,6 +1,6 @@
 use super::super::apps_ui::app_icon;
 use super::*;
-use gpui_component::menu::{DropdownMenu, PopupMenuItem};
+use gpui_component::{Sizable as _, menu::{DropdownMenu, PopupMenuItem}};
 use rv_session::AppCommand;
 
 // Same system exclusions as native AppState; native entitlement checks still apply.
@@ -18,6 +18,7 @@ pub(super) struct Backup {
     note: String,
     date: String,
     snapshot: bool,
+    owner: Option<&'static str>,
 }
 #[derive(Clone, Copy, PartialEq)]
 enum EnvironmentRunStatus {
@@ -149,12 +150,13 @@ impl SessionView {
     pub(in crate::session_window) fn backup_profile_result(
         &mut self,
         saved: bool,
+        failure: Option<&str>,
         cx: &mut Context<Self>,
     ) {
         self.functions.message = if saved {
             "账号备份已保存到 RV"
         } else {
-            "账号备份保存失败，请查看日志"
+            failure.unwrap_or("账号备份保存失败，请查看日志")
         }
         .into();
         cx.notify();
@@ -553,6 +555,12 @@ impl SessionView {
                     Some(Backup {
                         app: app_id.clone(),
                         snapshot: row["kind"] == "snapshot",
+                        owner: match row.get("owner") {
+                            None => Some("phone"),
+                            Some(value) if value == "phone" => Some("phone"),
+                            Some(value) if value == "rv" => Some("rv"),
+                            _ => None,
+                        },
                         name: row["display_name"]
                             .as_str()
                             .filter(|name| !name.is_empty())
@@ -1478,7 +1486,7 @@ impl SessionView {
                     return Err("此账号正在同步，请稍后重试".into());
                 }
                 if !self.read_home_profile(id.clone(), backup.app.clone(), backup.id.clone(), cx) {
-                    book.update(cx, |book, cx| book.backup_sync_failed(&id, owner, cx));
+                    book.update(cx, |book, cx| book.backup_sync_failed(&id, owner, "请先连接手机并完成当前备份操作", cx));
                     return Err("请先连接手机并完成当前备份操作".into());
                 }
             }
@@ -1571,13 +1579,15 @@ impl SessionView {
                                 .child(backup.note.clone()),
                         )
                     })
-                    .child(div().text_xs().text_color(theme::muted(cx)).child(
-                        if current && self.functions.environment.restore_pending {
+                    .child(h_flex().gap_1().text_xs().text_color(theme::muted(cx))
+                        .when_some(backup.owner, |row, owner| row.child(
+                            Icon::new(if owner == "rv" { FunctionIcon::Monitor } else { FunctionIcon::Smartphone }).small(),
+                        ))
+                        .child(if current && self.functions.environment.restore_pending {
                             format!("{} · 恢复未完成", backup.date)
                         } else {
                             backup.date.clone()
-                        },
-                    )),
+                        })),
             )
             .child(
                 Button::new(format!("takeover-{}", backup.id))
@@ -1980,6 +1990,7 @@ mod tests {
                     note: "".into(),
                     date: "".into(),
                     snapshot: true,
+                    owner: Some("phone"),
                 };
                 view.environment_action("app-delete", Some(stale), window, cx);
                 view.execute_function(window, cx);

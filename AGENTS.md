@@ -211,3 +211,8 @@
 - 店铺详情接管按钮支持双向：RV 管理显示手机图标，Phone 来源/归属显示电脑图标；交回 RV 经原生确认框读取关联手机所选备份的最新完整 state，复用 TakeoverBackup，不直接切来源或消费旧本地 refresh token。
 
 - RV 自有可聚焦容器在 track_focus 之外必须提供稳定 id、语义 role 和 aria_label；窗口/面板根容器使用 Group，不能只加 id 或通过屏蔽 a11y 日志掩盖缺失节点。原生 Dialog/Popover/Menu 继续使用组件自带角色。
+
+## 备份 ownership 与 Token Source（2026-10-31）
+
+- 用户明确两者表示同一刷新责任。普通手机 state 同步在同一保存事务内从所选备份 manifest 的 owner 映射 Token Source：phone（旧数据缺失同样处理）对应该来源手机，rv 对应 RV；后续同步也更新，覆盖早先“重复导入保留既有来源”的约定。
+- 普通同步仍保护 RV 当前凭据，不以历史备份覆盖已轮换令牌，不自动 claim/release、不启用停止任务；只有显式交给 RV 才采用所选备份完整最新令牌对。归属查询与读取走已认证 HTTP/2。

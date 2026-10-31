@@ -59,23 +59,36 @@ pub(crate) async fn download(
             .download(&body)
             .await
             .map_err(|_| "state 下载连接中断")?;
-        if response.status() != 200 {
-            let status = response.status().as_u16();
+        let status = response.status().as_u16();
+        let limit = if status == 200 { maximum } else { 64 * 1024 };
+        let mut data = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|_| "state 下载中断")? {
+            if data.len() + chunk.len() > limit {
+                return Err("state 下载超过大小限制".into());
+            }
+            data.extend_from_slice(&chunk);
+        }
+        if status != 200 {
+            let error = serde_json::from_slice::<Value>(&data).unwrap_or(Value::Null);
             tracing::error!(
                 http_status = status,
                 part = body["part"].as_str().unwrap_or(""),
                 "Shadow state download rejected by phone"
             );
-            return Err(format!(
-                "Shadow state 读取失败（HTTP {status}），请检查备份或更新手机服务"
-            ));
-        }
-        let mut data = Vec::new();
-        while let Some(chunk) = response.chunk().await.map_err(|_| "state 下载中断")? {
-            if data.len() + chunk.len() > maximum {
-                return Err("state 下载超过大小限制".into());
-            }
-            data.extend_from_slice(&chunk);
+            return Err(
+                match error["error_code"]
+                    .as_str()
+                    .or_else(|| error["error"]["error_code"].as_str())
+                {
+                    Some("ownership_conflict") => {
+                        "备份归属已改变，本次同步已停止；请刷新备份列表后重新同步".into()
+                    }
+                    Some("snapshot_changed") => "备份内容已更新，本次同步已停止；请重新同步".into(),
+                    _ => {
+                        format!("Shadow state 读取失败（HTTP {status}），请检查备份或更新手机服务")
+                    }
+                },
+            );
         }
         Ok(data)
     })
@@ -88,7 +101,27 @@ pub async fn read_shadow_state(
     bundle: &str,
     backup: &str,
 ) -> Result<ShadowAppState, String> {
-    read_shadow_state_for(client, id, bundle, backup, "phone").await
+    if backup != format!("snapshot:{}", id.as_str()) || !crate::valid_bundle_id(bundle) {
+        return Err("Shadow 备份身份不匹配".into());
+    }
+    let api = client.api();
+    let service = api.app_state();
+    let record = service
+        .ownership(&json!({"bundle_id":bundle,"backup_id":backup}))
+        .await
+        .map_err(|error| format!("查询备份归属失败：{error}"))?;
+    let record = service
+        .wait(record, std::time::Duration::from_secs(30))
+        .await
+        .map_err(|error| format!("查询备份归属失败：{error}"))?;
+    let requester = match record["result"]["owner"].as_str() {
+        Some("phone") => "phone",
+        Some("rv") => "rv",
+        _ => return Err("手机返回的备份归属无效，请刷新列表或更新手机服务".into()),
+    };
+    // Ordinary sync observes the owner once; it never claims, releases or retries
+    // under a different requester when ownership changes during the download.
+    read_shadow_state_for(client, id, bundle, backup, requester).await
 }
 pub(crate) async fn read_shadow_state_as_rv(
     client: &PhoneHttpClient,
@@ -153,3 +186,7 @@ async fn read_shadow_state_for(
     .await
     .map_err(|_| "state 解析已停止".to_string())?
 }
+
+#[cfg(test)]
+#[path = "app_profile_tests.rs"]
+mod tests;
