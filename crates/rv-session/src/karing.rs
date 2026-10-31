@@ -73,7 +73,8 @@ impl KaringOperation {
                     headers.insert("content-type", "application/json".parse().unwrap());
                 }
                 let mut response = client
-                    .request(method, &path, headers, request.body)
+                    .api()
+                    .raw(method, &path, headers, request.body)
                     .await
                     .map_err(|_| "Karing 请求中断；修改结果可能未知".to_string())?;
                 let status = response.status().as_u16();

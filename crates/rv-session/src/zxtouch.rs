@@ -136,7 +136,11 @@ async fn exchange(
     Ok(DeviceReply {
         op: request.op,
         id: request.id,
-        status: if status == 200 { 0 } else { 1 },
+        status: if status == 200 && value.get("error").is_none_or(Value::is_null) {
+            0
+        } else {
+            1
+        },
         payload: value.to_string(),
     })
 }

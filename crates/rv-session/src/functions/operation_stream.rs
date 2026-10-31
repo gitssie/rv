@@ -11,7 +11,7 @@ pub(super) async fn request(
     headers.insert("content-type", "application/json".parse().unwrap());
     let mut response = tokio::time::timeout(
         Duration::from_secs(10),
-        client.request(
+        client.api().raw(
             Method::POST,
             "/api/app-state/stream",
             headers,

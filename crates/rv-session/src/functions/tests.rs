@@ -165,7 +165,7 @@ async fn resume_authorization_failure_keeps_unknown_and_allows_explicit_requery(
     assert_eq!(query, json!({"action":"result","operation_id":"original"}));
     reply(
         &mut socket,
-        json!({"operation_id":"original","status":"completed","result":{}}),
+        json!({"operation_id":"original","method":"list","status":"completed","result":{}}),
     )
     .await;
     assert!(
@@ -368,7 +368,7 @@ async fn resumed_worker_requires_query_before_code_submission() {
         let (_, query) = packet(&mut socket).await;
         assert_eq!(query["action"], "result");
         assert_eq!(query["operation_id"], "old-operation");
-        reply(&mut socket,json!({"operation_id":"old-operation","status":"requires_verification_code","challenge":{"challenge_id":"challenge"}})).await;
+        reply(&mut socket,json!({"operation_id":"old-operation","method":"signInAppStore","status":"requires_verification_code","challenge":{"challenge_id":"challenge"}})).await;
         socket = reconnect(&listener, socket).await;
         let (_, submit) = packet(&mut socket).await;
         assert_eq!(submit["action"], "submit_code");
@@ -472,7 +472,7 @@ async fn next_operation_reauthorizes_on_shared_connection() {
             assert_eq!(invoke["action"], "invoke");
             reply(
                 &mut socket,
-                json!({"operation_id":id,"status":"completed","result":{}}),
+                json!({"operation_id":id,"method":"queryState","status":"completed","result":{}}),
             )
             .await;
             // The next operation reuses this connection.
@@ -529,7 +529,7 @@ async fn logout_resolves_phone_cloud_on_short_sockets_before_one_write() {
         );
         reply(
             &mut socket,
-            json!({"operation_id":"read","status":"running"}),
+            json!({"operation_id":"read","method":"queryAccountState","status":"running"}),
         )
         .await;
         socket = reconnect(&listener, socket).await;
@@ -539,7 +539,7 @@ async fn logout_resolves_phone_cloud_on_short_sockets_before_one_write() {
         );
         reply(
             &mut socket,
-            json!({"operation_id":"read","status":"completed","result":{
+            json!({"operation_id":"read","method":"queryAccountState","status":"completed","result":{
                 "icloud":{"status":"signed_in","account":{"apple_id":"cloud@example.test"}},
                 "app_store":{"status":"signed_in","account":{"apple_id":"store@example.test"}}
             }}),
@@ -605,7 +605,7 @@ async fn absent_cloud_never_submits_logout_or_falls_back_to_store() {
         assert_eq!(packet(&mut socket).await.1["method"], "queryAccountState");
         reply(
             &mut socket,
-            json!({"operation_id":"read","status":"completed","result":{
+            json!({"operation_id":"read","method":"queryAccountState","status":"completed","result":{
                 "icloud":{"status":"not_signed_in","account":null},
                 "app_store":{"status":"signed_in","account":{"apple_id":"store@example.test"}}
             }}),
@@ -666,7 +666,7 @@ async fn query_followup_rechecks_bound_account_before_exactly_one_mutation() {
             };
             reply(
                 &mut socket,
-                json!({"operation_id":"read","status":"completed","result":{
+                json!({"operation_id":"read","method":"queryAccountState","status":"completed","result":{
                     "icloud":{"status":"signed_in","account":{"apple_id":current}},
                     "identity":{"status":"signed_in","account":{"apple_id":current}}
                 }}),
@@ -1144,7 +1144,7 @@ async fn cloud_login_resolves_fresh_store_account_before_invoking() {
         let (_, query) = packet(&mut socket).await;
         assert_eq!(query["method"], "queryAccountState");
         reply(&mut socket, json!({
-            "operation_id":"account-read", "status":"completed", "result": {
+            "operation_id":"account-read", "method":"queryAccountState", "status":"completed", "result": {
                 "app_store":{"status":"signed_in","account":{"apple_id":"fresh@test","authenticated":true}},
                 "icloud":{"status":"not_signed_in","account":null},
                 "identity":{"status":"signed_in","account":{"apple_id":"unrelated@test"}}
@@ -1524,17 +1524,52 @@ async fn managed_manual_change_preserves_ready_and_does_not_switch_other_media_a
 
 #[test]
 fn app_state_stable_errors_preserve_legacy_codes_and_known_partial_failures() {
-    assert!(uncertain_result(32, &json!({"error":{"code":5,"error_code":"operation_failed","outcome_unknown":true}})));
-    assert!(uncertain_result(32, &json!({"error":{"code":5,"error_code":"outcome_unknown"}})));
-    assert!(!uncertain_result(32, &json!({"error":{"code":5,"error_code":"restore_failed","state_may_be_partial":true}})));
-    assert!(!uncertain_result(31, &json!({"error":{"code":5,"error_code":"outcome_unknown"}})));
-    let failure=json!({"error":{"code":5,"error_code":"snapshot_busy","message":"Snapshot is busy"}});
+    assert!(uncertain_result(
+        32,
+        &json!({"error":{"code":5,"error_code":"operation_failed","outcome_unknown":true}})
+    ));
+    assert!(uncertain_result(
+        32,
+        &json!({"error":{"code":5,"error_code":"outcome_unknown"}})
+    ));
+    assert!(!uncertain_result(
+        32,
+        &json!({"error":{"code":5,"error_code":"restore_failed","state_may_be_partial":true}})
+    ));
+    assert!(!uncertain_result(
+        31,
+        &json!({"error":{"code":5,"error_code":"outcome_unknown"}})
+    ));
+    let failure =
+        json!({"error":{"code":5,"error_code":"snapshot_busy","message":"Snapshot is busy"}});
     assert_eq!(service_error_code(&failure), Some("snapshot_busy"));
     assert_eq!(service_error(&failure), "原生请求失败：Snapshot is busy");
-    assert_eq!(service_error_message(&json!({"error":"legacy raw error"})), "legacy raw error");
-    assert_eq!(service_error_message(&json!({"error":{"reason":"legacy_reason"}})), "legacy_reason");
-    assert_eq!(service_error_code(&json!({"error":{"error_code":"bad/code","code":"legacy_code"}})), Some("legacy_code"));
-    assert_eq!(service_error_message(&json!({"error":{"message":"bad\nlog", "error_code":"snapshot_busy"}})), "snapshot_busy");
-    assert_eq!(service_error_message(&json!({"error":{"message":"x".repeat(1025), "error_code":"snapshot_busy"}})), "snapshot_busy");
-    assert_eq!(service_error_message(&json!({"error":{"error_code":"bad/code"}})), "unknown");
+    assert_eq!(
+        service_error_message(&json!({"error":"legacy raw error"})),
+        "legacy raw error"
+    );
+    assert_eq!(
+        service_error_message(&json!({"error":{"reason":"legacy_reason"}})),
+        "legacy_reason"
+    );
+    assert_eq!(
+        service_error_code(&json!({"error":{"error_code":"bad/code","code":"legacy_code"}})),
+        Some("legacy_code")
+    );
+    assert_eq!(
+        service_error_message(
+            &json!({"error":{"message":"bad\nlog", "error_code":"snapshot_busy"}})
+        ),
+        "snapshot_busy"
+    );
+    assert_eq!(
+        service_error_message(
+            &json!({"error":{"message":"x".repeat(1025), "error_code":"snapshot_busy"}})
+        ),
+        "snapshot_busy"
+    );
+    assert_eq!(
+        service_error_message(&json!({"error":{"error_code":"bad/code"}})),
+        "unknown"
+    );
 }

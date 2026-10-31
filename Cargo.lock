@@ -6225,6 +6225,7 @@ dependencies = [
  "vnc-rs",
  "webpki-roots 0.26.11",
  "zeroize",
+ "zxtouch",
 ]
 
 [[package]]
@@ -9654,4 +9655,16 @@ dependencies = [
  "serde",
  "syn 3.0.4",
  "winnow 1.0.4",
+]
+
+[[package]]
+name = "zxtouch"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "h2",
+ "http",
+ "reqwest",
+ "serde_json",
+ "tokio",
 ]

@@ -441,12 +441,20 @@ pub fn uncertain_result(task: u8, record: &Value) -> bool {
             || error["archive_may_be_partial"] == true))
 }
 pub(crate) fn service_error_code(response: &Value) -> Option<&str> {
-    [response["error"]["error_code"].as_str(), response["error_code"].as_str(), response["error"]["code"].as_str()]
-        .into_iter().flatten()
-        .find(|s| !s.is_empty() && s.len() <= 64 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'))
+    [
+        response["error"]["error_code"].as_str(),
+        response["error_code"].as_str(),
+        response["error"]["code"].as_str(),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|s| {
+        !s.is_empty() && s.len() <= 64 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    })
 }
 pub(crate) fn service_error_message(response: &Value) -> String {
-    response["error"]["message"].as_str()
+    response["error"]["message"]
+        .as_str()
         .or_else(|| response["message"].as_str())
         .or_else(|| response["error"]["reason"].as_str())
         .or_else(|| response["error"].as_str())
@@ -488,9 +496,8 @@ impl Wire {
         })
     }
     async fn request(&mut self, module: u8, body: Value) -> Result<Value, String> {
-        let prefix = match module {
-            31 => "/api/apple",
-            32 => "/api/app-state",
+        match module {
+            31 | 32 => (),
             _ => return Err("未知原生模块".into()),
         };
         let (action, params) = if body["action"] == "invoke" {
@@ -517,11 +524,43 @@ impl Wire {
         if params.to_string().len() > 32768 {
             return Err("功能请求过大".into());
         }
-        let (_, result) = self
-            .client
-            .json(&format!("{prefix}/{action}"), &params)
-            .await?;
-        Ok(result)
+        let api = self.client.api();
+        let service = if module == 31 {
+            api.apple().operations()
+        } else {
+            api.app_state().operations()
+        };
+        let result = match action.as_str() {
+            "submit_code" => {
+                service
+                    .submit_code(
+                        params["operation_id"].as_str().unwrap_or(""),
+                        params["challenge_id"].as_str().unwrap_or(""),
+                        params["code"].as_str().unwrap_or(""),
+                    )
+                    .await
+            }
+            "cancel_challenge" => {
+                service
+                    .cancel_challenge(
+                        params["operation_id"].as_str().unwrap_or(""),
+                        params["challenge_id"].as_str().unwrap_or(""),
+                    )
+                    .await
+            }
+            "result" => {
+                service
+                    .result(params["operation_id"].as_str().unwrap_or(""))
+                    .await
+            }
+            _ => service.invoke(&action, &params).await,
+        };
+        match result {
+            // Admission/challenge rejection has no operation record; let the RV
+            // state machine show the native reason without treating it as a disconnect.
+            Err(zxtouch::Error::Rejected { body, .. }) => Ok(body),
+            other => other.map_err(|error| error.to_string()),
+        }
     }
 }
 

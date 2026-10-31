@@ -204,7 +204,8 @@ async fn screen_size(client: &PhoneHttpClient) -> Result<(u32, u32), String> {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert("content-type", "application/json".parse().unwrap());
         let mut reply = client
-            .request(
+            .api()
+            .raw(
                 reqwest::Method::POST,
                 "/api/device/screenshot",
                 headers,

@@ -30,69 +30,136 @@ impl HandoffOperation {
 }
 
 fn phone_service_failure(label: &str, status: u16, response: &serde_json::Value) -> String {
-    let detail=crate::functions::service_error_message(response);
-    let unknown=crate::functions::uncertain_result(32,response) || response["outcome_unknown"]==true;
-    let suffix=if unknown { "，原操作结果未知，请先查询确认，勿自动重试" } else { "" };
+    let detail = crate::functions::service_error_message(response);
+    let unknown =
+        crate::functions::uncertain_result(32, response) || response["outcome_unknown"] == true;
+    let suffix = if unknown {
+        "，原操作结果未知，请先查询确认，勿自动重试"
+    } else {
+        ""
+    };
     format!("{label}失败（HTTP {status}）：{detail}{suffix}")
 }
 
-async fn app_state_result(client:&PhoneHttpClient,bundle:&str,method:&str)->Result<serde_json::Value,String> {
-    let (label,timeout)=match method {"stop"=>("关闭手机 App",15),"list"=>("读取手机备份目录",30),_=>return Err("不支持的手机交接操作".into())};
-    tokio::time::timeout(std::time::Duration::from_secs(timeout),async {
-        let (status,mut record)=client.json(&format!("/api/app-state/{method}"),&json!({"bundle_id":bundle})).await?;
-        if status!=200 {return Err(phone_service_failure(label,status,&record));}
-        let operation=record["operation_id"].as_str().filter(|id|!id.is_empty())
-            .ok_or_else(||format!("{label}未返回操作标识"))?.to_string();
-        loop {
-            if record["operation_id"].as_str()!=Some(operation.as_str()) || record["method"]!=method {
-                return Err(format!("{label}回执不匹配"));
+async fn app_state_result(
+    client: &PhoneHttpClient,
+    bundle: &str,
+    method: &str,
+) -> Result<serde_json::Value, String> {
+    app_state_request(client, method, &json!({"bundle_id":bundle})).await
+}
+
+async fn app_state_request(
+    client: &PhoneHttpClient,
+    method: &str,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let (label, timeout) = match method {
+        "stop" => ("关闭手机 App", 15),
+        "list" => ("读取手机备份目录", 30),
+        "claim" => ("申请 RV 归属", 30),
+        "release" => ("归还手机归属", 30),
+        "ownership" => ("查询备份归属", 30),
+        _ => return Err("不支持的手机交接操作".into()),
+    };
+    let api = client.api();
+    let service = api.app_state().operations();
+    let record = service
+        .invoke(method, params)
+        .await
+        .map_err(|error| match error {
+            zxtouch::Error::Rejected { status, body } => {
+                phone_service_failure(label, status, &body)
             }
-            if record.get("error").is_some_and(|error|!error.is_null()) {
-                let message=phone_service_failure(label,status,&record);
-                tracing::error!(method,operation_id=%operation,error=%message,"Phone handoff operation failed");
-                return Err(message);
-            }
-            match record["status"].as_str() {
-                Some("completed")=>return record.get("result").filter(|value|value.is_object()).cloned()
-                    .ok_or_else(||format!("{label}缺少结果")),
-                Some("running"|"pending")=>{},
-                _=>return Err(format!("{label}状态无效")),
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            let (status,next)=client.json("/api/app-state/result",&json!({"operation_id":operation})).await?;
-            if status!=200 {return Err(phone_service_failure(label,status,&next));}
-            record=next;
-        }
-    }).await.unwrap_or_else(|_|Err(format!("{label}超时，未确认完成")))
+            other => format!("{label}失败：{other}"),
+        })?;
+    let record = service
+        .wait(record, std::time::Duration::from_secs(timeout))
+        .await
+        .map_err(|error| match error {
+            zxtouch::Error::Operation { record } => phone_service_failure(label, 200, &record),
+            other => format!("{label}失败：{other}"),
+        })?;
+    record
+        .get("result")
+        .filter(|value| value.is_object())
+        .cloned()
+        .ok_or_else(|| format!("{label}缺少结果"))
+}
+
+async fn change_ownership(
+    client: &PhoneHttpClient,
+    bundle: &str,
+    backup: &str,
+    claim: bool,
+) -> Result<(), String> {
+    let method = if claim { "claim" } else { "release" };
+    let result = app_state_request(
+        client,
+        method,
+        &json!({"bundle_id":bundle,"backup_id":backup}),
+    )
+    .await?;
+    let expected = if claim { "rv" } else { "phone" };
+    if result["owner"] != expected {
+        return Err("手机归属变更未确认".into());
+    }
+    Ok(())
 }
 
 /// A stop ACK alone is insufficient: native completion must confirm that both
 /// the main app and its extensions have exited.
-async fn stop_phone_app(client:&PhoneHttpClient,bundle:&str)->Result<(),String> {
-    let result=app_state_result(client,bundle,"stop").await?;
-    if result["bundle_id"]==bundle && result["running"]==false
-        && result["main_running"]==false && result["extension_process_count"]==0 {
+async fn stop_phone_app(client: &PhoneHttpClient, bundle: &str) -> Result<(), String> {
+    let result = app_state_result(client, bundle, "stop").await?;
+    if result["bundle_id"] == bundle
+        && result["running"] == false
+        && result["main_running"] == false
+        && result["extension_process_count"] == 0
+    {
         Ok(())
-    } else {Err("手机 App 进程尚未确认退出，未回写备份".into())}
+    } else {
+        Err("手机 App 进程尚未确认退出，未回写备份".into())
+    }
 }
 
 /// Catalog current_idfv is read directly from Shadow preferences by the phone;
 /// active detection never reads or depends on access/refresh tokens.
-async fn require_inactive_backup(client:&PhoneHttpClient,id:&AppId,bundle:&str)->Result<(),String> {
-    let catalog=app_state_result(client,bundle,"list").await?;
-    if catalog["bundle_id"]!=bundle || !catalog["backups"].is_array() {
+async fn require_inactive_backup(
+    client: &PhoneHttpClient,
+    id: &AppId,
+    bundle: &str,
+) -> Result<(), String> {
+    let catalog = app_state_result(client, bundle, "list").await?;
+    if catalog["bundle_id"] != bundle || !catalog["backups"].is_array() {
         return Err("手机备份目录与所选 App 不匹配，未交接给 RV".into());
     }
-    let value=catalog.get("current_idfv").ok_or("手机服务尚未提供独立的 active 查询，请更新 TrollVNC 至 4.0-16 或以上")?;
-    if value.is_null() {return Ok(());}
-    let current=AppId::from_idfv(value.as_str().unwrap_or(""))
-        .map_err(|_|"手机当前环境 IDFV 无效，未交接给 RV")?;
-    if current==*id {
+    let value = catalog
+        .get("current_idfv")
+        .ok_or("手机服务尚未提供独立的 active 查询，请更新 TrollVNC 至 4.0-16 或以上")?;
+    if value.is_null() {
+        return Ok(());
+    }
+    let current = AppId::from_idfv(value.as_str().unwrap_or(""))
+        .map_err(|_| "手机当前环境 IDFV 无效，未交接给 RV")?;
+    if current == *id {
         return Err("该备份仍是手机当前 active 环境。请先在 Shadow 保存最新备份并切换到其他环境，再回来交给 RV".into());
     }
     Ok(())
 }
 
+async fn takeover_state(
+    client: &PhoneHttpClient,
+    id: &AppId,
+    bundle: &str,
+    backup: &str,
+) -> Result<ShadowAppState, String> {
+    require_inactive_backup(client, id, bundle).await?;
+    change_ownership(client, bundle, backup, true).await?;
+    // A failed download/local commit keeps the RV claim for explicit recovery.
+    let state = crate::app_profile::read_shadow_state_as_rv(client, id, bundle, backup).await?;
+    require_inactive_backup(client, id, bundle).await?;
+    Ok(state)
+}
 
 async fn upload(
     client: &PhoneHttpClient,
@@ -106,18 +173,24 @@ async fn upload(
     let sha = state_sha256(bytes);
     let mut offset = 0;
     for chunk in bytes.chunks(192 * 1024) {
-        let (status, response) = client.json("/api/app-state/upload", &json!({
-            "bundle_id":bundle,"backup_id":backup,"transfer_id":operation.to_ascii_uppercase(),
+        let response = client.api().app_state().upload(&json!({
+            "bundle_id":bundle,"backup_id":backup,"requester":"rv","transfer_id":operation.to_ascii_uppercase(),
             "part":part,"offset":offset,"total":bytes.len(),"sha256":sha,"data_sha256":data_sha,"data":STANDARD.encode(chunk),
-        })).await?;
+        })).await.map_err(|error| match error {
+            zxtouch::Error::Rejected { status, body } => phone_service_failure("备份回写", status, &body),
+            other => format!("备份回写未确认：{other}"),
+        })?;
         offset += chunk.len();
-        if status != 200
-            || response["ok"] != true
+        if response["ok"] != true
             || response["received"].as_u64() != Some(offset as u64)
             || response["complete"].as_bool() != Some(offset == bytes.len())
         {
-            tracing::error!(http_status = status, part, "Phone backup write rejected");
-            return Err(phone_service_failure(&format!("备份 {part} 回写未确认"), status, &response));
+            tracing::error!(part, "Phone backup write rejected");
+            return Err(phone_service_failure(
+                &format!("备份 {part} 回写未确认"),
+                200,
+                &response,
+            ));
         }
     }
     Ok(())
@@ -148,14 +221,21 @@ async fn write_parts(
     local_manifest: &[u8],
     local_archive: &[u8],
 ) -> Result<(), String> {
-    if !crate::valid_bundle_id(bundle) {return Err("交接 App 身份无效".into());}
-    stop_phone_app(client,bundle).await?;
-    write_stopped_parts(client,id,bundle,operation,local_manifest,local_archive).await
+    if !crate::valid_bundle_id(bundle) {
+        return Err("交接 App 身份无效".into());
+    }
+    stop_phone_app(client, bundle).await?;
+    write_stopped_parts(client, id, bundle, operation, local_manifest, local_archive).await?;
+    change_ownership(client, bundle, &format!("snapshot:{}", id.as_str()), false).await
 }
 async fn write_stopped_parts(
-    client:&PhoneHttpClient,id:&AppId,bundle:&str,operation:&str,
-    local_manifest:&[u8],local_archive:&[u8],
-)->Result<(),String> {
+    client: &PhoneHttpClient,
+    id: &AppId,
+    bundle: &str,
+    operation: &str,
+    local_manifest: &[u8],
+    local_archive: &[u8],
+) -> Result<(), String> {
     let backup = format!("snapshot:{}", id.as_str());
     let expected = plist::Value::from_reader(std::io::Cursor::new(local_manifest))
         .map_err(|_| "本地备份清单无效")?;
@@ -177,7 +257,7 @@ async fn write_stopped_parts(
     }
     let original = crate::app_profile::download(
         client,
-        json!({"bundle_id":bundle,"backup_id":backup,"part":"manifest"}),
+        json!({"bundle_id":bundle,"backup_id":backup,"requester":"rv","part":"manifest"}),
         MAX_MANIFEST_BYTES,
     )
     .await?;
@@ -199,11 +279,14 @@ async fn write_stopped_parts(
     let mut outgoing = original.clone();
     outgoing.insert(
         "stateArchiveInfo".into(),
-        expected_fields.get("stateArchiveInfo")
-            .ok_or("本地备份缺少 state 信息")?.clone(),
+        expected_fields
+            .get("stateArchiveInfo")
+            .ok_or("本地备份缺少 state 信息")?
+            .clone(),
     );
     let mut outgoing_manifest = Vec::new();
-    plist::Value::Dictionary(outgoing).to_writer_binary(&mut outgoing_manifest)
+    plist::Value::Dictionary(outgoing)
+        .to_writer_binary(&mut outgoing_manifest)
         .map_err(|_| "生成回写清单失败")?;
     upload(
         client,
@@ -227,20 +310,70 @@ async fn write_stopped_parts(
     .await?;
     let manifest = crate::app_profile::download(
         client,
-        json!({"bundle_id":bundle,"backup_id":backup,"part":"manifest"}),
+        json!({"bundle_id":bundle,"backup_id":backup,"requester":"rv","part":"manifest"}),
         MAX_MANIFEST_BYTES,
     )
     .await?;
     if manifest != outgoing_manifest {
         return Err("手机备份清单读回不一致，交接尚未完成".into());
     }
-    let archive = crate::app_profile::download(client, json!({"bundle_id":bundle,"backup_id":backup,"part":"state","state_sha256":state_sha256(local_archive)}), MAX_STATE_BYTES).await?;
+    let archive = crate::app_profile::download(client, json!({"bundle_id":bundle,"backup_id":backup,"requester":"rv","part":"state","state_sha256":state_sha256(local_archive)}), MAX_STATE_BYTES).await?;
     if archive.len() != local_archive.len() || state_sha256(&archive) != state_sha256(local_archive)
     {
         return Err("手机 state 读回哈希或大小不一致，交接尚未完成".into());
     }
     Ok(())
 }
+async fn confirm_released_state(
+    client: &PhoneHttpClient,
+    bundle: &str,
+    backup: &str,
+    expected: &[u8],
+) -> Result<(), String> {
+    let bytes = crate::app_profile::download(
+        client,
+        json!({"bundle_id":bundle,"backup_id":backup,
+        "requester":"phone","part":"state","state_sha256":state_sha256(expected)}),
+        MAX_STATE_BYTES,
+    )
+    .await?;
+    if bytes != expected {
+        return Err("已归还手机的 state 与待交接内容不同，未重复上传".into());
+    }
+    Ok(())
+}
+
+async fn publish_or_confirm_handoff(
+    client: &PhoneHttpClient,
+    app_id: &AppId,
+    bundle: &str,
+    backup: &str,
+    operation_id: &str,
+    manifest: &[u8],
+    archive: &[u8],
+) -> Result<(), String> {
+    let ownership = app_state_request(
+        client,
+        "ownership",
+        &json!({"bundle_id":bundle,"backup_id":backup}),
+    )
+    .await?;
+    match ownership["owner"].as_str() {
+        Some("rv") => {
+            stop_phone_app(client, bundle).await?;
+            write_stopped_parts(client, app_id, bundle, operation_id, manifest, archive).await?;
+            change_ownership(client, bundle, backup, false).await?;
+        }
+        Some("phone") => {
+            // A lost release acknowledgement/local commit may leave ToPhone locally.
+            // Confirm the published bytes; do not replay the upload or claim ownership.
+            confirm_released_state(client, bundle, backup, archive).await?;
+        }
+        _ => return Err("手机备份归属无效，未交接".into()),
+    }
+    Ok(())
+}
+
 async fn execute(client: &PhoneHttpClient, command: &AppCommand) -> Result<(), String> {
     if let AppCommand::TakeoverBackup {
         app_id,
@@ -265,9 +398,7 @@ async fn execute(client: &PhoneHttpClient, command: &AppCommand) -> Result<(), S
         .await
         .map_err(|_| "RV 接管检查已停止")?
         .map_err(|error| error.to_string())?;
-        require_inactive_backup(client,app_id,bundle).await?;
-        let state = crate::read_shadow_state(client, app_id, bundle, backup).await?;
-        require_inactive_backup(client,app_id,bundle).await?;
+        let state = takeover_state(client, app_id, bundle, backup).await?;
         let id = app_id.clone();
         let device = *device_id;
         let operation = operation_id.clone();
@@ -293,15 +424,24 @@ async fn execute(client: &PhoneHttpClient, command: &AppCommand) -> Result<(), S
         return Err("交接备份身份无效".into());
     }
     let paths = StorePaths::in_dir(store_root.clone());
-    let check_paths=paths.clone();let check_id=app_id.clone();let check_operation=operation_id.clone();let check_device=*device_id;
-    tokio::task::spawn_blocking(move|| {
-        let store=WorkspaceStore::open(&check_paths)?;let execution=store.execution(&check_id)?;
-        if execution.mode!=ExecutionMode::ToPhone || execution.operation_id!=check_operation || execution.device_id!=Some(check_device) {
+    let check_paths = paths.clone();
+    let check_id = app_id.clone();
+    let check_operation = operation_id.clone();
+    let check_device = *device_id;
+    tokio::task::spawn_blocking(move || {
+        let store = WorkspaceStore::open(&check_paths)?;
+        let execution = store.execution(&check_id)?;
+        if execution.mode != ExecutionMode::ToPhone
+            || execution.operation_id != check_operation
+            || execution.device_id != Some(check_device)
+        {
             return Err(StoreError::Invalid("交接状态或目标手机已改变".into()));
         }
-        Ok::<_,StoreError>(())
-    }).await.map_err(|_|"交接检查已停止")?.map_err(|error|error.to_string())?;
-    stop_phone_app(client,bundle).await?;
+        Ok::<_, StoreError>(())
+    })
+    .await
+    .map_err(|_| "交接检查已停止")?
+    .map_err(|error| error.to_string())?;
     let state = loop {
         let paths = paths.clone();
         let id = app_id.clone();
@@ -325,7 +465,16 @@ async fn execute(client: &PhoneHttpClient, command: &AppCommand) -> Result<(), S
             Err(error) => return Err(error.to_string()),
         }
     };
-    write_stopped_parts(client,app_id,bundle,operation_id,state.manifest(),state.archive()).await?;
+    publish_or_confirm_handoff(
+        client,
+        app_id,
+        bundle,
+        backup,
+        operation_id,
+        state.manifest(),
+        state.archive(),
+    )
+    .await?;
     let sha = state_sha256(state.archive());
     let id = app_id.clone();
     let operation = operation_id.clone();

@@ -522,7 +522,8 @@ pub async fn inspect_phone(
             "application/json".parse().expect("static header"),
         );
         let mut response = client
-            .request(
+            .api()
+            .raw(
                 reqwest::Method::POST,
                 "/api/device/screenshot",
                 headers,

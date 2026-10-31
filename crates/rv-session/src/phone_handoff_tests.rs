@@ -77,7 +77,11 @@ async fn run_case(corrupt_readback: bool, different_data: bool, stop_mode:u8) {
                         "result":{"bundle_id":BUNDLE,"running":stop_mode==2,"main_running":stop_mode==2,"extension_process_count":0}});
                     if stop_mode==1 {result["error"]=json!({"message":"fixture stop failed"});}
                     result.to_string().into_bytes()
+                } else if path == "/api/app-state/release" {
+                    assert_eq!(input["backup_id"],format!("snapshot:{ID}"));
+                    json!({"operation_id":"release-op","method":"release","status":"completed","result":{"owner":"phone"}}).to_string().into_bytes()
                 } else if path == "/api/app-state/upload" {
+                    assert_eq!(input["requester"],"rv");
                     assert!(phone.stopped,"write must follow confirmed process exit");
                     let part = input["part"].as_str().unwrap().to_string();
                     let before=plist::Value::from_reader(std::io::Cursor::new(&phone.manifest)).unwrap();
@@ -99,6 +103,7 @@ async fn run_case(corrupt_readback: bool, different_data: bool, stop_mode:u8) {
                 } else {
                     assert!(phone.stopped,"download must follow confirmed process exit");
                     assert_eq!(path, "/api/app-state/download");
+                    assert_eq!(input["requester"],"rv");
                     if input["part"] == "manifest" {
                         phone.manifest.clone()
                     } else if corrupt_readback {
@@ -139,6 +144,8 @@ async fn run_case(corrupt_readback: bool, different_data: bool, stop_mode:u8) {
     assert_eq!(actual["archiveInfo"].as_dictionary().unwrap()["sha256"].as_string(),Some(if different_data {"b"}else{"a"}.repeat(64).as_str()));
     assert_eq!(actual.get("stateArchiveInfo"),local.as_dictionary().unwrap().get("stateArchiveInfo"));
     assert_eq!(phone.state.len(),archive.len());
+    assert_eq!(phone.calls.last().unwrap(),if corrupt_readback {"/api/app-state/download"}else{"/api/app-state/release"});
+    assert_eq!(phone.calls.iter().filter(|p|p.as_str()=="/api/app-state/release").count(),if corrupt_readback {0}else{1});
     server.abort();
 }
 #[tokio::test]
@@ -230,4 +237,87 @@ fn phone_handoff_error_details_preserve_unknown_and_legacy_errors() {
     assert!(known.contains("Invalid snapshot") && !known.contains("结果未知"));
     let unsafe_message=phone_service_failure("读取",503,&json!({"error":{"message":"injected\nlog","error_code":"helper_unavailable"}}));
     assert!(unsafe_message.contains("helper_unavailable") && !unsafe_message.contains('\n'));
+}
+
+#[tokio::test]
+async fn takeover_claim_precedes_rv_download_and_download_failure_keeps_claim() {
+    let calls=Arc::new(Mutex::new(Vec::new()));let observed=calls.clone();
+    let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port=listener.local_addr().unwrap().port();
+    let server=tokio::spawn(async move {
+        let (socket,_)=listener.accept().await.unwrap();
+        let service=service_fn(move|request:Request<Incoming>| {
+            let observed=observed.clone();
+            async move {
+                let path=request.uri().path().to_owned();observed.lock().unwrap().push(path.clone());
+                let input:serde_json::Value=serde_json::from_slice(&request.into_body().collect().await.unwrap().to_bytes()).unwrap();
+                let (status,body)=match path.as_str() {
+                    "/api/app-state/list"=>(200,json!({"operation_id":"list-op","method":"list","status":"completed","result":{"bundle_id":BUNDLE,"current_idfv":null,"backups":[]}})),
+                    "/api/app-state/claim"=>{
+                        assert_eq!(input,json!({"bundle_id":BUNDLE,"backup_id":format!("snapshot:{ID}")}));
+                        (200,json!({"operation_id":"claim-op","method":"claim","status":"completed","result":{"owner":"rv"}}))
+                    },
+                    "/api/app-state/download"=>{assert_eq!(input["requester"],"rv");(503,json!({"error":"fixture unavailable"}))},
+                    _=>panic!("unexpected mutation {path}"),
+                };
+                Ok::<_,std::convert::Infallible>(Response::builder().status(status).body(Full::new(Bytes::from(body.to_string()))).unwrap())
+            }
+        });
+        let _=hyper::server::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new()).serve_connection(hyper_util::rt::TokioIo::new(socket),service).await;
+    });
+    let client=PhoneHttpClient::new("127.0.0.1",port,"fixture".into()).unwrap();
+    assert!(takeover_state(&client,&AppId::from_idfv(ID).unwrap(),BUNDLE,&format!("snapshot:{ID}")).await.is_err());
+    assert_eq!(calls.lock().unwrap().as_slice(),["/api/app-state/list","/api/app-state/claim","/api/app-state/download"]);
+    server.abort();
+}
+
+#[tokio::test]
+async fn released_handoff_recovery_only_reads_and_compares_without_upload_or_claim() {
+    for matches in [true,false] {
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port=listener.local_addr().unwrap().port();
+        let server=tokio::spawn(async move {
+            let (socket,_)=listener.accept().await.unwrap();
+            let service=service_fn(move|request:Request<Incoming>|async move {
+                assert_eq!(request.uri().path(),"/api/app-state/download");
+                let input:serde_json::Value=serde_json::from_slice(&request.into_body().collect().await.unwrap().to_bytes()).unwrap();
+                assert_eq!(input["requester"],"phone");assert_eq!(input["state_sha256"],state_sha256(b"latest"));
+                Ok::<_,std::convert::Infallible>(Response::new(Full::new(Bytes::from_static(if matches {b"latest"}else{b"older"}))))
+            });
+            let _=hyper::server::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new()).serve_connection(hyper_util::rt::TokioIo::new(socket),service).await;
+        });
+        let client=PhoneHttpClient::new("127.0.0.1",port,"fixture".into()).unwrap();
+        assert_eq!(confirm_released_state(&client,BUNDLE,&format!("snapshot:{ID}"),b"latest").await.is_ok(),matches);
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn already_phone_retry_preserves_running_phone_without_stop_or_upload() {
+    let calls=Arc::new(Mutex::new(Vec::new()));let observed=calls.clone();
+    let running=Arc::new(Mutex::new(true));let phone_running=running.clone();
+    let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let port=listener.local_addr().unwrap().port();
+    let server=tokio::spawn(async move {
+        let (socket,_)=listener.accept().await.unwrap();
+        let service=service_fn(move|request:Request<Incoming>| {
+            let observed=observed.clone();let phone_running=phone_running.clone();
+            async move {
+                let path=request.uri().path().to_owned();observed.lock().unwrap().push(path.clone());
+                let body=if path=="/api/app-state/ownership" {
+                    json!({"operation_id":"owner-op","method":"ownership","status":"completed","result":{"owner":"phone"}}).to_string().into_bytes()
+                } else if path=="/api/app-state/download" {
+                    assert!(*phone_running.lock().unwrap());
+                    let input:serde_json::Value=serde_json::from_slice(&request.into_body().collect().await.unwrap().to_bytes()).unwrap();
+                    assert_eq!(input["requester"],"phone");b"latest".to_vec()
+                } else {panic!("read-only retry must not mutate phone: {path}")};
+                Ok::<_,std::convert::Infallible>(Response::new(Full::new(Bytes::from(body))))
+            }
+        });
+        let _=hyper::server::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new()).serve_connection(hyper_util::rt::TokioIo::new(socket),service).await;
+    });
+    let client=PhoneHttpClient::new("127.0.0.1",port,"fixture".into()).unwrap();
+    publish_or_confirm_handoff(&client,&AppId::from_idfv(ID).unwrap(),BUNDLE,&format!("snapshot:{ID}"),"operation",b"unused",b"latest").await.unwrap();
+    assert!(*running.lock().unwrap());
+    assert_eq!(calls.lock().unwrap().as_slice(),["/api/app-state/ownership","/api/app-state/download"]);
+    server.abort();
 }

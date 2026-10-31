@@ -51,3 +51,14 @@ RV 当前 access token 有效时隐藏「修复状态」；只有缺失、过期
 原先使用 `/api/apps/access-token` 判断 active 是错误耦合：手机切换到无 token 的环境后，非 active 目标也被阻止。现已完全移除该依赖，目录独立返回 `current_idfv`；不读取 Keychain。独立审查发现并修复了无效 UUID 被误当作 null 的问题。
 
 已在7Plus安装4.0-16并只读核对：token 接口仍不可用时，目录仍返回与 Shadow 配置一致的当前 IDFV，且与 C65…AB53 不同。两份备份的六个文件哈希未变；本轮没有采用凭据或刷新 token。RV 需运行包含本次修改的新构建，不支持旧服务缺少独立身份字段时静默猜测。
+
+
+## Shadow ownership
+
+显式交给 RV：先核对非 active，再通过 `claim` 等待 Shadow 确认 owner=rv，随后以 requester=rv 下载最新 state。下载或本地提交失败不自动归还，避免交接结果未知时手机使用旧凭据。
+
+交回手机：RV 现有任务冻结完成后，以 requester=rv 回写 state/manifest 并读回核对，再调用 `release` 等待 owner=phone，最后提交本地交接状态。上传、校验或归还失败不会自动重放。
+
+如果远端归还成功但确认或本地提交丢失，用户显式重试时先查询 ownership；已经归手机则只用 requester=phone 读回并比对待交接 state，匹配后完成本地提交，不重新上传或申请归属。不匹配则保留本地待交接状态并报错。
+
+普通资料导入保持手机操作语义（requester=phone），不会隐式申请 RV 控制权；RV 接管使用独立读取入口。公共 `write_shadow_backup` 是完整回写并归还操作，调用方须已经取得 RV 归属。

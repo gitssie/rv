@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/rv-core", "crates/rv-session", "crates/rv-app", "crates/rv-business", "crates/rv-automation", "crates/rv-gpui-chat"]
+members = ["crates/zxtouch", "crates/rv-core", "crates/rv-session", "crates/rv-app", "crates/rv-business", "crates/rv-automation", "crates/rv-gpui-chat"]
 exclude = ["vendor/vnc-rs"]
 resolver = "2"
 default-members = ["crates/rv-app"]
@@ -31,6 +31,7 @@ openssl = { version = "0.10", features = ["vendored"] }
 tokio-openssl = "0.6"
 smallvec = "1"
 
+zxtouch = { path = "crates/zxtouch" }
 rv-core = { path = "crates/rv-core" }
 rv-session = { path = "crates/rv-session" }
 rv-business = { path = "crates/rv-business" }

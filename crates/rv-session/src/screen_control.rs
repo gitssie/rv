@@ -52,7 +52,8 @@ impl ScreenOperation {
                 let mut headers = reqwest::header::HeaderMap::new();
                 headers.insert("content-type", "application/json".parse().unwrap());
                 let mut response = client
-                    .request(
+                    .api()
+                    .raw(
                         reqwest::Method::POST,
                         if locking {
                             "/api/device/lock"

@@ -53,15 +53,10 @@ pub(crate) async fn download(
     maximum: usize,
 ) -> Result<Vec<u8>, String> {
     tokio::time::timeout(std::time::Duration::from_secs(30), async {
-        let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert("content-type", "application/json".parse().unwrap());
         let mut response = client
-            .request(
-                reqwest::Method::POST,
-                "/api/app-state/download",
-                headers,
-                body.to_string().into_bytes(),
-            )
+            .api()
+            .app_state()
+            .download(&body)
             .await
             .map_err(|_| "state 下载连接中断")?;
         if response.status() != 200 {
@@ -93,12 +88,29 @@ pub async fn read_shadow_state(
     bundle: &str,
     backup: &str,
 ) -> Result<ShadowAppState, String> {
+    read_shadow_state_for(client, id, bundle, backup, "phone").await
+}
+pub(crate) async fn read_shadow_state_as_rv(
+    client: &PhoneHttpClient,
+    id: &AppId,
+    bundle: &str,
+    backup: &str,
+) -> Result<ShadowAppState, String> {
+    read_shadow_state_for(client, id, bundle, backup, "rv").await
+}
+async fn read_shadow_state_for(
+    client: &PhoneHttpClient,
+    id: &AppId,
+    bundle: &str,
+    backup: &str,
+    requester: &str,
+) -> Result<ShadowAppState, String> {
     if backup != format!("snapshot:{}", id.as_str()) || !crate::valid_bundle_id(bundle) {
         return Err("Shadow 备份身份不匹配".into());
     }
     let manifest = download(
         client,
-        json!({"bundle_id":bundle,"backup_id":backup,"part":"manifest"}),
+        json!({"bundle_id":bundle,"backup_id":backup,"requester":requester,"part":"manifest"}),
         MAX_MANIFEST_BYTES,
     )
     .await?;
@@ -119,14 +131,16 @@ pub async fn read_shadow_state(
         .ok_or("Shadow 清单缺少 state 哈希")?;
     let archive = download(
         client,
-        json!({"bundle_id":bundle,"backup_id":backup,"part":"state","state_sha256":sha}),
+        json!({"bundle_id":bundle,"backup_id":backup,"requester":requester,"part":"state","state_sha256":sha}),
         MAX_STATE_BYTES,
     )
     .await?;
-    let (status, info) = client.json("/api/device/info", &json!({})).await?;
-    if status != 200 {
-        return Err("读取请求上下文设备信息失败".into());
-    }
+    let info = client
+        .api()
+        .device()
+        .info(&json!({}))
+        .await
+        .map_err(|_| "读取请求上下文设备信息失败")?;
     let device = AppDeviceInfo {
         model: info["model"].as_str().unwrap_or("").into(),
         os_version: info["os_version"].as_str().unwrap_or("").into(),
