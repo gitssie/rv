@@ -32,31 +32,45 @@ isolation, delegated domain names, replacement/removal, active-versus-idle
 cleanup, mandatory-front failures, upstream rejection, buffered tunnel bytes,
 and TCP half-close. These four tests pass on the local macOS host.
 
-## Result: proxy semantics work; direct RV embedding is blocked
+## Result: plain proxy patch resolves the local native TLS collision
 
-A separate compatibility probe links RV's OpenSSL and meow's BoringSSL into the
-same process and attempts a real HTTPS request through the chain. On this host,
-the linker reports duplicate OpenSSL/BoringSSL symbols and the test process
-terminates with SIGSEGV. Type checking alone does not detect this collision.
-Even disabling meow's default protocol features still brings in BoringSSL.
+Unmodified upstream pulls BoringSSL even with default protocol features disabled.
+Linking it with RV's OpenSSL produced duplicate symbols and a SIGSEGV in the
+HTTPS probe. `patches/optional-proxy-tls.patch` makes proxy TLS optional while
+preserving upstream's default TLS support. The patch changes four meow-proxy
+files: the feature manifest, HTTP/SOCKS5 TLS wrapping, and HTTPS health probes.
+Without the `tls` feature, requesting proxy TLS returns an explicit error;
+meow's own HTTPS health probes likewise fail rather than downgrading to HTTP.
+Application HTTPS remains handled by the caller, such as RV's rustls client.
 
-Reproduce only the compatibility failure (expected to fail; may produce a core dump):
+With the patch and default features disabled, all five RV spike tests passed
+on the local macOS host, including a real HTTPS request through the proxy chain
+to an OpenSSL server in the same process. The selected dependency tree contains
+no BoringSSL. Explicitly enabling the new meow `tls` feature also passed a type
+check, but must not be enabled alongside RV's OpenSSL until the conflict is
+resolved separately. This does not verify the complete desktop application.
+
+Reproduce against a local meow checkout (the script leaves RV's workspace and
+lockfile untouched; build artifacts use RV's target directory):
 
 ```sh
-cargo test -p rv-proxy-spike --features openssl-compat openssl_coexistence_probe -- --exact tests::openssl_coexistence_probe
+git clone https://github.com/meow-rs/meow-rs.git /path/to/meow-rs
+git -C /path/to/meow-rs checkout -b spike/optional-proxy-tls 59da792d91f10598ce1d9f0afcb99be59150c22c
+git -C /path/to/meow-rs apply /path/to/rv/crates/rv-proxy-spike/patches/optional-proxy-tls.patch
+python3 crates/rv-proxy-spike/verify_plain_proxy.py /path/to/meow-rs
 ```
 
-The failing probe is opt-in so the independent routing tests remain executable;
-it is not waived or counted as passing. No production route depends on this
-crate. Safe in-process integration requires resolving native symbol isolation
-or eliminating one TLS implementation, then rerunning the probe successfully.
-A separate proxy process is another option, but is not validated here. This
-spike does not establish HTTPS compatibility inside the existing RV process.
+The verifier checks the proxy changes against the pinned upstream revision;
+the patch may be committed on the local branch. It
+runs the crate in a temporary workspace with explicit local Cargo patches, not
+by changing the production dependency pin. No production route depends on this
+crate. Running the `openssl-compat` feature directly against unpatched upstream
+still reproduces the original crash and may produce a core dump.
 
 This is a feasibility harness, not a production replacement for sing-box. Its
 entrance accepts CONNECT only: plain HTTP forwarding, a SOCKS5/mixed entrance,
 UDP, business-route integration and multi-platform packaging are outside this
 spike. It has not verified the provider's Session lifetime or distinct public
-IPs. Building meow's transport currently requires the BoringSSL C/C++ toolchain
-even with optional outbound protocols disabled. Do not run the RV desktop build
+IPs. The unmodified upstream dependency still requires BoringSSL; the local
+plain-proxy patch avoids it. Do not run the RV desktop build
 or app packager to execute this spike.

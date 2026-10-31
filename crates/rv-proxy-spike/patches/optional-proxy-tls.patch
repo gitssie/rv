@@ -1,0 +1,339 @@
+diff --git a/crates/meow-proxy/Cargo.toml b/crates/meow-proxy/Cargo.toml
+index b0d089a..6aeca5d 100644
+--- a/crates/meow-proxy/Cargo.toml
++++ b/crates/meow-proxy/Cargo.toml
+@@ -9,13 +9,15 @@ repository.workspace = true
+ homepage.workspace = true
+
+ [features]
+-default = ["ss", "trojan", "vless", "vless-vision", "vless-encryption", "ech-tls-tunnel", "vmess", "snell", "hysteria2", "mux", "kcptun", "public-suffix", "shadow-tls", "restls", "jls", "gost-plugin"]
++default = ["tls", "ss", "trojan", "vless", "vless-vision", "vless-encryption", "ech-tls-tunnel", "vmess", "snell", "hysteria2", "mux", "kcptun", "public-suffix", "shadow-tls", "restls", "jls", "gost-plugin"]
++# TLS-wrapped upstream proxies are optional for plain HTTP/SOCKS5 embedders.
++tls = ["meow-transport/tls"]
+ # The embedded public-suffix list (`psl`) behind load-balance
+ # `consistent-hashing`'s eTLD+1 key — about 500 KB of lookup tables, so it
+ # is in the app `full` profile and kept out of `minimal` (ADR-0007
+ # binary-size caps), where the key falls back to the last two labels.
+ public-suffix = ["dep:psl"]
+-ss = ["dep:shadowsocks", "meow-transport/simple-obfs"]
++ss = ["tls", "dep:shadowsocks", "meow-transport/simple-obfs"]
+ # Built-in SIP003 plugin transports on the `ss` adapter. `minimal` keeps
+ # only simple-obfs + v2ray-plugin (bundled in `ss`); these four are opt-in
+ # and re-bundled into `default`/`full` so release binaries are unchanged
+@@ -26,9 +28,9 @@ shadow-tls = ["ss", "meow-transport/shadow-tls"]
+ restls = ["ss", "meow-transport/restls"]
+ jls = ["ss", "meow-transport/jls"]
+ gost-plugin = ["ss", "mux"]
+-trojan = []
+-vless = []
+-vmess = ["dep:md-5", "dep:hmac", "dep:aes", "dep:boring", "dep:crc32fast"]
++trojan = ["tls"]
++vless = ["tls"]
++vmess = ["tls", "dep:md-5", "dep:hmac", "dep:aes", "dep:boring", "dep:crc32fast"]
+ vless-vision = ["vless"]
+ # VLESS post-quantum Encryption layer (`encryption: mlkem768x25519plus...`),
+ # the ML-KEM-768 + X25519 hybrid handshake used by Xray-core / mihomo. Adds the
+@@ -49,16 +51,16 @@ vless-encryption = [
+ # the SS simple-obfs module), UDP-over-TCP, and an opt-in v4–v6 reuse pool
+ # (CommandConnectV2). v6's PSK-derived traffic-shaping profile is seeded
+ # with BLAKE2b.
+-snell = ["dep:argon2", "dep:boring", "dep:blake2", "meow-transport/simple-obfs"]
++snell = ["tls", "dep:argon2", "dep:boring", "dep:blake2", "meow-transport/simple-obfs"]
+ # Opt-in anytls outbound (uses the vendored `meow-anytls` crate, lib name
+ # `anytls_rs`). The client's TLS is supplied by meow-transport's BoringSSL
+ # TlsLayer through anytls-rs's `TlsConnect` hook, so no second TLS stack.
+-anytls = ["dep:meow-anytls"]
++anytls = ["tls", "dep:meow-anytls"]
+ # Hysteria2 outbound implemented in-tree on top of quiche (BoringSSL-native
+ # QUIC + HTTP/3), so it links no rustls and no second crypto library.
+-hysteria2 = ["dep:quiche", "dep:boring", "dep:blake2", "dep:webpki-root-certs", "dep:tokio-util"]
++hysteria2 = ["tls", "dep:quiche", "dep:boring", "dep:blake2", "dep:webpki-root-certs", "dep:tokio-util"]
+ # TrustTunnel H2 client outbound; opt-in pending upstream profile review (#727).
+-trusttunnel = ["dep:h2", "dep:tokio-util"]
++trusttunnel = ["tls", "dep:h2", "dep:tokio-util"]
+ # The HTTP/3 transport for that outbound (`quic: true`). Rides quiche on the
+ # same vendored BoringSSL as `hysteria2`, so it links no second crypto
+ # library — but quiche is not in an H2-only build's graph at all, so this is
+@@ -87,7 +89,7 @@ kcptun = ["ss", "mux", "dep:tokio-util", "meow-transport/kcptun"]
+ [dependencies]
+ meow-common = { workspace = true }
+ meow-dns = { workspace = true }
+-meow-transport = { workspace = true, features = ["tls", "ws"] }
++meow-transport = { workspace = true, features = ["ws"] }
+ tokio = { workspace = true }
+ tokio-util = { workspace = true, optional = true }
+ yamux = { workspace = true, optional = true }
+diff --git a/crates/meow-proxy/src/health.rs b/crates/meow-proxy/src/health.rs
+index 2d7a0db..fad3318 100644
+--- a/crates/meow-proxy/src/health.rs
++++ b/crates/meow-proxy/src/health.rs
+@@ -5,7 +5,9 @@ use meow_common::{
+     failure_reason, AdapterType, ChainTarget, ChainVerdict, MeowError, Metadata, Proxy,
+     ProxyAdapter, ProxyConn, ProxyPacketConn,
+ };
++#[cfg(feature = "tls")]
+ use meow_transport::tls::{TlsConfig, TlsLayer};
++#[cfg(feature = "tls")]
+ use meow_transport::Transport as _;
+ use smol_str::SmolStr;
+ use std::sync::atomic::{AtomicBool, Ordering};
+@@ -850,11 +852,16 @@ async fn probe_once(
+     parsed: ParsedUrl,
+     ranges: Vec<(u16, u16)>,
+ ) -> Result<(), String> {
++    #[cfg(not(feature = "tls"))]
++    if parsed.https {
++        return Err("HTTPS health probes require the tls feature".into());
++    }
+     let conn = adapter
+         .dial_tcp(&metadata)
+         .await
+         .map_err(|e| format!("dial: {e}"))?;
+
++    #[cfg(feature = "tls")]
+     if parsed.https {
+         // Same TlsLayer the proxies dial with (BoringSSL by default). Both
+         // backends memoise the TLS context per (alpn, skip_cert_verify), so
+@@ -865,10 +872,9 @@ async fn probe_once(
+             .connect(Box::new(conn))
+             .await
+             .map_err(|e| format!("tls: {e}"))?;
+-        send_get_and_check(tls, &parsed, &ranges).await
+-    } else {
+-        send_get_and_check(conn, &parsed, &ranges).await
++        return send_get_and_check(tls, &parsed, &ranges).await;
+     }
++    send_get_and_check(conn, &parsed, &ranges).await
+ }
+
+ async fn send_get_and_check<S>(
+diff --git a/crates/meow-proxy/src/http_adapter.rs b/crates/meow-proxy/src/http_adapter.rs
+index c8d5027..ce66cf2 100644
+--- a/crates/meow-proxy/src/http_adapter.rs
++++ b/crates/meow-proxy/src/http_adapter.rs
+@@ -48,7 +48,10 @@ pub struct HttpAdapter {
+     auth: Option<(String, String)>,
+     /// Built once at construction (rustls ClientConfig + root store are
+     /// expensive); `TlsLayer::connect` is safe to call concurrently.
++    #[cfg(feature = "tls")]
+     tls_layer: Option<meow_transport::tls::TlsLayer>,
++    #[cfg(not(feature = "tls"))]
++    tls_requested: bool,
+     /// Extra headers injected into the CONNECT request only.
+     extra_headers: Vec<(String, String)>,
+     health: ProxyHealth,
+@@ -76,6 +79,9 @@ impl HttpAdapter {
+         // Hoisted out of the dial path: TlsLayer::new clones the webpki root
+         // store and builds verifier + crypto provider — per-adapter, not
+         // per-connection (same pattern as TrojanAdapter::new).
++        #[cfg(not(feature = "tls"))]
++        let _ = skip_cert_verify;
++        #[cfg(feature = "tls")]
+         let tls_layer = tls.then(|| {
+             use meow_transport::tls::{TlsConfig, TlsLayer};
+             let tls_cfg = TlsConfig {
+@@ -92,7 +98,10 @@ impl HttpAdapter {
+             server: SmolStr::from(server),
+             port,
+             auth,
++            #[cfg(feature = "tls")]
+             tls_layer,
++            #[cfg(not(feature = "tls"))]
++            tls_requested: tls,
+             extra_headers,
+             health: ProxyHealth::new(),
+             dialer,
+@@ -117,18 +126,28 @@ impl HttpAdapter {
+         &self,
+         stream: Box<dyn meow_transport::Stream>,
+     ) -> Result<Box<dyn meow_transport::Stream>> {
+-        if let Some(tls_layer) = &self.tls_layer {
+-            use meow_transport::Transport;
+-            tls_layer
+-                .connect(Box::new(stream))
+-                .await
+-                .map_err(|e| match e {
+-                    meow_transport::TransportError::Io(e) => MeowError::Io(e),
+-                    other => MeowError::Proxy(other.to_string()),
+-                })
+-        } else {
++        #[cfg(not(feature = "tls"))]
++        {
++            if self.tls_requested {
++                return Err(MeowError::Proxy("proxy TLS support is disabled".into()));
++            }
+             Ok(stream)
+         }
++        #[cfg(feature = "tls")]
++        {
++            if let Some(tls_layer) = &self.tls_layer {
++                use meow_transport::Transport;
++                tls_layer
++                    .connect(Box::new(stream))
++                    .await
++                    .map_err(|e| match e {
++                        meow_transport::TransportError::Io(e) => MeowError::Io(e),
++                        other => MeowError::Proxy(other.to_string()),
++                    })
++            } else {
++                Ok(stream)
++            }
++        }
+     }
+
+     /// Run the HTTP CONNECT handshake over `stream`.
+@@ -858,3 +877,23 @@ mod tests {
+         assert!(failures.is_empty(), "{}", failures.join("\n"));
+     }
+ }
++
++#[cfg(all(test, not(feature = "tls")))]
++mod no_tls_tests {
++    use super::*;
++    #[tokio::test]
++    async fn requested_tls_is_rejected_without_downgrade() {
++        let adapter = HttpAdapter::new(
++            "test",
++            "localhost",
++            1,
++            None,
++            true,
++            false,
++            vec![],
++            Arc::new(crate::dialer::DirectDialer),
++        );
++        let (stream, _) = tokio::io::duplex(64);
++        assert!(adapter.wrap_tls(Box::new(stream)).await.is_err());
++    }
++}
+diff --git a/crates/meow-proxy/src/socks5_adapter.rs b/crates/meow-proxy/src/socks5_adapter.rs
+index a4b9223..0e17cbc 100644
+--- a/crates/meow-proxy/src/socks5_adapter.rs
++++ b/crates/meow-proxy/src/socks5_adapter.rs
+@@ -66,7 +66,10 @@ pub struct Socks5Adapter {
+     auth: Option<(String, String)>,
+     /// Built once at construction (rustls ClientConfig + root store are
+     /// expensive); `TlsLayer::connect` is safe to call concurrently.
++    #[cfg(feature = "tls")]
+     tls_layer: Option<meow_transport::tls::TlsLayer>,
++    #[cfg(not(feature = "tls"))]
++    tls_requested: bool,
+     /// Whether `udp: true` was configured — gates UDP ASSOCIATE.
+     udp: bool,
+     health: ProxyHealth,
+@@ -88,6 +91,9 @@ impl Socks5Adapter {
+         // Hoisted out of the dial path: TlsLayer::new clones the webpki root
+         // store and builds verifier + crypto provider — per-adapter, not
+         // per-connection (same pattern as TrojanAdapter::new).
++        #[cfg(not(feature = "tls"))]
++        let _ = skip_cert_verify;
++        #[cfg(feature = "tls")]
+         let tls_layer = tls.then(|| {
+             use meow_transport::tls::{TlsConfig, TlsLayer};
+             let tls_cfg = TlsConfig {
+@@ -104,7 +110,10 @@ impl Socks5Adapter {
+             server: SmolStr::from(server),
+             port,
+             auth,
++            #[cfg(feature = "tls")]
+             tls_layer,
++            #[cfg(not(feature = "tls"))]
++            tls_requested: tls,
+             udp: false,
+             health: ProxyHealth::new(),
+             dialer,
+@@ -136,18 +145,28 @@ impl Socks5Adapter {
+         &self,
+         stream: Box<dyn meow_transport::Stream>,
+     ) -> Result<Box<dyn meow_transport::Stream>> {
+-        if let Some(tls_layer) = &self.tls_layer {
+-            use meow_transport::Transport;
+-            tls_layer
+-                .connect(Box::new(stream))
+-                .await
+-                .map_err(|e| match e {
+-                    meow_transport::TransportError::Io(e) => MeowError::Io(e),
+-                    other => MeowError::Proxy(other.to_string()),
+-                })
+-        } else {
++        #[cfg(not(feature = "tls"))]
++        {
++            if self.tls_requested {
++                return Err(MeowError::Proxy("proxy TLS support is disabled".into()));
++            }
+             Ok(stream)
+         }
++        #[cfg(feature = "tls")]
++        {
++            if let Some(tls_layer) = &self.tls_layer {
++                use meow_transport::Transport;
++                tls_layer
++                    .connect(Box::new(stream))
++                    .await
++                    .map_err(|e| match e {
++                        meow_transport::TransportError::Io(e) => MeowError::Io(e),
++                        other => MeowError::Proxy(other.to_string()),
++                    })
++            } else {
++                Ok(stream)
++            }
++        }
+     }
+
+     /// Run the full SOCKS5 handshake (auth negotiation + CONNECT) over `stream`.
+@@ -719,7 +738,7 @@ impl ProxyAdapter for Socks5Adapter {
+             Some(_) => {
+                 return Err(MeowError::NotSupported(
+                     "socks5: domain UDP target exceeds ATYP_DOMAIN length".into(),
+-                ))
++                ));
+             }
+             None => None,
+         };
+@@ -1226,9 +1245,11 @@ mod tests {
+
+     #[test]
+     fn udp_still_advertised_under_direct_dialer() {
+-        assert!(make_adapter("127.0.0.1", 1080, None)
+-            .with_udp(true)
+-            .support_udp());
++        assert!(
++            make_adapter("127.0.0.1", 1080, None)
++                .with_udp(true)
++                .support_udp()
++        );
+     }
+
+     /// Captures the `internal` flag the adapter hands to its dialer —
+@@ -2465,7 +2486,7 @@ mod tests {
+     #[tokio::test]
+     async fn socks5_udp_associate_round_trip() {
+         use tokio::net::UdpSocket;
+-        use tokio::time::{timeout, Duration};
++        use tokio::time::{Duration, timeout};
+
+         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+         let ctrl_addr = listener.local_addr().unwrap();
+@@ -2572,3 +2593,22 @@ mod tests {
+         assert!(e.to_string().contains("empty domain"), "{e}");
+     }
+ }
++
++#[cfg(all(test, not(feature = "tls")))]
++mod no_tls_tests {
++    use super::*;
++    #[tokio::test]
++    async fn requested_tls_is_rejected_without_downgrade() {
++        let adapter = Socks5Adapter::new(
++            "test",
++            "localhost",
++            1,
++            None,
++            true,
++            false,
++            Arc::new(crate::dialer::DirectDialer),
++        );
++        let (stream, _) = tokio::io::duplex(64);
++        assert!(adapter.wrap_tls(Box::new(stream)).await.is_err());
++    }
++}
