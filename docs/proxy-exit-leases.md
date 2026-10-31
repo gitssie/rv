@@ -12,7 +12,7 @@ alphanumeric value immediately following the configured marker (default
 `_session-`) with a new lowercase random value of the same length, preserving all
 other password parameters. For example, `_country-fr_lifetime-5_session-a7ozznml`
 changes only `a7ozznml`. The new password is committed atomically before creating
-a new client/full front→exit sing-box route. It remains stored if observation
+a new client/full front→exit meow route. It remains stored if observation
 fails, so future requests do not revert to the old provider session. No Vinted
 request header or access-token Session is changed. Changing the password is not
 proof that the exit changed; both methods observe the resulting exit.

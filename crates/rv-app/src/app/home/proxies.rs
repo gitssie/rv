@@ -16,7 +16,7 @@ use gpui_component::{
     switch::Switch,
     v_flex,
 };
-use gpui_component::{Icon, IconName, WindowExt, dialog::DialogButtonProps, list::ListItem};
+use gpui_component::{Icon, IconName, list::ListItem};
 
 #[derive(Clone)]
 pub(in crate::app) struct ProxyChoice {
@@ -41,7 +41,6 @@ pub(in crate::app) struct ProxyView {
     pub front_select: Entity<SelectState<Vec<ProxyChoice>>>,
     pub front_id: Option<String>,
     draft_id: String,
-    engine_path: Entity<InputState>,
     engine_info: Option<Result<(String, String), String>>,
     engine_generation: u64,
     pub binding_select: Entity<SelectState<Vec<ProxyChoice>>>,
@@ -100,8 +99,6 @@ impl ProxyView {
             }),
             front_id: None,
             draft_id: uuid::Uuid::new_v4().to_string(),
-            engine_path: cx
-                .new(|cx| InputState::new(window, cx).placeholder("留空自动查找 sing-box")),
             engine_info: None,
             engine_generation: 0,
             binding_select: cx.new(|cx| {
@@ -576,7 +573,7 @@ impl AddressBookApp {
                 .background_executor()
                 .spawn(async move {
                     rv_business::proxy::engine::info(&paths)
-                        .map(|info| (info.version, info.path.display().to_string()))
+                        .map(|info| (info.version, "内置代理引擎".into()))
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
@@ -587,69 +584,6 @@ impl AddressBookApp {
             });
         })
         .detach();
-    }
-    fn configure_proxy_engine(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let saved = WorkspaceStore::open(self.book.paths()).and_then(|s| s.proxy_engine_path());
-        let path = match saved {
-            Ok(path) => path.unwrap_or_default(),
-            Err(error) => {
-                self.home.proxies.error = Some(error.to_string());
-                cx.notify();
-                return;
-            }
-        };
-        self.home
-            .proxies
-            .engine_path
-            .update(cx, |input, cx| input.set_value(path, window, cx));
-        let owner = cx.entity();
-        let input = self.home.proxies.engine_path.clone();
-        window.open_alert_dialog(cx, move |dialog, _, _| {
-            let owner = owner.clone();
-            let input = input.clone();
-            dialog
-                .title("sing-box 程序")
-                .description("使用自行安装的 sing-box，留空自动查找。")
-                .child(
-                    Form::vertical()
-                        .child(Field::new().label("程序路径").child(Input::new(&input))),
-                )
-                .confirm()
-                .button_props(
-                    DialogButtonProps::default()
-                        .show_cancel(true)
-                        .ok_text("保存")
-                        .cancel_text("取消"),
-                )
-                .on_ok(move |_, _, cx| {
-                    owner.update(cx, |this, cx| {
-                        if this.read_only {
-                            return true;
-                        }
-                        let path = this
-                            .home
-                            .proxies
-                            .engine_path
-                            .read(cx)
-                            .value()
-                            .trim()
-                            .to_string();
-                        match WorkspaceStore::open(this.book.paths()).and_then(|mut s| {
-                            s.save_proxy_engine_path((!path.is_empty()).then_some(path.as_str()))
-                        }) {
-                            Ok(()) => {
-                                this.refresh_proxy_engine(cx);
-                                true
-                            }
-                            Err(error) => {
-                                this.home.proxies.error = Some(error.to_string());
-                                cx.notify();
-                                false
-                            }
-                        }
-                    })
-                })
-        });
     }
     pub(in crate::app) fn render_proxy_manager(
         &self,
@@ -942,11 +876,11 @@ impl AddressBookApp {
                     ),
             );
         let (status, tooltip) = match &view.engine_info {
-            Some(Ok((version, path))) => (format!("sing-box {version}"), format!("已安装：{path}")),
-            Some(Err(error)) => ("sing-box 未就绪".into(), error.clone()),
+            Some(Ok((version, description))) => (version.clone(), description.clone()),
+            Some(Err(error)) => ("代理引擎未就绪".into(), error.clone()),
             None => (
-                "正在检测 sing-box…".into(),
-                "检测外部程序，不连接代理".into(),
+                "正在检测代理引擎…".into(),
+                "检查内置代理引擎，不连接代理".into(),
             ),
         };
         v_flex()
@@ -965,17 +899,6 @@ impl AddressBookApp {
                             .label(status)
                             .tooltip(tooltip)
                             .on_click(cx.listener(|this, _, _, cx| this.refresh_proxy_engine(cx))),
-                    )
-                    .child(div().flex_1())
-                    .child(
-                        Button::new("proxy-engine-settings")
-                            .ghost()
-                            .icon(IconName::Settings)
-                            .tooltip("sing-box 程序路径")
-                            .disabled(self.read_only)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.configure_proxy_engine(window, cx)
-                            })),
                     ),
             )
             .child(

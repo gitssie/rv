@@ -516,10 +516,16 @@ fn tls_server() -> (Arc<openssl::ssl::SslAcceptor>, Vec<u8>) {
 #[cfg(feature = "openssl-compat")]
 #[tokio::test]
 async fn openssl_coexistence_probe() {
-    let (tls, certificate) = tls_server();
-    let hits = Arc::new(AtomicUsize::new(0));
-    let seen = hits.clone();
-    let origin = server(move |socket| {
+    for (protocol, entrance) in [
+        (ExitProtocol::Http, "http"),
+        (ExitProtocol::Socks5, "http"),
+        (ExitProtocol::Http, "socks5h"),
+        (ExitProtocol::Socks5, "socks5h"),
+    ] {
+        let (tls, certificate) = tls_server();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let seen = hits.clone();
+        let origin = server(move |socket| {
         let tls = tls.clone(); let hits = seen.clone();
         async move {
             let ssl = openssl::ssl::Ssl::new(tls.context()).unwrap();
@@ -533,29 +539,64 @@ async fn openssl_coexistence_probe() {
             stream.shutdown().await.unwrap();
         }
     }).await;
-    let f = Fixture::with_origin(ExitProtocol::Http, origin, hits).await;
-    f.insert("tls-shop", A);
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .proxy(
-            reqwest::Proxy::all(format!("http://{}", f.gateway.address))
-                .unwrap()
-                .basic_auth("tls-shop", LOCAL_SECRET),
-        )
-        .add_root_certificate(reqwest::Certificate::from_der(&certificate).unwrap())
-        .retry(reqwest::retry::never())
-        .timeout(Duration::from_secs(5))
-        .build()
-        .unwrap();
-    let response = client
-        .get(format!("https://localhost:{}/proof", f._origin.addr.port()))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), 200);
-    assert_eq!(response.text().await.unwrap(), "loopback-ok");
-    assert_eq!(f.events.lock().unwrap().len(), 2);
-    assert_eq!(f.origin_hits.load(Ordering::SeqCst), 1);
-    assert!(openssl::version::version().starts_with("OpenSSL "));
-    assert!(rustls::RootCertStore::empty().is_empty());
+        let f = Fixture::with_origin(protocol, origin, hits).await;
+        f.insert("tls-shop", A);
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .proxy(
+                reqwest::Proxy::all(format!("{entrance}://{}", f.gateway.address))
+                    .unwrap()
+                    .basic_auth("tls-shop", LOCAL_SECRET),
+            )
+            .add_root_certificate(reqwest::Certificate::from_der(&certificate).unwrap())
+            .retry(reqwest::retry::never())
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let response = client
+            .get(format!("https://localhost:{}/proof", f._origin.addr.port()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.text().await.unwrap(), "loopback-ok");
+        assert_eq!(f.events.lock().unwrap().len(), 2);
+        assert_eq!(f.origin_hits.load(Ordering::SeqCst), 1);
+        assert!(openssl::version::version().starts_with("OpenSSL "));
+        assert!(rustls::RootCertStore::empty().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn socks_authentication_rejects_wrong_secret_unknown_and_removed_sessions() {
+    let f = Fixture::new(ExitProtocol::Http).await;
+    f.insert("valid", A);
+    f.insert("removed", B);
+    f.sessions.remove("removed");
+    for (key, secret) in [
+        ("valid", "wrong-secret"),
+        ("missing", LOCAL_SECRET),
+        ("removed", LOCAL_SECRET),
+    ] {
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .proxy(
+                reqwest::Proxy::all(format!("socks5h://{}", f.gateway.address))
+                    .unwrap()
+                    .basic_auth(key, secret),
+            )
+            .timeout(Duration::from_secs(2))
+            .retry(reqwest::retry::never())
+            .build()
+            .unwrap();
+        assert!(
+            client
+                .get("http://origin.invalid/proof")
+                .send()
+                .await
+                .is_err()
+        );
+    }
+    assert!(f.events.lock().unwrap().is_empty());
+    assert_eq!(f.origin_hits.load(Ordering::SeqCst), 0);
 }

@@ -146,7 +146,8 @@
 
 - 代理设置采用已确认 `docs/designs/rv-proxy-list-detail-chain-v1.png` 的左右布局：左 ListItem，右单条 Form/Field；不自绘控件，不用顶部代理选择下拉替代列表。
 - 每个代理配置一次，可选 front_proxy_id 引用已有单代理；最多一个前置，禁止自身、循环及二级前置，被引用记录删除需先解除引用。店铺绑定最终出口。
-- 链式代理使用用户自行安装的外部 sing-box，RV 不打包或自动安装；只管理自己启动的实例，不改用户其它实例。单代理保持原网络方式。全部业务及 IP 探测使用完整链路，失败不直连。
+- 链式代理使用内置 rv-proxy/meow-rs，一个进程共用一个仅监听 loopback 的认证入口，不依赖外部 sing-box。meow 直接依赖 gitssie/meow-rs 固定 Git 提交，禁用代理 TLS/BoringSSL，保留 RV OpenSSL。单代理保持原网络方式。全部业务及 IP 探测使用完整链路，失败不直连。
+- Shared 的 PasswordSession 代理按真实 IDFV 生成并复用内存 Session，业务与图片持有同一租约；不改 SQLite 密码模板。空闲且无租约的映射 120 秒后回收。Exclusive 和显式 managed 换 IP 保留原门锁、确认和历史规则。
 - 排他开关针对当前记录作为最终出口的任务并发。细节与进程回收见 docs/proxy-chains.md。
 
 - 代理详情「协议」用原生 Select 支持 HTTP / SOCKS5；前置与出口各自使用记录协议，无字段旧记录按 SOCKS5。HTTP 支持通过 CONNECT 访问 HTTPS 目标，不根据端口自动推断、不失败后自动切协议。密码按用户要求明文输入，加密保存。

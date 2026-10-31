@@ -148,11 +148,12 @@ pub(crate) fn proxy_gate(paths: &StorePaths, proxy_id: &str) -> Result<Arc<Gate>
         .clone())
 }
 
-/// Keeps the external route alive for as long as its HTTP client is in use.
+/// Keeps the embedded route alive for as long as its HTTP client is in use.
 #[derive(Clone)]
 pub(crate) struct ProxyClient {
     inner: reqwest::Client,
     tunnel: Option<Arc<crate::proxy::engine::Tunnel>>,
+    session: Option<PasswordLease>,
 }
 impl std::ops::Deref for ProxyClient {
     type Target = reqwest::Client;
@@ -164,6 +165,7 @@ impl std::ops::Deref for ProxyClient {
 pub(crate) struct Route {
     pub client: reqwest::Client,
     _tunnel: Option<Arc<crate::proxy::engine::Tunnel>>,
+    _session: Option<PasswordLease>,
     gate: Option<Arc<Gate>>,
     mode: ProxyMode,
     owner: String,
@@ -260,7 +262,7 @@ async fn acquire_route_for(
                 .lock()
                 .unwrap()
                 .entries
-                .retain(|(path, proxy_id, _), _| path != &database || proxy_id != &proxy.id);
+                .retain(|(path, proxy_id, _, _), _| path != &database || proxy_id != &proxy.id);
             // Retain the exact full chain confirmed by preparation, including the
             // new password. Later config edits must not silently replace that chain.
             let client = if images {
@@ -270,6 +272,7 @@ async fn acquire_route_for(
             };
             route.client = client.inner;
             route._tunnel = client.tunnel;
+            route._session = client.session;
             route.proxy_fingerprint = Some(snapshot_fingerprint(paths, &snapshot)?);
             route.validate_binding(paths, id)?;
         }
@@ -289,13 +292,6 @@ fn builder() -> reqwest::ClientBuilder {
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(40))
-}
-fn proxy_client(
-    paths: &StorePaths,
-    proxy: &SocksProxy,
-    images: bool,
-) -> Result<ProxyClient, String> {
-    build_proxy_client(paths, proxy, images, false)
 }
 pub(crate) fn probe_client(paths: &StorePaths, proxy: &SocksProxy) -> Result<ProxyClient, String> {
     build_proxy_client(paths, proxy, false, true)
@@ -378,7 +374,11 @@ fn build_route_client(
         .proxy(configured)
         .build()
         .map_err(|_| "无法初始化代理客户端".to_owned())?;
-    Ok(ProxyClient { inner, tunnel })
+    Ok(ProxyClient {
+        inner,
+        tunnel,
+        session: None,
+    })
 }
 #[cfg(test)]
 pub(crate) fn route(
@@ -414,6 +414,7 @@ fn route_for(
         return Ok(Route {
             client: direct.clone(),
             _tunnel: None,
+            _session: None,
             gate: None,
             mode: ProxyMode::Shared,
             owner: id.as_str().into(),
@@ -426,6 +427,7 @@ fn route_for(
     let key = (
         std::fs::canonicalize(&paths.database).map_err(|_| "代理数据库不可用")?,
         proxy.id.clone(),
+        id.as_str().to_owned(),
         images,
     );
     start_client_reaper();
@@ -446,7 +448,13 @@ fn route_for(
             entry.client.clone()
         }
         _ => {
-            let client = proxy_client(paths, &proxy, images)?;
+            let (snapshot, session) = session_route(
+                paths,
+                id,
+                store.resolve_proxy(&proxy).map_err(|e| e.to_string())?,
+            )?;
+            let mut client = build_route_client(paths, &snapshot, images, false)?;
+            client.session = session;
             clients.insert(
                 key.clone(),
                 CachedClient {
@@ -463,13 +471,118 @@ fn route_for(
     Ok(Route {
         client: client.inner,
         _tunnel: client.tunnel,
+        _session: client.session,
         gate: Some(gate),
         mode: proxy.mode,
         owner: id.as_str().into(),
         proxy_fingerprint: Some(fingerprint),
     })
 }
-type ClientKey = (std::path::PathBuf, String, bool);
+// Provider Session IDs are process-local. Different shops sharing a password-
+// session exit get distinct credentials; API and image clients use the same one.
+// The durable record remains the user's template, not a shop's generated password.
+type SessionKey = (std::path::PathBuf, String, String);
+struct PasswordSession {
+    fingerprint: Vec<u8>,
+    password: String,
+    last_used: Mutex<std::time::Instant>,
+}
+#[derive(Clone)]
+struct PasswordLease(Arc<PasswordSession>);
+impl Drop for PasswordLease {
+    fn drop(&mut self) {
+        *self.0.last_used.lock().unwrap() = std::time::Instant::now();
+    }
+}
+#[derive(Default)]
+struct PasswordSessions {
+    entries: HashMap<SessionKey, Arc<PasswordSession>>,
+    // Weak reservations include superseded routes while their leases still live.
+    issued: HashMap<(std::path::PathBuf, String, String), std::sync::Weak<PasswordSession>>,
+}
+static PASSWORD_SESSIONS: OnceLock<Mutex<PasswordSessions>> = OnceLock::new();
+fn session_route(
+    paths: &StorePaths,
+    app: &AppId,
+    mut route: rv_core::workspace::ProxyRoute,
+) -> Result<(rv_core::workspace::ProxyRoute, Option<PasswordLease>), String> {
+    if route.exit.mode != ProxyMode::Shared
+        || !matches!(
+            route.exit.ip.rotation,
+            rv_core::workspace::ProxyRotation::PasswordSession { .. }
+        )
+    {
+        return Ok((route, None));
+    }
+    let key = (
+        std::fs::canonicalize(&paths.database).map_err(|_| "代理数据库不可用")?,
+        route.exit.id.clone(),
+        app.as_str().to_owned(),
+    );
+    let fingerprint = snapshot_fingerprint(paths, &route)?;
+    let mut sessions = PASSWORD_SESSIONS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap();
+    sessions.issued.retain(|_, s| s.strong_count() > 0);
+    let replace = sessions
+        .entries
+        .get(&key)
+        .is_none_or(|s| s.fingerprint != fingerprint);
+    if replace {
+        let mut password = route
+            .exit
+            .ip
+            .rotation
+            .next_password(&route.exit.password)
+            .map_err(|e| e.to_string())?;
+        // Never accidentally reuse another shop's generated Session, even with
+        // a short provider template. Give up explicitly if its space is exhausted.
+        let mut tries = 0;
+        while sessions
+            .issued
+            .get(&(key.0.clone(), key.1.clone(), password.clone()))
+            .is_some_and(|s| s.strong_count() > 0)
+        {
+            tries += 1;
+            if tries >= 64 {
+                return Err("无法分配独立的代理 Session，请增加 Session 长度".into());
+            }
+            password = route
+                .exit
+                .ip
+                .rotation
+                .next_password(&route.exit.password)
+                .map_err(|e| e.to_string())?;
+        }
+        let entry = Arc::new(PasswordSession {
+            fingerprint,
+            password,
+            last_used: Mutex::new(std::time::Instant::now()),
+        });
+        sessions.issued.insert(
+            (key.0.clone(), key.1.clone(), entry.password.clone()),
+            Arc::downgrade(&entry),
+        );
+        sessions.entries.insert(key.clone(), entry);
+    }
+    route.exit.password = sessions.entries.get(&key).unwrap().password.clone();
+    let lease = PasswordLease(sessions.entries.get(&key).unwrap().clone());
+    Ok((route, Some(lease)))
+}
+fn prune_password_sessions() {
+    if let Some(sessions) = PASSWORD_SESSIONS.get() {
+        let mut sessions = sessions.lock().unwrap();
+        sessions.entries.retain(|_, session| {
+            Arc::strong_count(session) > 1
+                || session.last_used.lock().unwrap().elapsed() < Duration::from_secs(120)
+        });
+        sessions
+            .issued
+            .retain(|_, session| session.strong_count() > 0);
+    }
+}
+type ClientKey = (std::path::PathBuf, String, String, bool);
 struct CachedClient {
     fingerprint: Vec<u8>,
     client: ProxyClient,
@@ -485,6 +598,7 @@ struct ClientCache {
 }
 impl ClientCache {
     fn prune(&mut self) {
+        prune_password_sessions();
         let mut changed = Vec::new();
         for (path, events) in &self.watchers {
             while let Ok(event) = events.try_recv() {
@@ -497,7 +611,7 @@ impl ClientCache {
                 }
             }
         }
-        self.entries.retain(|(path, _, _), entry| {
+        self.entries.retain(|(path, _, _, _), entry| {
             !changed.contains(path) && entry.last_used.elapsed() < Duration::from_secs(120)
         });
         while self.entries.len() > 32 {
@@ -509,8 +623,11 @@ impl ClientCache {
                 .unwrap();
             self.entries.remove(&key);
         }
-        self.watchers
-            .retain(|path, _| self.entries.keys().any(|(database, _, _)| database == path));
+        self.watchers.retain(|path, _| {
+            self.entries
+                .keys()
+                .any(|(database, _, _, _)| database == path)
+        });
     }
 }
 static CLIENTS: OnceLock<Mutex<ClientCache>> = OnceLock::new();
@@ -537,16 +654,10 @@ fn proxy_fingerprint(paths: &StorePaths, proxy: &SocksProxy) -> Result<Vec<u8>, 
     snapshot_fingerprint(paths, &route)
 }
 fn snapshot_fingerprint(
-    paths: &StorePaths,
+    _paths: &StorePaths,
     route: &rv_core::workspace::ProxyRoute,
 ) -> Result<Vec<u8>, String> {
-    let store = WorkspaceStore::open(paths).map_err(|e| e.to_string())?;
-    let engine = if route.front.is_some() {
-        store.proxy_engine_path().map_err(|e| e.to_string())?
-    } else {
-        None
-    };
-    Ok(Sha256::digest(serde_json::to_vec(&(route, engine)).map_err(|_| "代理配置无效")?).to_vec())
+    Ok(Sha256::digest(serde_json::to_vec(route).map_err(|_| "代理配置无效")?).to_vec())
 }
 #[cfg(test)]
 pub(crate) fn route_with_policy(
@@ -639,6 +750,253 @@ mod tests {
         };
         store.save_proxy(&proxy).unwrap();
         store.bind_proxy(id, Some(&proxy.id)).unwrap();
+    }
+    #[test]
+    fn shared_password_sessions_are_shop_scoped_reused_and_do_not_rewrite_the_template() {
+        let (_dir, paths, a) = fixture();
+        bind(&paths, &a, 12345);
+        let b = AppId::from_idfv("D9EB7804-2062-4519-AC8D-6F68972574F3").unwrap();
+        let mut store = WorkspaceStore::open(&paths).unwrap();
+        let mut proxy = store.proxies().unwrap().remove(0);
+        proxy.mode = ProxyMode::Shared;
+        proxy.password = "fixture_country-fr_lifetime-60_session-abcdefgh".into();
+        proxy.ip.rotation = rv_core::workspace::ProxyRotation::PasswordSession {
+            marker: "_session-".into(),
+        };
+        store.save_proxy(&proxy).unwrap();
+        let snapshot = store.resolve_proxy(&proxy).unwrap();
+        let (one, lease) = session_route(&paths, &a, snapshot.clone()).unwrap();
+        let (two, _) = session_route(&paths, &b, snapshot.clone()).unwrap();
+        let (again, _) = session_route(&paths, &a, snapshot.clone()).unwrap();
+        assert_ne!(one.exit.password, two.exit.password);
+        assert_eq!(one.exit.password, again.exit.password);
+        assert!(
+            one.exit
+                .password
+                .starts_with("fixture_country-fr_lifetime-60_session-")
+        );
+        assert_eq!(store.proxies().unwrap()[0].password, proxy.password);
+        let lease = lease.unwrap();
+        *lease.0.last_used.lock().unwrap() = std::time::Instant::now() - Duration::from_secs(121);
+        prune_password_sessions();
+        let (alive, _) = session_route(&paths, &a, snapshot).unwrap();
+        assert_eq!(alive.exit.password, one.exit.password);
+        drop(lease);
+        let key = (
+            std::fs::canonicalize(&paths.database).unwrap(),
+            proxy.id.clone(),
+            a.as_str().to_owned(),
+        );
+        {
+            let map = PASSWORD_SESSIONS.get().unwrap().lock().unwrap();
+            *map.entries.get(&key).unwrap().last_used.lock().unwrap() =
+                std::time::Instant::now() - Duration::from_secs(121);
+        }
+        prune_password_sessions();
+        assert!(
+            !PASSWORD_SESSIONS
+                .get()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .entries
+                .contains_key(&key)
+        );
+        proxy.mode = ProxyMode::Exclusive;
+        let (exclusive, lease) = session_route(
+            &paths,
+            &a,
+            rv_core::workspace::ProxyRoute {
+                exit: proxy.clone(),
+                front: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(exclusive.exit.password, proxy.password);
+        assert!(lease.is_none());
+    }
+    #[test]
+    fn replaced_password_session_remains_reserved_until_its_last_lease_is_released() {
+        let (_dir, paths, id) = fixture();
+        bind(&paths, &id, 12345);
+        let mut proxy = WorkspaceStore::open(&paths)
+            .unwrap()
+            .proxies()
+            .unwrap()
+            .remove(0);
+        proxy.mode = ProxyMode::Shared;
+        proxy.password = "fixture_session-abcdefgh".into();
+        proxy.ip.rotation = rv_core::workspace::ProxyRotation::PasswordSession {
+            marker: "_session-".into(),
+        };
+        let mut snapshot = rv_core::workspace::ProxyRoute {
+            exit: proxy,
+            front: None,
+        };
+        let (old, held) = session_route(&paths, &id, snapshot.clone()).unwrap();
+        snapshot.exit.name = "updated".into();
+        let (new, _new_lease) = session_route(&paths, &id, snapshot).unwrap();
+        assert_ne!(old.exit.password, new.exit.password);
+        let key = (
+            std::fs::canonicalize(&paths.database).unwrap(),
+            old.exit.id,
+            old.exit.password,
+        );
+        prune_password_sessions();
+        assert!(
+            PASSWORD_SESSIONS
+                .get()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .issued
+                .get(&key)
+                .unwrap()
+                .upgrade()
+                .is_some()
+        );
+        drop(held);
+        prune_password_sessions();
+        assert!(
+            !PASSWORD_SESSIONS
+                .get()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .issued
+                .contains_key(&key)
+        );
+    }
+    #[tokio::test]
+    async fn shared_shop_api_and_images_send_their_own_session_through_one_gateway() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        async fn header(socket: &mut tokio::net::TcpStream) -> String {
+            let mut bytes = Vec::new();
+            while !bytes.ends_with(b"\r\n\r\n") {
+                bytes.push(socket.read_u8().await.unwrap());
+                assert!(bytes.len() < 8192);
+            }
+            String::from_utf8(bytes).unwrap()
+        }
+        let (_dir, paths, a) = fixture();
+        let b = AppId::from_idfv("D9EB7804-2062-4519-AC8D-6F68972574F3").unwrap();
+        let phone = rv_core::AddressBook::load(paths.clone())
+            .unwrap()
+            .connections()[0]
+            .id;
+        let mut store = WorkspaceStore::open(&paths).unwrap();
+        store.sync_backups(phone,"lt.manodrabuziai.fr",&serde_json::json!({"bundle_id":"lt.manodrabuziai.fr","backups":[{"kind":"snapshot","backup_id":"snapshot:1","idfv":a.as_str()},{"kind":"snapshot","backup_id":"snapshot:2","idfv":b.as_str()}]})).unwrap();
+        let front_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let exit_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let front = SocksProxy {
+            protocol: rv_core::workspace::ProxyProtocol::Http,
+            front_proxy_id: None,
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "front".into(),
+            host: "127.0.0.1".into(),
+            port: front_listener.local_addr().unwrap().port(),
+            username: "front-user".into(),
+            password: "front-pass".into(),
+            mode: ProxyMode::Shared,
+            ip: Default::default(),
+        };
+        let mut exit = front.clone();
+        exit.id = uuid::Uuid::new_v4().to_string();
+        exit.name = "exit".into();
+        exit.host = "exit.invalid".into();
+        exit.port = exit_listener.local_addr().unwrap().port();
+        exit.front_proxy_id = Some(front.id.clone());
+        exit.username = "shared-provider".into();
+        exit.password = "fixture_session-abcdefgh".into();
+        exit.ip.rotation = rv_core::workspace::ProxyRotation::PasswordSession {
+            marker: "_session-".into(),
+        };
+        store.save_proxy(&front).unwrap();
+        store.save_proxy(&exit).unwrap();
+        store.bind_proxy(&a, Some(&exit.id)).unwrap();
+        store.bind_proxy(&b, Some(&exit.id)).unwrap();
+        let exit_addr = exit_listener.local_addr().unwrap();
+        let first = tokio::spawn(async move {
+            for _ in 0..4 {
+                let (mut socket, _) = front_listener.accept().await.unwrap();
+                let request = header(&mut socket).await;
+                assert!(request.starts_with(&format!(
+                    "CONNECT exit.invalid:{} HTTP/1.1",
+                    exit_addr.port()
+                )));
+                assert!(
+                    request.contains("Proxy-Authorization: Basic ZnJvbnQtdXNlcjpmcm9udC1wYXNz")
+                );
+                let mut outgoing = tokio::net::TcpStream::connect(exit_addr).await.unwrap();
+                socket.write_all(b"HTTP/1.1 200 OK\r\n\r\n").await.unwrap();
+                tokio::io::copy_bidirectional(&mut socket, &mut outgoing)
+                    .await
+                    .unwrap();
+            }
+        });
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let seen = observed.clone();
+        let last = tokio::spawn(async move {
+            for _ in 0..4 {
+                let (mut socket, _) = exit_listener.accept().await.unwrap();
+                let request = header(&mut socket).await;
+                assert!(request.starts_with("CONNECT rv-target.invalid:80 HTTP/1.1"));
+                seen.lock().unwrap().push(
+                    request
+                        .lines()
+                        .find(|l| l.to_ascii_lowercase().starts_with("proxy-authorization:"))
+                        .unwrap()
+                        .to_owned(),
+                );
+                socket.write_all(b"HTTP/1.1 200 OK\r\n\r\n").await.unwrap();
+                assert!(header(&mut socket).await.starts_with("GET /"));
+                socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        let direct = builder().build().unwrap();
+        let (one, _one_lease) = acquire_route(&paths, &a, &direct, true).await.unwrap();
+        let (two, _two_lease) = acquire_route(&paths, &b, &direct, true).await.unwrap();
+        let image = one.for_images(&paths, &a).unwrap();
+        assert_eq!(
+            one._tunnel.as_ref().unwrap().port,
+            two._tunnel.as_ref().unwrap().port
+        );
+        for client in [&one.client, &two.client, &image.client, &one.client] {
+            let response = client
+                .get("http://rv-target.invalid/proof")
+                .timeout(Duration::from_secs(3))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.text().await.unwrap(), "{}");
+        }
+        tokio::time::timeout(Duration::from_secs(3), first)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), last)
+            .await
+            .unwrap()
+            .unwrap();
+        let auth = observed.lock().unwrap();
+        assert_ne!(auth[0], auth[1]);
+        assert_eq!(auth[0], auth[2]);
+        assert_eq!(auth[0], auth[3]);
+        assert_eq!(
+            store
+                .proxies()
+                .unwrap()
+                .into_iter()
+                .find(|p| p.id == exit.id)
+                .unwrap()
+                .password,
+            exit.password
+        );
     }
     #[tokio::test]
     async fn binding_changes_while_waiting_reject_the_old_route() {
@@ -938,10 +1296,11 @@ mod tests {
         let client = ProxyClient {
             inner: builder().build().unwrap(),
             tunnel: None,
+            session: None,
         };
         for number in 0..40 {
             cache.entries.insert(
-                (database.clone(), number.to_string(), false),
+                (database.clone(), number.to_string(), "app".into(), false),
                 CachedClient {
                     fingerprint: vec![],
                     client: client.clone(),
@@ -961,7 +1320,7 @@ mod tests {
             bus.subscribe::<rv_core::events::WorkspaceChanged>(),
         );
         cache.entries.insert(
-            (database.clone(), "exit".into(), false),
+            (database.clone(), "exit".into(), "app".into(), false),
             CachedClient {
                 fingerprint: vec![],
                 client,
@@ -991,6 +1350,7 @@ mod tests {
         let route = Route {
             client: builder().build().unwrap(),
             _tunnel: None,
+            _session: None,
             gate: None,
             mode: ProxyMode::Shared,
             owner: id.as_str().into(),

@@ -1,5 +1,5 @@
 use super::*;
-use rv_core::workspace::{ProxyMode, ProxyProtocol};
+use rv_core::workspace::{ProxyMode, ProxyProtocol, WorkspaceStore};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 fn fixture() -> (tempfile::TempDir, StorePaths) {
     let dir = tempfile::tempdir().unwrap();
@@ -95,7 +95,7 @@ async fn protocol_handshake(
     target
 }
 #[tokio::test]
-async fn installed_sing_box_chains_existing_records_with_both_auths_and_remote_dns() {
+async fn embedded_meow_chains_existing_records_with_both_auths_and_remote_dns() {
     for (front, exit) in [
         (ProxyProtocol::Socks5, ProxyProtocol::Socks5),
         (ProxyProtocol::Socks5, ProxyProtocol::Http),
@@ -107,10 +107,6 @@ async fn installed_sing_box_chains_existing_records_with_both_auths_and_remote_d
 }
 async fn chain(front_protocol: ProxyProtocol, exit_protocol: ProxyProtocol) {
     let (_dir, paths) = fixture();
-    if info(&paths).is_err() {
-        eprintln!("sing-box not installed; external-engine integration skipped");
-        return;
-    }
     let front_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let exit_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mut front = proxy("front", front_listener.local_addr().unwrap().port());
@@ -163,7 +159,7 @@ async fn chain(front_protocol: ProxyProtocol, exit_protocol: ProxyProtocol) {
         .await
         .unwrap()
         .unwrap();
-    // Both clients share one immutable sing-box instance for the same route.
+    // Both clients share one immutable embedded route for the same route.
     let resolved = store.resolve_proxy(&exit).unwrap();
     let one = acquire(&paths, &resolved).unwrap();
     let two = acquire(&paths, &resolved).unwrap();
@@ -177,10 +173,7 @@ async fn chain(front_protocol: ProxyProtocol, exit_protocol: ProxyProtocol) {
 #[tokio::test]
 async fn failed_front_cannot_bypass_chain_to_origin() {
     let (_dir, paths) = fixture();
-    if info(&paths).is_err() {
-        return;
-    }
-    let closed = TcpListener::bind("127.0.0.1:0").unwrap();
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = closed.local_addr().unwrap().port();
     drop(closed);
     let front = proxy("front", port);
@@ -206,11 +199,115 @@ async fn failed_front_cannot_bypass_chain_to_origin() {
     );
 }
 #[test]
-fn missing_engine_has_actionable_error_without_starting_a_route() {
+fn embedded_engine_does_not_require_an_executable() {
     let (_dir, paths) = fixture();
     WorkspaceStore::open(&paths)
         .unwrap()
         .save_proxy_engine_path(Some("/rv-fixture-missing/sing-box"))
         .unwrap();
-    assert!(info(&paths).err().unwrap().contains("不存在"));
+    assert!(info(&paths).unwrap().version.starts_with("meow-rs"));
+}
+
+#[test]
+fn distinct_routes_share_one_port_but_have_independent_authentication_and_lifetimes() {
+    let (_dir, paths) = fixture();
+    let front = proxy("front", 1080);
+    let mut exit = proxy("exit", 1081);
+    exit.front_proxy_id = Some(front.id.clone());
+    let mut route = ProxyRoute {
+        exit,
+        front: Some(front),
+    };
+    let one = acquire(&paths, &route).unwrap();
+    route.exit.password = "second-fixture-session".into();
+    let two = acquire(&paths, &route).unwrap();
+    assert_eq!(one.port, two.port);
+    assert_ne!(one.username, two.username);
+    assert!(one.engine.sessions.len() >= 2);
+    one.stop();
+    assert!(!one.alive());
+    assert!(two.alive());
+}
+
+/// Manual network probe; never runs in CI or rotates/persists provider Sessions.
+#[test]
+#[ignore = "requires explicit authorization to use saved live proxy credentials"]
+fn live_google_through_configured_chain() {
+    let paths = StorePaths::default_dir().unwrap();
+    assert!(paths.database.is_file(), "existing RV database required");
+    let store = WorkspaceStore::open(&paths).unwrap();
+    let proxies = store.proxies().unwrap();
+    let selected = if let Ok(id) = std::env::var("RV_LIVE_PROXY_ID") {
+        proxies.iter().find(|p| p.id == id)
+    } else {
+        proxies
+            .iter()
+            .find(|p| {
+                p.front_proxy_id.is_some()
+                    && matches!(
+                        p.ip.rotation,
+                        rv_core::workspace::ProxyRotation::PasswordSession { .. }
+                    )
+            })
+            .or_else(|| proxies.iter().find(|p| p.front_proxy_id.is_some()))
+    }
+    .expect("a saved front/exit chain is required");
+    let captured = store.resolve_proxy(selected).unwrap();
+    assert!(
+        captured.front.is_some(),
+        "this probe must exercise a full chain"
+    );
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let client = crate::network::probe_client(&paths, selected).unwrap();
+            let response = client
+                .get("https://google.com/")
+                .timeout(Duration::from_secs(25))
+                .send()
+                .await
+                .expect("Google HTTPS connection through configured chain failed");
+            println!(
+                "google.com: HTTP {}, {:?}; front/exit chain enabled; TLS verification enabled",
+                response.status().as_u16(),
+                response.version()
+            );
+            assert!(response.status().is_success() || response.status().is_redirection());
+            if response.status().is_redirection() {
+                let location = response
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .unwrap()
+                    .to_str()
+                    .unwrap();
+                let target = reqwest::Url::parse(location).unwrap();
+                assert_eq!(target.scheme(), "https");
+                assert!(matches!(
+                    target.host_str(),
+                    Some("www.google.com" | "google.com")
+                ));
+                let response = client
+                    .get(target)
+                    .timeout(Duration::from_secs(25))
+                    .send()
+                    .await
+                    .expect("Google redirect HTTPS connection failed");
+                println!(
+                    "Google destination: HTTP {}, {:?}",
+                    response.status().as_u16(),
+                    response.version()
+                );
+                assert!(response.status().is_success());
+            }
+        });
+    let after = WorkspaceStore::open(&paths)
+        .unwrap()
+        .resolve_proxy(selected)
+        .unwrap();
+    assert!(
+        serde_json::to_vec(&captured).unwrap() == serde_json::to_vec(&after).unwrap(),
+        "live probe must not change configuration"
+    );
 }
