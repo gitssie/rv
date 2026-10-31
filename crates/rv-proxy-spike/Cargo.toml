@@ -1,0 +1,27 @@
+[package]
+name = "rv-proxy-spike"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.90"
+publish = false
+
+[features]
+# Explicitly reproduce the native TLS collision; see README before enabling.
+openssl-compat = ["dep:openssl", "dep:tokio-openssl", "dep:rustls"]
+
+[dependencies]
+meow-common = { git = "https://github.com/meow-rs/meow-rs", rev = "59da792d91f10598ce1d9f0afcb99be59150c22c", default-features = false }
+meow-proxy = { git = "https://github.com/meow-rs/meow-rs", rev = "59da792d91f10598ce1d9f0afcb99be59150c22c", default-features = false }
+tokio.workspace = true
+base64 = "0.22"
+http = "1"
+httparse = "1"
+async-trait = "0.1"
+
+openssl = { workspace = true, optional = true }
+tokio-openssl = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+
+[dev-dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "socks"] }
