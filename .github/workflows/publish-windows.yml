@@ -1,0 +1,98 @@
+name: Publish Windows preview
+
+on:
+  push:
+    branches: [release/windows-publish]
+  workflow_dispatch:
+    inputs:
+      x64_run:
+        description: Successful x86_64 Windows installer run ID
+        required: true
+        type: string
+      arm64_run:
+        description: Successful ARM64 Windows installer run ID
+        required: true
+        type: string
+      release_tag:
+        description: New Windows preview tag
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: publish-windows-preview
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      X64_RUN: ${{ inputs.x64_run || '41396484376' }}
+      ARM64_RUN: ${{ inputs.arm64_run || '41396993376' }}
+      RELEASE_TAG: ${{ inputs.release_tag || 'windows-v0.2.0-preview.20261102' }}
+    steps:
+      - name: Validate source builds
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$X64_RUN" =~ ^[0-9]+$ && "$ARM64_RUN" =~ ^[0-9]+$ ]]
+          [[ "$RELEASE_TAG" =~ ^windows-v[0-9]+\.[0-9]+\.[0-9]+[-.a-zA-Z0-9]*$ ]]
+          for run in "$X64_RUN" "$ARM64_RUN"; do
+            gh api "repos/$GH_REPO/actions/runs/$run" > "run-$run.json"
+            jq -e --arg repo "$GH_REPO" '.conclusion == "success" and .name == "Windows installer" and .head_repository.full_name == $repo' "run-$run.json"
+          done
+          sha=$(jq -r .head_sha "run-$X64_RUN.json")
+          test "$sha" = "$(jq -r .head_sha "run-$ARM64_RUN.json")"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          # Never overwrite an existing tag, release or its assets.
+          gh api "repos/$GH_REPO/git/matching-refs/tags/$RELEASE_TAG" > tags.json
+          jq -e --arg tag "refs/tags/$RELEASE_TAG" 'all(.[]; .ref != $tag)' tags.json
+
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ env.X64_RUN }}
+          name: windows-x86_64
+          path: dist/x64
+
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ env.ARM64_RUN }}
+          name: windows-aarch64
+          path: dist/arm64
+
+      - name: Verify checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd dist/x64 && sha256sum -c SHA256SUMS-windows-x86_64.txt)
+          (cd dist/arm64 && sha256sum -c SHA256SUMS-windows-aarch64.txt)
+
+      - name: Publish preview
+        env:
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > notes.md <<EOF
+          Windows 预览版，源码提交：$SOURCE_SHA。
+
+          - Intel/AMD 电脑下载 x86_64-setup.exe；Windows ARM 电脑下载 aarch64-setup.exe。
+          - ZIP 为便携版，SHA256SUMS 文件提供校验值。
+          - 安装目录可选，数据默认保存在 rv.exe 同目录的 data 文件夹，升级和卸载保留 data。RV_DATA_DIR 显式覆盖仍有效。
+          - 两种架构均通过 132 项存储测试、release 编译、安装打包、自定义目录安装、重装及卸载后数据保留验证。
+          - 安装包未进行代码签名；真实桌面 GPU、VNC 与手机交互仍需 Windows 电脑验证。
+
+          构建记录：
+          - https://github.com/$GH_REPO/actions/runs/$X64_RUN
+          - https://github.com/$GH_REPO/actions/runs/$ARM64_RUN
+          EOF
+          gh release create "$RELEASE_TAG" --target "$SOURCE_SHA" --title "RV Windows 0.2.0 Preview" --notes-file notes.md --prerelease dist/x64/*.exe dist/x64/*.zip dist/x64/SHA256SUMS-*.txt dist/arm64/*.exe dist/arm64/*.zip dist/arm64/SHA256SUMS-*.txt
