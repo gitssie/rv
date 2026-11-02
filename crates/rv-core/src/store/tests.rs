@@ -140,7 +140,8 @@ fn password_and_unlock_clear_independently_and_device_delete_clears_both() {
 }
 #[test]
 fn concurrent_credential_updates_preserve_both_fields() {
-    let (book, _) = book();
+    // Keep the initialized database alive while both writers run.
+    let (book, _dir) = book();
     let device = Connection::new("phone", "a", 5900);
     let id = device.id;
     let req = ConnectRequest::from_connection(&device, None);

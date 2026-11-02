@@ -53,6 +53,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: windows-installer-${{ matrix.arch }}
+          cache-on-failure: true
 
       - name: Test data storage
         run: |

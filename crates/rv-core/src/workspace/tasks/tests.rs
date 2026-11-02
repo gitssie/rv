@@ -326,7 +326,7 @@ fn stopped_tasks_keep_user_cron_and_running_completion_cannot_restart_them() {
 }
 
 fn previous_task_schema() -> String {
-    include_str!("../tasks.sql")
+    include_str!("../tasks.sql").replace("\r\n", "\n")
         .replace("    task_key TEXT,\n","")
         .replace("    depends_on TEXT REFERENCES tasks(id),\n","")
         .replace("    enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0,1)),\n","")
