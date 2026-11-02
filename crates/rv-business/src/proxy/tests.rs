@@ -652,6 +652,23 @@ async fn business_probe(paths: &StorePaths, app: &AppId) -> Result<String, Strin
         .map_err(|e| e.to_string())
 }
 #[tokio::test]
+async fn shop_ip_observation_does_not_rotate_or_transfer_business_ownership() {
+    let (_dir, paths, mut proxy) = fixture();
+    let server = Server::new(&[]).await;
+    server.configure(&paths, &mut proxy);
+    proxy.mode = rv_core::workspace::ProxyMode::Exclusive;
+    WorkspaceStore::open(&paths).unwrap().save_proxy(&proxy).unwrap();
+    let [a, b] = business_apps(&paths, &proxy);
+    business_probe(&paths, &a).await.unwrap();
+    {
+        let (route, _lease) = network::acquire_inspection_route(&paths, &b, &reqwest::Client::new()).await.unwrap();
+        let body = route.client.get("http://ip.fixture.invalid/probe").send().await.unwrap().text().await.unwrap();
+        assert!(body.contains("8.8.8.8"));
+    }
+    business_probe(&paths, &a).await.unwrap();
+    assert_eq!(server.changes(), 0);
+}
+#[tokio::test]
 async fn exclusive_business_rotates_only_when_virtual_app_changes() {
     let (_dir, paths, mut proxy) = fixture();
     let server = Server::new(&[Ipv4Addr::new(1, 1, 1, 1), Ipv4Addr::new(9, 9, 9, 9)]).await;

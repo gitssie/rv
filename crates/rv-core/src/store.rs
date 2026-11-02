@@ -37,10 +37,24 @@ impl StorePaths {
         if let Some(dir) = std::env::var_os("RV_DATA_DIR").filter(|d| !d.is_empty()) {
             return Ok(Self::in_dir(PathBuf::from(dir)));
         }
-        let dirs = directories::ProjectDirs::from("app", "RV", "rv").ok_or_else(|| {
-            StoreError::Io(std::io::Error::other("cannot resolve application data dir"))
+        #[cfg(target_os = "windows")]
+        {
+            Self::beside_executable(&std::env::current_exe()?)
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let dirs = directories::ProjectDirs::from("app", "RV", "rv").ok_or_else(|| {
+                StoreError::Io(std::io::Error::other("cannot resolve application data dir"))
+            })?;
+            Ok(Self::in_dir(dirs.data_dir().to_path_buf()))
+        }
+    }
+    #[cfg(any(target_os = "windows", test))]
+    fn beside_executable(executable: &std::path::Path) -> Result<Self, StoreError> {
+        let directory = executable.parent().ok_or_else(|| {
+            StoreError::Io(std::io::Error::other("cannot resolve executable directory"))
         })?;
-        Ok(Self::in_dir(dirs.data_dir().to_path_buf()))
+        Ok(Self::in_dir(directory.join("data")))
     }
     pub fn in_dir(root: PathBuf) -> Self {
         Self {

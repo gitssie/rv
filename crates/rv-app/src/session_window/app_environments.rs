@@ -96,6 +96,12 @@ impl EnvironmentUi {
     }
 }
 impl SessionView {
+    pub(crate) fn continue_initial_profiles(&mut self, device: rv_core::ConnectionId, commands: Vec<AppCommand>, cx: &mut Context<Self>) -> bool {
+        if self.phase != Phase::Connected || self.view_only() || self.req.connection_id != Some(device) { return false; }
+        for command in commands { self.handle.app(command); }
+        cx.notify();
+        true
+    }
     pub(crate) fn can_handoff_backup(&self) -> bool {
         self.phase == Phase::Connected && !self.view_only() && !self.functions.app_state_unsettled()
     }
@@ -107,30 +113,6 @@ impl SessionView {
         self.handle.app(command);
         self.functions.message = if to_rv {"正在读取手机备份并交给 RV…"}
             else {"正在回写账号备份，RV 任务已停止…"}.into();
-        cx.notify();
-        true
-    }
-    pub(crate) fn read_home_profile(
-        &mut self,
-        id: rv_core::workspace::AppId,
-        bundle: String,
-        backup: String,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        if self.phase != Phase::Connected
-            || self.view_only()
-            || self.functions.app_state_unsettled()
-        {
-            self.functions.message = "请先连接手机并完成当前备份操作".into();
-            cx.notify();
-            return false;
-        }
-        self.handle.app(AppCommand::ReadProfile {
-            app_id: id,
-            bundle,
-            backup,
-        });
-        self.functions.message = "正在从手机读取账号备份…".into();
         cx.notify();
         true
     }
@@ -582,9 +564,11 @@ impl SessionView {
             if let Some(device) = self.req.connection_id
                 && let Some(book) = self.address_book.as_ref().and_then(WeakEntity::upgrade)
             {
+                let session = cx.entity().downgrade();
                 let profiles = book.update(cx, |book, cx| {
-                    book.sync_phone_backups(device, &app_id, result, cx);
-                    book.missing_backup_profiles(&app_id, result)
+                    if !book.sync_phone_backups(device, &app_id, result, cx) { return vec![]; }
+                    let profiles = book.missing_backup_profiles(&app_id, result);
+                    book.stage_initial_profiles(device, profiles, session, cx)
                 });
                 for command in profiles {
                     self.handle.app(command);
@@ -1443,71 +1427,6 @@ impl SessionView {
         .into();
         cx.notify();
     }
-    fn confirm_sync_backup_to_home(
-        &mut self,
-        backup: Backup,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let owner = cx.entity();
-        crate::ui::confirm_backup_sync(backup.name.clone(), window, cx, move |_, cx| {
-            owner.update(cx, |this, cx| this.sync_backup_to_home(backup.clone(), cx));
-        });
-    }
-    fn sync_backup_to_home(&mut self, backup: Backup, cx: &mut Context<Self>) {
-        let result = (|| {
-            if self.phase != Phase::Connected
-                || self.view_only()
-                || self.functions.app_state_unsettled()
-            {
-                return Err("请先连接手机并完成当前操作".to_string());
-            }
-            let device = self.req.connection_id.ok_or("备份来源设备未保存")?;
-            let id = rv_core::workspace::AppId::from_idfv(
-                backup
-                    .id
-                    .strip_prefix("snapshot:")
-                    .ok_or("请选择账号备份")?,
-            )
-            .map_err(|_| "备份身份无效，请刷新列表".to_string())?;
-            let book = self
-                .address_book
-                .as_ref()
-                .and_then(WeakEntity::upgrade)
-                .ok_or("本地账号列表不可用")?;
-            book.update(cx, |book, cx| {
-                book.reimport_phone_backup(device, &backup.app, &id, &backup.id, cx)
-            })?;
-            if backup.app == "lt.manodrabuziai.fr" {
-                let owner = cx.entity().entity_id();
-                if !book.update(cx, |book, cx| {
-                    book.begin_backup_sync(&id, device, owner, cx)
-                }) {
-                    return Err("此账号正在同步，请稍后重试".into());
-                }
-                if !self.read_home_profile(id.clone(), backup.app.clone(), backup.id.clone(), cx) {
-                    book.update(cx, |book, cx| book.backup_sync_failed(&id, owner, "请先连接手机并完成当前备份操作", cx));
-                    return Err("请先连接手机并完成当前备份操作".into());
-                }
-            }
-            Ok::<_, String>(())
-        })();
-        match result {
-            Ok(()) => {
-                self.functions.message = if backup.app == "lt.manodrabuziai.fr" {
-                    "正在从手机读取账号备份…"
-                } else {
-                    "备份信息已同步到本地"
-                }
-                .into()
-            }
-            Err(error) => {
-                tracing::error!(bundle_id=%backup.app,error=%error,"Backup local sync failed");
-                self.functions.message = error.into();
-            }
-        }
-        cx.notify();
-    }
     fn render_backup_row(
         &self,
         backup: &Backup,
@@ -1529,7 +1448,6 @@ impl SessionView {
                     .map(|book| book.read(cx).execution_mode(&id))
             })
             .unwrap_or_default();
-        let show_sync = backup.snapshot && mode == rv_core::workspace::ExecutionMode::Rv;
         let can_takeover = self
             .address_book
             .as_ref()
@@ -1621,26 +1539,9 @@ impl SessionView {
                     .disabled(disabled)
                     .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
                         let edit = entity.clone();
-                        let sync = entity.clone();
-                        let sync_backup = menu_backup.clone();
                         let edit_backup = menu_backup.clone();
                         let copy = menu_backup.id.clone();
                         menu.action_context(focus.clone())
-                            .when(show_sync, |menu| {
-                                menu.item(
-                                    PopupMenuItem::new("从手机同步账号备份…")
-                                        .icon(IconName::Redo)
-                                        .on_click(move |_, window, cx| {
-                                            sync.update(cx, |this, cx| {
-                                                this.confirm_sync_backup_to_home(
-                                                    sync_backup.clone(),
-                                                    window,
-                                                    cx,
-                                                )
-                                            })
-                                        }),
-                                )
-                            })
                             .item(
                                 PopupMenuItem::new("编辑名称与备注")
                                     .icon(FunctionIcon::Edit)

@@ -82,7 +82,12 @@ RV_MOCK_SIZE=1280x800 RV_MOCK_RECTS=8 cargo run -p rv-session --example mock_ser
 RV_DATA_DIR=/tmp/rv-scratch cargo run -p rv-app -- 127.0.0.1:5999
 ```
 
-`RV_DATA_DIR` overrides the address-book location (default: the platform data directory).
+`RV_DATA_DIR` overrides the data directory on every platform. On Windows the
+default directory is `data` beside `rv.exe` (for example, `D:\RV\data\rv.sqlite3`),
+independent of the shortcut working directory. macOS and Linux retain their
+platform application-data directories; macOS uses
+`~/Library/Application Support/app.RV.rv/rv.sqlite3`.
+No existing database is moved or imported automatically.
 
 To preview file transfer without an iPhone, start the local TightVNC 1.x fixture
 with an existing folder as its remote root:
@@ -273,3 +278,5 @@ macOS is the primary target. Linux and Windows should compile via GPUI.
 ### 手机工作助手
 
 会话工具栏右侧「助手」打开商品草稿、图片、常用文案和通知侧栏。草稿使用 SQLite 自动保存；可向手机剪贴板发送文案、将图片导入手机相册，再在 Vinted 内选择、粘贴和发布。切换手机 App 不影响本地工作内容。详见 [模块与技术实现](docs/work-assistant-implementation.md)。
+
+Windows 安装包与 GitHub 发布流程见 [Windows 构建与发布](docs/windows-release.md)。

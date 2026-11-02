@@ -124,7 +124,7 @@
 
 - 「交给手机」仅回写所选手机相同 Bundle／IDFV 的备份 `state.tar.zst` 与匹配 manifest，用户明确不改 Shadow、不恢复 live Keychain／偏好、不启动 App、不触碰 data.tar.zst。先持久化 app_execution.mode=to_phone 并取消全部调度／禁用任务，等待已运行任务提交最终凭据后导出；顺序 state→manifest，再读回逐字／SHA／大小校验，通过才持久化 phone。失败或断线保持 to_phone，可显式重试同一冻结版本，不自动恢复 RV 任务。新任务／领取／立即执行／启用均校验执行归属，初始化不重开手机接管任务。
 - 卡片与店铺共用 Monitor／Clock／Smartphone 接管图标，说明放 Tooltip；Phone 模式只表示备份已校验且 RV 停止，不声称手机 live 环境已使用新令牌。按钮使用默认 AlertDialog 确认和来源选择，取消不改变模式。
-- 「交给 RV／修复状态」要求用户先在 Shadow 保存所选环境最新备份并切换到其他环境；实际读取前后通过 TrollVNC4.0-16目录的 current_idfv 检查，目标仍 active 或无法确认时不交接。目录身份查询不得依赖 access token，不要求旧 current_backup_id；旧 save／switch 已移除，不得据历史协议或历史文档重新接入自动备份。完整 state 与令牌对、刷新归属原子采用，用户停止的任务不启用，普通同步继续保护 RV 凭据。旧手机服务缺少独立身份字段时明确要求更新，不使用 token 接口代替身份查询。详见 docs/phone-handoff.md。
+- 「交给 RV」要求用户先在 Shadow 保存所选环境最新备份并切换到其他环境；实际读取前后通过 TrollVNC4.0-16目录的 current_idfv 检查，目标仍 active 或无法确认时不交接。目录身份查询不得依赖 access token，不要求旧 current_backup_id；旧 save／switch 已移除，不得据历史协议或历史文档重新接入自动备份。完整 state 与令牌对、刷新归属原子采用，用户停止的任务不启用，普通同步继续保护 RV 凭据。旧手机服务缺少独立身份字段时明确要求更新，不使用 token 接口代替身份查询。详见 docs/phone-handoff.md。
 
 - Dialog 归属同步必须在 `WindowRoot::render` 构建 `Root::render_dialog_layer` 之前完成，不放在其子 `AddressBookApp::render` 中。WindowRoot 观察 AddressBook 更新以刷新弹层，避免关闭后旧 builder 根据 Modal::None 生成默认空 Dialog 并缓存。回归要检查关闭首帧实际渲染层消失，不能只检查 has_active_dialog=false 或靠第二次 draw 掩盖。
 
@@ -217,3 +217,25 @@
 
 - 用户明确两者表示同一刷新责任。普通手机 state 同步在同一保存事务内从所选备份 manifest 的 owner 映射 Token Source：phone（旧数据缺失同样处理）对应该来源手机，rv 对应 RV；后续同步也更新，覆盖早先“重复导入保留既有来源”的约定。
 - 普通同步仍保护 RV 当前凭据，不以历史备份覆盖已轮换令牌，不自动 claim/release、不启用停止任务；只有显式交给 RV 才采用所选备份完整最新令牌对。归属查询与读取走已认证 HTTP/2。
+
+## 双向交接入口收敛（2026-11-02）
+
+- 商品面板及手机备份行菜单移除「从手机同步账号备份」，移除「修复状态」入口，手机图标直接确认交给手机，不再显示「状态与交接」选择框。
+- 移除 RV 已持有刷新责任时采用手机备份的修复特例；令牌缺失、过期或401均不能绕过双向交接覆盖 RV 凭据。首次自动导入与明确 Phone→RV、RV→Phone 交接保留。此条覆盖上文修复入口约定。
+
+- 店铺面板 IP 图标通过店铺绑定完整代理线路及本店铺密码 Session 请求 ipwho.is，原生 Popover 展示 IP/Country/Region/City 原始值，不翻译。不换 IP、不更改上次业务店铺、不记录历史；检测占用独立排他租约，防止同店铺换 IP 期间读到旧线路。
+
+## 首次备份同步代理选择（2026-11-02）
+
+- 首次刷新手机备份发现 Vinted 缺少完整 state 且未绑定代理时，整批弹出原生 Dialog 统一选择一个已保存代理；确认绑定后才下载完整 state 并初始化任务。取消保留目录记录，不下载 state，下次刷新仍可配置。
+- 已绑定代理的店铺直接沿用，不重新选择。批量保存为 SQLite 原子事务，仅填补未绑定记录，不覆盖期间已选择的代理；断线后保留已确认绑定，重连刷新继续初始化。
+
+## Windows 数据目录（2026-11-02）
+
+- Windows 默认使用实际 rv.exe 同目录下的 data/，如 D:\RV\data\rv.sqlite3，不依赖当前工作目录或快捷方式的「起始位置」。RV_DATA_DIR 非空时仍优先覆盖。
+- macOS/Linux 保持原平台数据目录；不自动迁移旧 AppData 或 Mac 数据。后续 Windows 安装器须确保所选程序目录内 data 可由运行用户写入，升级/卸载不能默认删除用户 data。
+
+## Windows 打包发布
+
+- Windows 编译、打包和安装测试通过 GitHub Actions `.github/workflows/windows.yml` 运行，不在 Mac 安装或尝试本地 Windows 工具链；现有 Release 工作流复用该工作流。
+- 安装器为当前用户安装并允许选目录，data 与实际 rv.exe 同目录；升级和卸载保留 data，不携带真实本地数据库。包内使用应用本地 MSVC CRT。运行包含自定义目录、重装、卸载数据保留的安装测试。详见 docs/windows-release.md。

@@ -2,3 +2,5 @@
 /tempdir/
 **/*.rs.bk
 .DS_Store
+
+/dist

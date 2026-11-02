@@ -129,35 +129,6 @@ pub(crate) fn empty_icon(cx: &App) -> Div {
     )
 }
 
-/// All explicit imports from a phone use the same direction and credential warning.
-pub(crate) fn confirm_backup_sync(
-    source: String,
-    window: &mut Window,
-    cx: &mut App,
-    on_confirm: impl Fn(&mut Window, &mut App) + 'static,
-) {
-    let on_confirm = std::rc::Rc::new(on_confirm);
-    window.open_alert_dialog(cx, move |alert, _, _| {
-        let on_confirm = on_confirm.clone();
-        alert
-            .title("从手机同步账号备份？")
-            .description(format!(
-                "将从“{source}”读取账号备份，更新 RV 中保存的 state 和设备请求参数。\n手机备份中的令牌与 RV 不同时，保留 RV 当前的 Access Token 和 Refresh Token。令牌刷新将按备份归属交由手机或 RV 负责。此操作不会将 RV 状态写回手机。"
-            ))
-            .confirm()
-            .button_props(
-                gpui_component::dialog::DialogButtonProps::default()
-                    .show_cancel(true)
-                    .ok_text("确认同步")
-                    .cancel_text("取消"),
-            )
-            .on_ok(move |_, window, cx| {
-                on_confirm(window, cx);
-                true
-            })
-    });
-}
-
 pub(crate) const RV_HANDOFF_DESCRIPTION: &str = "请先在 Shadow 保存该环境的最新备份，并切换到其他环境。目标仍为 active 时不能交给 RV。RV 只读取所选备份的 state 和令牌，不会自动备份或切换手机环境；已停止的任务保持停止。";
 pub(crate) const PHONE_HANDOFF_DESCRIPTION: &str = "RV 将停止该店铺的调度，通过 ZXTouch 自动关闭手机 App 并确认进程退出，等待在途任务结束后，把最新状态写回手机备份。当前 active 备份也可交接；回写不会自动应用到当前环境，请先在 Shadow 应用最新状态，再打开 App。";
 

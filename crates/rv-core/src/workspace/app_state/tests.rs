@@ -574,68 +574,27 @@ fn rv_takeover_adopts_phone_tokens_and_preserves_stopped_task_schedules() {
 }
 
 #[test]
-fn valid_or_unknown_access_blocks_repair_and_new_credentials_block_a_stale_confirmation() {
-    use super::super::TokenSource;
-    let (_dir,mut store,id,device)=store_fixture();
-    let phone_state=fixture_state();
-    store.import_app_state(&id,Some(device),&phone_state).unwrap();
-    store.set_token_source(&id,TokenSource::Rv).unwrap();
-    let operation=store.execution(&id).unwrap().operation_id;
-    for expiry in [Some(now()+3600),None] {
-        store.update_app_tokens(&id,"usable-access".into(),Some("latest-refresh".into()),expiry).unwrap();
-        assert!(!store.state_repair_needed(&id).unwrap());
-        assert!(store.validate_rv_takeover(&id,device,&operation).is_err());
-        assert!(store.complete_rv_takeover(&id,device,&operation,&phone_state).is_err());
-        assert_eq!(store.auth(&id).unwrap().unwrap().refresh_token.as_deref(),Some("latest-refresh"));
-    }
-    store.update_app_tokens(&id,"expired-access".into(),Some("latest-refresh".into()),Some(now()-1)).unwrap();
-    assert!(store.state_repair_needed(&id).unwrap());
-    store.validate_rv_takeover(&id,device,&operation).unwrap();
-    store.update_app_tokens(&id,"rejected-access".into(),Some("latest-refresh".into()),Some(now()+3600)).unwrap();
-    store.reject_access_token(&id,"rejected-access").unwrap();
-    assert!(store.state_repair_needed(&id).unwrap());
-    store.validate_rv_takeover(&id,device,&operation).unwrap();
-    // A successful refresh after opening the confirmation must prevent adoption.
-    store.update_app_tokens(&id,"new-valid-access".into(),Some("new-valid-refresh".into()),Some(now()+3600)).unwrap();
-    let state=store.app_state_info(&id).unwrap().unwrap().archive_sha256;
-    assert!(store.complete_rv_takeover(&id,device,&operation,&phone_state).is_err());
-    assert_eq!(store.auth(&id).unwrap().unwrap().access_token,"new-valid-access");
-    assert_eq!(store.auth(&id).unwrap().unwrap().refresh_token.as_deref(),Some("new-valid-refresh"));
-    assert_eq!(store.app_state_info(&id).unwrap().unwrap().archive_sha256,state);
-}
-
-#[test]
-fn rv_owned_state_can_be_repaired_from_linked_phone_without_a_mode_roundtrip() {
+fn rv_owned_credentials_cannot_be_replaced_by_phone_backup_even_when_invalid() {
     use super::super::TokenSource;
     let (_dir, mut store, id, device) = store_fixture();
-    let phone_state=fixture_state();
+    let phone_state = fixture_state();
     store.import_app_state(&id, Some(device), &phone_state).unwrap();
     store.set_token_source(&id, TokenSource::Rv).unwrap();
-    store.update_app_tokens(&id,"outdated-rv-access".into(),Some("outdated-rv-refresh".into()),Some(1)).unwrap();
-    store.reject_access_token(&id,"outdated-rv-access").unwrap();
-    let waiting=store.enqueue_task(&id,&TaskSpec::new("products","0 */20 * * * *")).unwrap();
-    store.wait_for_access_token(&id).unwrap();
-    let stopped=store.enqueue_task(&id,&TaskSpec::new("orders","0 */30 * * * *")).unwrap();
-    store.set_task_enabled(&stopped.id,false).unwrap();
-    // Normal synchronization must not silently replace RV credentials.
-    store.import_app_state(&id,Some(device),&phone_state).unwrap();
-    assert_eq!(store.auth(&id).unwrap().unwrap().access_token,"outdated-rv-access");
-    let operation=store.execution(&id).unwrap().operation_id;
-    store.complete_rv_takeover(&id,device,&operation,&phone_state).unwrap();
-    let auth=store.auth(&id).unwrap().unwrap();
-    assert_eq!(auth.access_token,"original-access");
-    assert_eq!(auth.refresh_token.as_deref(),Some("original-refresh"));
-    assert!(!auth.access_token_rejected());
-    assert_eq!(store.execution(&id).unwrap().mode,ExecutionMode::Rv);
-    assert_eq!(store.token_source(&id).unwrap(),TokenSource::Rv);
-    assert_eq!(store.app_state_info(&id).unwrap().unwrap().archive_sha256,state_sha256(phone_state.archive()));
-    let resumed=store.task(&waiting.id).unwrap();
-    assert!(resumed.enabled && resumed.error_code.is_none());
-    assert_eq!(resumed.cron_expression,"0 */20 * * * *");
-    let stopped=store.task(&stopped.id).unwrap();
-    assert!(!stopped.enabled);
-    assert_eq!(stopped.cron_expression,"0 */30 * * * *");
-    assert!(store.complete_rv_takeover(&id,device,&operation,&phone_state).is_err());
+    let operation = store.execution(&id).unwrap().operation_id;
+    let original_state = store.app_state_info(&id).unwrap().unwrap().archive_sha256;
+    for expiry in [Some(now() + 3600), None, Some(now() - 1)] {
+        store.update_app_tokens(&id, "rv-access".into(), Some("rv-refresh".into()), expiry).unwrap();
+        assert!(store.validate_rv_takeover(&id, device, &operation).is_err());
+        assert!(store.complete_rv_takeover(&id, device, &operation, &phone_state).is_err());
+    }
+    store.reject_access_token(&id, "rv-access").unwrap();
+    assert!(store.complete_rv_takeover(&id, device, &operation, &phone_state).is_err());
+    let auth = store.auth(&id).unwrap().unwrap();
+    assert_eq!(auth.access_token, "rv-access");
+    assert_eq!(auth.refresh_token.as_deref(), Some("rv-refresh"));
+    assert!(auth.access_token_rejected());
+    assert_eq!(store.token_source(&id).unwrap(), TokenSource::Rv);
+    assert_eq!(store.app_state_info(&id).unwrap().unwrap().archive_sha256, original_state);
 }
 
 #[test]

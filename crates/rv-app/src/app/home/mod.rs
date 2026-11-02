@@ -8,9 +8,11 @@ pub(in crate::app) mod control;
 mod deletion;
 mod devices;
 mod editor;
+pub(in crate::app) mod first_proxy;
 mod handoff;
 mod plugins;
 mod proxies;
+mod shop_ip;
 mod task_config;
 mod token_expiry;
 mod token_source;
@@ -34,6 +36,8 @@ pub(super) struct CardContext {
     pub keepalive_enabled: bool,
 }
 pub(super) struct HomeState {
+    pub first_proxy: std::collections::VecDeque<first_proxy::FirstProxyBatch>,
+    pub first_proxy_return: Option<Modal>,
     pub apps: Vec<AppInstance>,
     pub icons: HashMap<String, std::sync::Arc<RenderImage>>,
     pub links: HashMap<AppId, Vec<BackupLink>>,
@@ -96,6 +100,8 @@ impl HomeState {
             }),
             login_username: cx.new(|cx| InputState::new(window, cx).placeholder("尚未同步用户名")),
             login_password: cx.new(|cx| InputState::new(window, cx).placeholder("尚未保存密码")),
+            first_proxy: Default::default(),
+            first_proxy_return: None,
             tags: cx.new(|cx| InputState::new(window, cx).placeholder("多个标签，用逗号分隔")),
             note: cx.new(|cx| TextareaState::new(window, cx).rows(3).placeholder("备注")),
             icons: HashMap::new(),
@@ -486,41 +492,6 @@ impl AddressBookApp {
             }
         }
     }
-    pub(super) fn confirm_backup_profile_sync(
-        &mut self,
-        id: AppId,
-        link: BackupLink,
-        bundle: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.read_only || self.home.backup_syncing.contains_key(&id) {
-            return;
-        }
-        let owner = cx.entity();
-        let source = self
-            .backup_source_labels(std::slice::from_ref(&link))
-            .join("");
-        crate::ui::confirm_backup_sync(source, window, cx, move |_, cx| {
-            owner.update(cx, |this, cx| {
-                this.read_backup_profile(id.clone(), link.clone(), bundle.clone(), cx);
-            });
-        });
-    }
-    pub(crate) fn begin_backup_sync(
-        &mut self,
-        id: &AppId,
-        source: ConnectionId,
-        owner: EntityId,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        if self.read_only || self.home.backup_syncing.contains_key(id) {
-            return false;
-        }
-        self.home.backup_syncing.insert(id.clone(), (source, owner));
-        self.set_status("正在从手机读取账号备份…", cx);
-        true
-    }
     pub(crate) fn backup_sync_failed(
         &mut self,
         id: &AppId,
@@ -564,37 +535,6 @@ impl AddressBookApp {
         }
     }
 
-    fn read_backup_profile(
-        &mut self,
-        id: AppId,
-        link: BackupLink,
-        bundle: String,
-        cx: &mut Context<Self>,
-    ) {
-        if self.read_only {
-            return;
-        }
-        let Some(view) = self
-            .home
-            .controls
-            .get(&link.device_id)
-            .map(|s| s.view.clone())
-        else {
-            self.set_status("请先连接来源手机，再读取账号资料", cx);
-            return;
-        };
-        if self.home.backup_syncing.contains_key(&id) {
-            return;
-        }
-        let started = view.update(cx, |view, cx| {
-            view.read_home_profile(id.clone(), bundle, link.backup_id, cx)
-        });
-        if started {
-            self.begin_backup_sync(&id, link.device_id, view.entity_id(), cx);
-        } else {
-            self.set_status("请先连接来源手机并完成当前备份操作", cx);
-        }
-    }
     pub(super) fn run_shop_sync(
         &mut self,id:AppId,operation:rv_business::Operation,cx:&mut Context<Self>,
     ) {

@@ -78,6 +78,7 @@ enum Modal {
     DeleteConfirm { id: ConnectionId, name: String },
     App,
     AppDelete,
+    FirstProxy,
     Shop,
     PhoneControl(ConnectionId),
 }
@@ -288,9 +289,9 @@ impl AddressBookApp {
         bundle: &str,
         result: &serde_json::Value,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
         if self.read_only {
-            return;
+            return false;
         }
         match rv_core::workspace::WorkspaceStore::open(self.book.paths())
             .and_then(|mut store| store.sync_backups(device, bundle, result))
@@ -304,40 +305,11 @@ impl AddressBookApp {
                 tracing::error!(device_id = %device, bundle_id = bundle, error = %error,
                     "Phone backup sync to virtual Apps failed");
                 self.status = format!("备份同步失败：{error}").into();
+                return false;
             }
         }
         self.reload_home(cx);
-    }
-
-    pub(crate) fn reimport_phone_backup(
-        &mut self,
-        device: ConnectionId,
-        bundle: &str,
-        id: &rv_core::workspace::AppId,
-        backup: &str,
-        cx: &mut Context<Self>,
-    ) -> Result<(), String> {
-        if self.read_only {
-            return Err("当前为只读模式".into());
-        }
-        let result =
-            rv_core::workspace::WorkspaceStore::open(self.book.paths()).and_then(|mut store| {
-                let catalog = store
-                    .phone_state(device, bundle)?
-                    .ok_or_else(|| rv_core::StoreError::Invalid("请先刷新手机备份列表".into()))?;
-                store.reimport_backup(device, bundle, &catalog, id, backup)
-            });
-        match result {
-            Ok(_) => {
-                self.reload_home(cx);
-                self.set_status("备份信息已同步，账号 state 尚待读取", cx);
-                Ok(())
-            }
-            Err(error) => {
-                tracing::error!(device_id=%device,app_id=id.as_str(),error=%error,"Phone backup reimport failed");
-                Err("同步到本地失败，请查看日志".into())
-            }
-        }
+        true
     }
 
     /// Complete the import with a validated state before provisioning API tasks.
@@ -737,7 +709,7 @@ impl AddressBookApp {
             Modal::Connection => self.submit_connect(true, window, cx),
             Modal::DeleteConfirm { id, .. } => self.confirm_delete(id, cx),
             Modal::AppDelete => self.confirm_app_delete(cx),
-            Modal::App | Modal::Shop | Modal::PhoneControl(_) => {}
+            Modal::App | Modal::Shop | Modal::FirstProxy | Modal::PhoneControl(_) => {}
             Modal::None => {
                 let Some(id) = self.selected else {
                     self.set_status("Select a connection to connect", cx);
@@ -897,6 +869,10 @@ impl AddressBookApp {
     }
 
     fn close_modal(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.modal, Modal::FirstProxy) {
+            self.close_first_proxy(cx);
+            return;
+        }
         if self.credential_busy || self.home.deletion.as_ref().is_some_and(|d| d.busy) {
             return;
         }

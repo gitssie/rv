@@ -116,6 +116,9 @@ impl AddressBookApp {
         cx: &mut Context<Self>,
     ) -> Dialog {
         let owner = cx.entity();
+        if matches!(self.modal, Modal::FirstProxy) {
+            return self.configure_first_proxy_dialog(dialog, cx);
+        }
         if matches!(self.modal, Modal::Shop) {
             return dialog
                 .width(px((f32::from(window.viewport_size().width) - 32.).min(640.)))
@@ -137,7 +140,7 @@ impl AddressBookApp {
             }
             Modal::AppDelete => ("删除卡片", None),
             Modal::App | Modal::Shop => (self.app_editor_title(), None),
-            Modal::None | Modal::PhoneControl(_) => return dialog,
+            Modal::None | Modal::FirstProxy | Modal::PhoneControl(_) => return dialog,
         };
 
         let body: AnyElement = match &self.modal {
@@ -180,7 +183,7 @@ impl AddressBookApp {
                     .into_any_element()
             }
             Modal::App | Modal::Shop => self.render_app_editor(cx),
-            Modal::None | Modal::PhoneControl(_) => div().into_any_element(),
+            Modal::None | Modal::FirstProxy | Modal::PhoneControl(_) => div().into_any_element(),
         };
 
         let footer = match self.modal {
@@ -226,15 +229,18 @@ impl AddressBookApp {
     }
     pub(super) fn sync_component_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         use gpui_component::WindowExt;
+        self.prepare_first_proxy_dialog(window, cx);
         let kind = match self.modal {
             Modal::Connection => Some(1),
             Modal::DeleteConfirm { .. } => Some(2),
             Modal::App => Some(4),
             Modal::AppDelete => Some(5),
             Modal::Shop => Some(6),
+            Modal::FirstProxy => Some(7),
             _ => None,
         };
-        if self.home.component_dialog == kind {
+        if self.home.component_dialog == kind
+            && (kind.is_none() || window.has_active_dialog(cx)) {
             return;
         }
         if self.home.component_dialog.take().is_some() && window.has_active_dialog(cx) {

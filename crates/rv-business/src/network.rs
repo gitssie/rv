@@ -388,6 +388,22 @@ pub(crate) fn route(
 ) -> Result<Route, String> {
     route_for(paths, id, direct, false, false)
 }
+/// Observe the App's existing Session without rotating or changing the last business owner.
+pub(crate) async fn acquire_inspection_route(paths: &StorePaths, id: &AppId, direct: &reqwest::Client) -> Result<(Route, Lease), String> {
+    let initial = route_for(paths, id, direct, false, true)?;
+    let gate = initial.gate.as_ref().ok_or("请先为店铺关联代理")?;
+    // A distinct exclusive owner also blocks same-App business rotation while observing.
+    let owner = format!("shop-ip-{}", uuid::Uuid::new_v4());
+    let lease = gate.acquire(&owner, ProxyMode::Exclusive).await;
+    // A completed HTTP rotation can invalidate cached clients without changing passwords.
+    // Rebuild after waiting, but never send via an exit outside the held gate.
+    let route = route_for(paths, id, direct, false, true)?;
+    if route.proxy_fingerprint != initial.proxy_fingerprint
+        || !route.gate.as_ref().is_some_and(|current| Arc::ptr_eq(current, gate)) {
+        return Err("店铺代理关联或配置已变更，请重新检测".into());
+    }
+    Ok((route, lease))
+}
 pub(crate) fn image_route(
     paths: &StorePaths,
     id: &AppId,
@@ -750,6 +766,26 @@ mod tests {
         };
         store.save_proxy(&proxy).unwrap();
         store.bind_proxy(id, Some(&proxy.id)).unwrap();
+    }
+    #[tokio::test]
+    async fn shop_ip_reuses_shared_session_and_excludes_same_app_business() {
+        let (_dir, paths, id) = fixture();
+        let direct = reqwest::Client::new();
+        assert!(acquire_inspection_route(&paths, &id, &direct).await.is_err());
+        bind(&paths, &id, 12345);
+        let mut store = WorkspaceStore::open(&paths).unwrap();
+        let mut proxy = store.proxies().unwrap().remove(0);
+        proxy.mode = ProxyMode::Shared;
+        proxy.password = "fixture_session-abcdefgh".into();
+        proxy.ip.rotation = rv_core::workspace::ProxyRotation::PasswordSession { marker: "_session-".into() };
+        store.save_proxy(&proxy).unwrap();
+        let api = route_for(&paths, &id, &direct, false, true).unwrap();
+        let (observed, lease) = acquire_inspection_route(&paths, &id, &direct).await.unwrap();
+        assert!(Arc::ptr_eq(&api._session.as_ref().unwrap().0, &observed._session.as_ref().unwrap().0));
+        assert!(tokio::time::timeout(Duration::from_millis(20), api.acquire()).await.is_err());
+        assert_eq!(store.proxies().unwrap()[0].password, proxy.password);
+        drop(lease);
+        assert!(tokio::time::timeout(Duration::from_secs(1), api.acquire()).await.is_ok());
     }
     #[test]
     fn shared_password_sessions_are_shop_scoped_reused_and_do_not_rewrite_the_template() {

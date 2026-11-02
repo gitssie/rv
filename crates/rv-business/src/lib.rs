@@ -8,6 +8,7 @@ pub mod notifications;
 pub mod presentation;
 pub mod proxy;
 pub mod shop;
+pub mod shop_ip;
 pub mod shop_sync;
 mod executor;
 pub mod tasks;

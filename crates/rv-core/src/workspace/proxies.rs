@@ -332,6 +332,20 @@ impl WorkspaceStore {
         self.publish_changes();
         Ok(())
     }
+    /// First-import assignment never replaces a binding already chosen for an App.
+    pub fn bind_initial_proxies(&mut self, ids: &[super::AppId], proxy: &str) -> Result<(), StoreError> {
+        self.business_transaction(|db| {
+            if !read_proxies(db)?.iter().any(|entry| entry.id == proxy) {
+                return Err(StoreError::Invalid("所选代理已不存在，请重新选择".into()));
+            }
+            for id in ids {
+                let exists: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM app_instances WHERE id=?1 AND archived=0)", [id.as_str()], |row| row.get(0))?;
+                if !exists { return Err(StoreError::Invalid("店铺已删除或归档，请重新刷新备份".into())); }
+                db.execute("INSERT OR IGNORE INTO app_proxy_bindings(app_id,proxy_id) VALUES(?1,?2)", params![id.as_str(),proxy])?;
+            }
+            Ok(())
+        })
+    }
     /// A bound route cannot be deleted: deletion must never silently change the exit.
     pub fn delete_proxy(&mut self, id: &str) -> Result<(), StoreError> {
         self.business_transaction(|db| {

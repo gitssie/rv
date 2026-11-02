@@ -13,6 +13,7 @@ use gpui_component::{
 use rv_business::data::{BusinessPage, Dataset};
 use rv_core::events::{ChangeDomain, EntityChange, WorkspaceChanged};
 pub(in crate::app) struct BusinessView {
+    pub(super) ip: super::shop_ip::ShopIpView,
     pub dataset: Option<Dataset>,
     pub show_tasks: bool,
     pub page: BusinessPage,
@@ -24,6 +25,7 @@ pub(in crate::app) struct BusinessView {
 impl BusinessView {
     pub fn new(_window: &mut Window, _cx: &mut Context<AddressBookApp>) -> Self {
         Self {
+            ip: Default::default(),
             dataset: None,
             show_tasks: false,
             page: Default::default(),
@@ -36,18 +38,13 @@ impl BusinessView {
 }
 impl AddressBookApp {
     pub(in crate::app) fn render_shop_operations(&self, cx: &mut Context<Self>) -> AnyElement {
-        use gpui_component::{
-            IconName,
-            menu::{DropdownMenu, PopupMenuItem},
-        };
+        use gpui_component::IconName;
         let Some(app) = &self.home.editing else {
             return div().into_any_element();
         };
         let id = app.id.clone();
         let bundle = app.bundle_id.clone();
-        let host_owned = self.execution_mode(&id) == ExecutionMode::Rv;
         let operations = self.home.plugins.for_bundle(&bundle).offline_operations();
-        let links = self.home.links.get(&id).cloned().unwrap_or_default();
         let mut toolbar = h_flex()
             .id("shop-operations")
             .debug_selector(|| "shop-operations".into())
@@ -91,77 +88,10 @@ impl AddressBookApp {
                 })),
             );
         }
-        let source_online = links
-            .iter()
-            .any(|link| self.phone_online(link.device_id, cx));
-        let read = Button::new("shop-read-profile")
-            .ghost()
-            .icon(IconName::ArrowDown)
-            .tooltip(if source_online {
-                "从手机同步账号备份"
-            } else {
-                "请先连接来源手机"
-            })
-            .accessibility_label("同步账号备份")
-            .loading(self.home.backup_syncing.contains_key(&id))
-            .disabled(
-                self.read_only
-                    || !host_owned
-                    || !source_online
-                    || self.home.backup_syncing.contains_key(&id),
-            );
-        let read: AnyElement = if let [link] = links.as_slice() {
-            let link = link.clone();
-            read.on_click(cx.listener(move |this, _, window, cx| {
-                this.confirm_backup_profile_sync(
-                    id.clone(),
-                    link.clone(),
-                    bundle.clone(),
-                    window,
-                    cx,
-                )
-            }))
-            .into_any_element()
-        } else if links.len() > 1 {
-            let book = cx.entity();
-            let online: std::collections::HashSet<_> = links
-                .iter()
-                .filter(|link| self.phone_online(link.device_id, cx))
-                .map(|link| link.device_id)
-                .collect();
-            let source_titles = self.backup_source_labels(&links);
-            read.dropdown_menu(move |mut menu, _, _| {
-                for (link, source_title) in links.iter().zip(&source_titles) {
-                    let book = book.clone();
-                    let id = id.clone();
-                    let bundle = bundle.clone();
-                    let link = link.clone();
-                    menu = menu.item(
-                        PopupMenuItem::new(source_title.clone())
-                            .disabled(!online.contains(&link.device_id))
-                            .on_click(move |_, window, cx| {
-                                book.update(cx, |this, cx| {
-                                    this.confirm_backup_profile_sync(
-                                        id.clone(),
-                                        link.clone(),
-                                        bundle.clone(),
-                                        window,
-                                        cx,
-                                    )
-                                })
-                            }),
-                    );
-                }
-                menu
-            })
-            .into_any_element()
-        } else {
-            read.into_any_element()
-        };
         toolbar
+            .child(self.render_shop_ip_button(cx))
             .child(self.render_phone_token_button(cx))
             .child(self.render_set_avatar_button(cx))
-            .child(read)
             .child(self.render_phone_handoff_button(cx))
             .into_any_element()
     }
@@ -289,6 +219,9 @@ impl AddressBookApp {
         }
     }
     pub(super) fn reset_business_view(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.home.business.ip.generation += 1;
+        self.home.business.ip.loading = false;
+        self.home.business.ip.result = None;
         self.home.business.sequence += 1;
         self.home.business.show_tasks = false;
         self.home.task_config.editing = None;

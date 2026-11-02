@@ -223,3 +223,14 @@ fn editing_device_ip_preserves_passwords_and_other_device_settings() {
         b"001234"
     );
 }
+
+#[test]
+fn executable_relative_data_stays_with_the_program_directory() {
+    let installation = tempfile::tempdir().unwrap();
+    let executable = installation.path().join("RV").join("rv.exe");
+    let paths = super::StorePaths::beside_executable(&executable).unwrap();
+    assert_eq!(paths.root, installation.path().join("RV").join("data"));
+    assert_eq!(paths.database, paths.root.join("rv.sqlite3"));
+    assert_eq!(paths.thumbs, paths.root.join("thumbs"));
+    assert!(!paths.root.exists(), "resolving paths does not create or move data");
+}

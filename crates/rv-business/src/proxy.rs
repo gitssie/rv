@@ -290,7 +290,7 @@ fn record(slot: &PreparationSlot, ip: Ipv4Addr) -> Result<bool, ProxyError> {
         .map_err(|_| ProxyError::HistoryUnavailable)
 }
 
-async fn bounded_body(
+pub(crate) async fn bounded_body(
     mut response: reqwest::Response,
     limit: usize,
 ) -> Result<Vec<u8>, ProxyError> {

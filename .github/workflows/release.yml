@@ -146,48 +146,10 @@ jobs:
           if-no-files-found: error
 
   build-windows:
-    name: Windows (${{ matrix.arch }})
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: x86_64
-            runner: windows-latest
-          - arch: aarch64
-            runner: windows-11-arm
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install NASM (vendored OpenSSL)
-        if: matrix.arch == 'x86_64'
-        shell: pwsh
-        run: |
-          choco install -y nasm
-          Add-Content -Path $env:GITHUB_PATH -Value "C:\Program Files\NASM"
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: windows-${{ matrix.arch }}
-
-      - name: Build
-        run: cargo build --release -p rv-app
-
-      - name: Package zip
-        shell: pwsh
-        run: |
-          $Version = $env:GITHUB_REF_NAME -replace '^v', ''
-          if ($env:GITHUB_REF_TYPE -ne 'tag') { $Version = "0.0.0-$($env:GITHUB_SHA.Substring(0, 7))" }
-          $Stage = "rv-$Version-windows-${{ matrix.arch }}"
-          New-Item -ItemType Directory -Path "dist/$Stage" | Out-Null
-          Copy-Item "target/release/$env:BINARY.exe", "LICENSE", "README.md" "dist/$Stage/"
-          Compress-Archive -Path "dist/$Stage" -DestinationPath "dist/$Stage.zip"
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: windows-${{ matrix.arch }}
-          path: dist/*.zip
-          if-no-files-found: error
+    name: Windows installers
+    uses: ./.github/workflows/windows.yml
+    with:
+      architecture: all
 
   release:
     name: Attach to release
@@ -203,7 +165,7 @@ jobs:
       - name: Checksums
         run: |
           cd dist
-          sha256sum -- * > SHA256SUMS.txt
+          find . -maxdepth 1 -type f ! -name 'SHA256SUMS*' -printf '%f\0' | sort -z | xargs -0 sha256sum -- > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
       - uses: softprops/action-gh-release@v2

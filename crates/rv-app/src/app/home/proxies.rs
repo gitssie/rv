@@ -20,8 +20,8 @@ use gpui_component::{Icon, IconName, list::ListItem};
 
 #[derive(Clone)]
 pub(in crate::app) struct ProxyChoice {
-    id: String,
-    title: String,
+    pub(super) id: String,
+    pub(super) title: String,
 }
 impl SelectItem for ProxyChoice {
     type Value = String;

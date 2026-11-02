@@ -1,0 +1,88 @@
+name: Windows installer
+
+on:
+  push:
+    branches: [release/windows-installer]
+  workflow_dispatch:
+    inputs:
+      architecture:
+        description: Windows architecture
+        type: choice
+        options: [x86_64, aarch64, all]
+        default: x86_64
+  workflow_call:
+    inputs:
+      architecture:
+        type: string
+        default: all
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-installer-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: 2
+  CARGO_PROFILE_RELEASE_DEBUG: "0"
+
+jobs:
+  build:
+    name: Windows ${{ matrix.arch }} installer
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: ${{ fromJSON(inputs.architecture == 'all' && '["x86_64","aarch64"]' || inputs.architecture == 'aarch64' && '["aarch64"]' || '["x86_64"]') }}
+    runs-on: ${{ matrix.arch == 'aarch64' && 'windows-11-arm' || 'windows-2022' }}
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.arch == 'aarch64' && 'arm64' || 'x64' }}
+
+      - name: Prepare build tools
+        run: ./scripts/windows/prepare.ps1 -Architecture '${{ matrix.arch }}'
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-installer-${{ matrix.arch }}
+
+      - name: Test data storage
+        run: |
+          cargo test -p rv-core --locked
+          if ($LASTEXITCODE -ne 0) { throw "Storage tests failed" }
+
+      - name: Build RV
+        run: |
+          cargo build --release --locked -p rv-app
+          if ($LASTEXITCODE -ne 0) { throw "Windows build failed" }
+
+      - name: Package installer and portable ZIP
+        run: ./scripts/windows/package.ps1 -Architecture '${{ matrix.arch }}'
+
+      - name: Verify install, upgrade and uninstall preserve data
+        run: ./scripts/windows/test-installer.ps1
+
+      - name: Checksums
+        run: |
+          Get-ChildItem dist -File | Where-Object { $_.Extension -in '.exe', '.zip' } | Sort-Object Name | ForEach-Object {
+            $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $($_.Name)"
+          } | Set-Content -Encoding ascii dist/SHA256SUMS-windows-${{ matrix.arch }}.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-${{ matrix.arch }}
+          path: |
+            dist/*.exe
+            dist/*.zip
+            dist/SHA256SUMS-*.txt
+          if-no-files-found: error
+          retention-days: 30

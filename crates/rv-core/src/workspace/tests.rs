@@ -682,3 +682,23 @@ fn nested_profile_savepoint_failure_does_not_publish_credentials() {
     let event = events.try_recv().unwrap();
     assert!(event.changes.iter().all(|c| c.domain == ChangeDomain::Apps));
 }
+
+#[test]
+fn initial_batch_proxy_assignment_is_atomic_and_preserves_existing_choices() {
+    let (mut store, device, _dir) = fixture();
+    store.sync_backups(device.id, "lt.manodrabuziai.fr", &result(ID)).unwrap();
+    let a = AppId::from_idfv(ID).unwrap();
+    let b = AppId::from_idfv("D9EB7804-2062-4519-AC8D-6F68972574F3").unwrap();
+    store.sync_backups(device.id, "lt.manodrabuziai.fr", &result(b.as_str())).unwrap();
+    let proxy = SocksProxy { protocol: Default::default(), front_proxy_id: None, id: uuid::Uuid::new_v4().to_string(), name: "batch".into(), host: "127.0.0.1".into(), port: 1080, username: String::new(), password: String::new(), mode: ProxyMode::Shared, ip: Default::default() };
+    let mut existing = proxy.clone(); existing.id = uuid::Uuid::new_v4().to_string();
+    store.save_proxy(&proxy).unwrap(); store.save_proxy(&existing).unwrap();
+    store.bind_proxy(&a, Some(&existing.id)).unwrap();
+    let missing = AppId::from_idfv("E9EB7804-2062-4519-AC8D-6F68972574F3").unwrap();
+    assert!(store.bind_initial_proxies(&[b.clone(), missing], &proxy.id).is_err());
+    assert!(store.proxy_binding(&b).unwrap().is_none());
+    assert!(store.bind_initial_proxies(&[b.clone()], "deleted-proxy").is_err());
+    store.bind_initial_proxies(&[a.clone(), b.clone()], &proxy.id).unwrap();
+    assert_eq!(store.proxy_binding(&a).unwrap(), Some(existing.id));
+    assert_eq!(store.proxy_binding(&b).unwrap(), Some(proxy.id));
+}
